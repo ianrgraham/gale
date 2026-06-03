@@ -266,3 +266,51 @@ contribution (PR-ready) following PR #101. Remaining audit (same coercion class,
 yet exercised by a failing kernel): `emit_call` pointer args, `emit_return`, phi
 incomings, and `emit_store`'s value operand — apply `coerce_pointer_value` there too
 when a repro surfaces.
+
+### Third finding: opaque pointers (`ptr`) emitted for some kernels → libNVVM rejects
+
+Porting the **3D hex** hyperbolic operator (`src/bin/gpu_advection3d.rs`, the 3D
+analogue of `gpu-advection`) surfaced a new backend bug. The kernel fails at NVVM
+compile:
+
+```
+Ltoir(Nvvm(Call { operation: "nvvmCompileProgram", code: 9,
+                  log: Some("gale (14, 24): parse expected type") }))
+```
+
+The emitted NVVM IR (`cargo oxide build --bin gpu-advection3d --emit-nvvm-ir`) shows
+the function signature uses **opaque pointers**:
+
+```llvm
+define void @advect_rhs(ptr %v0, i64 %v1, ptr %v2, i64 %v3, ... ) {
+```
+
+whereas the working 2D kernels emit **typed pointers** (`i8*`), e.g. `gpu-advection`:
+
+```llvm
+define void @advect_rhs(i8* %v0, i64 %v1, i8* %v2, i64 %v3, ... ) {
+```
+
+libNVVM (pre-opaque-pointer) cannot parse `ptr` and errors at the first parameter
+(line 14, col 24 = the `ptr` token). So the backend's typed-pointer lowering — the
+same area as the §1 fix — is **applied to the 2D kernels but not to this 3D kernel**;
+some IR pattern in it routes around the opaque→typed conversion.
+
+Isolation performed (all reproduce the same `(N,24) parse expected type`, where `N`
+tracks the number of shared-array decls preceding the `define`):
+- **Not** parameter count: reducing 23→12 params (packing the 9 metrics node-major
+  into one buffer + the 4 face floats into another) did not change it.
+- **Not** the conditional shared-memory load (`if m < n2 { DS[m]=d[m] }`): replaced
+  with an unconditional load over a host-padded diff buffer; no change.
+- **Not** shared-array count (5→3 by packing PR/PS/PT into one array): error line
+  shifted with the count but persisted.
+- **Not** shared-array size: `p=3` (`[64 x double]`, smaller than the 2D kernels'
+  working `[81 x double]`) still emits `ptr`.
+
+So the trigger is structural to this kernel, not count/size/signature-width. The CPU
+operator it checks against (`Hyperbolic3d`) is correct and unit-tested; the binary is
+kept as the **minimal reproducer** for the upstream fix (extend the typed-pointer
+lowering to cover whatever pattern this kernel hits — candidates: the 3-way tensor
+volume contraction indexing, or the `met[b*9+c]` packed-stride loads). This blocks
+the 3D GPU operator (and thus 3D multi-GPU GPU execution) until fixed upstream; the
+2D GPU path and the whole CPU 3D stack are unaffected.

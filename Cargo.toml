@@ -97,6 +97,12 @@ path = "src/bin/gpu_poisson_pcg.rs"
 name = "gpu-advection"
 path = "src/bin/gpu_advection.rs"
 
+# GPU port: 3D hyperbolic operator on hexes (weak form, linear advection).
+# Run: cargo oxide run --bin gpu-advection3d
+[[bin]]
+name = "gpu-advection3d"
+path = "src/bin/gpu_advection3d.rs"
+
 # GPU port: Oldroyd-B conformation transport rhs (direct form, element-local).
 # Run: cargo oxide run --bin gpu-oldroyd
 [[bin]]
