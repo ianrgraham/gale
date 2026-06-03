@@ -1,10 +1,18 @@
-//! Live **multi-GPU** advection across the 2× Titan V: domain decomposition + GPU
-//! peer-to-peer halo exchange. Each GPU owns a partition; its state lives in a
-//! combined buffer `[local_state | halo]`. Cross-partition neighbour traces are
-//! filled into the halo by P2P `cuMemcpyPeerAsync` (peer access enabled), so the *same*
-//! `advect_rhs` kernel (which reads `u[face_nbr]`) runs unchanged — `face_nbr` simply
-//! points into local state or the halo region. Result is gathered and checked
-//! bit-for-bit against the monolithic CPU operator.
+//! Live **multi-GPU** advection across the 2× Titan V, driven by the framework's
+//! [`Device`](gale::sim::Device) abstraction: the element→GPU partition comes from
+//! [`DomainDecomposition`](gale::sim::DomainDecomposition) (the same decomposition
+//! validated CPU-side against the monolithic operator), and the GPU execution path
+//! consumes it. Each GPU owns a partition; its state lives in a combined buffer
+//! `[local_state | halo]`. Cross-partition neighbour traces are filled into the
+//! halo by P2P `cuMemcpyPeerAsync` (peer access enabled), so the *same* `advect_rhs`
+//! kernel (which reads `u[face_nbr]`) runs unchanged — `face_nbr` simply points into
+//! local state or the halo region. The result is gathered and checked bit-for-bit
+//! against the monolithic CPU operator.
+//!
+//! This closes the multi-GPU through-line: the framework `Device` selector +
+//! decomposition driving real kernel execution + P2P halos on hardware. (Device
+//! *module* code needs the cargo-oxide backend, so this execution path lives in a
+//! binary, not the normally-built lib — see docs/api-design.md §3.6.)
 //!
 //! Run: cargo oxide run --bin gpu-multigpu
 
@@ -13,6 +21,7 @@ use cuda_core::{memory, CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
 use gale::dg::{Edge, Hyperbolic, LinearAdvection, Mesh2d, Neighbor};
+use gale::sim::{Device, DomainDecomposition, Partition};
 
 const NN_MAX: usize = 81;
 
@@ -127,8 +136,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CPU monolithic reference.
     let cpu = Hyperbolic::new(&mesh, LinearAdvection { ax, ay }).rhs(&[gstate.clone()], 0.0, &|_, _, _, _: &mut [f64]| {});
 
-    // Partition into 2 contiguous blocks; local renumbering.
-    let parts: Vec<usize> = (0..ne).map(|e| if e < ne / 2 { 0 } else { 1 }).collect();
+    // Partition via the framework Device abstraction. The DomainDecomposition is the
+    // single source of element→GPU ownership (validated CPU-side against monolithic).
+    let device = Device::MultiGpu { ordinals: vec![0, 1], partition: Partition::Blocks };
+    let n_gpu = device.n_devices();
+    assert_eq!(n_gpu, 2, "this binary targets the 2× Titan V; device declares {n_gpu}");
+    let dd = DomainDecomposition::new(ne, &device);
+    println!(
+        "partition (framework DomainDecomposition): {} elements → {:?} per GPU",
+        ne,
+        dd.counts()
+    );
+    let parts: Vec<usize> = dd.parts.clone();
     let mut local_of = vec![0usize; ne];
     let mut global_of: [Vec<usize>; 2] = [vec![], vec![]];
     for e in 0..ne {
