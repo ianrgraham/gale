@@ -300,6 +300,20 @@ physics traits are written once; the backend dispatch happens at the `accumulate
 (`memcpy_peer_async`, already in our cuda-oxide fork) is driven by the `Device`,
 invisible to Term authors. CPU↔GPU parity remains the correctness oracle.
 
+**Implementation status** (`src/sim/device.rs`). The backend *selector* (`Device`)
+and the multi-GPU *domain decomposition* (`DomainDecomposition` — element→device
+ownership + cross-device halo, built on the validated `dg::distributed`
+partition/halo logic) are implemented and live in `Simulation` (`set_device` /
+`device` / `decompose`), non-leaking. The decomposition is validated end-to-end:
+the split a `Device::MultiGpu` produces, run through the distributed local-compute
++ halo path, reproduces the monolithic operator bit-for-bit (the CPU model of
+multi-GPU). GPU *kernel execution* behind this switch (launching the validated
+kernels, swapping the CPU halo copy for `memcpy_peer_async`) is the documented
+follow-on: it requires compiling `#[cuda_module]` device code with the cargo-oxide
+backend, which the normally-built lib (and its `cargo test` path) cannot do — so it
+stays in the cargo-oxide binaries where the kernels are already validated. With
+`Device::Cpu` (default) the simulation runs monolithically in-process, unchanged.
+
 ---
 
 ## 4. What assembling a simulation looks like

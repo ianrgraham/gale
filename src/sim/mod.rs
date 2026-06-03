@@ -12,6 +12,7 @@
 //! establishes the field-based [`State`] core.
 
 pub mod amr;
+pub mod device;
 pub mod dynamics;
 pub mod field;
 pub mod ibm;
@@ -22,6 +23,7 @@ pub mod state;
 pub mod term;
 
 pub use amr::AmrUpdater;
+pub use device::{Device, DomainDecomposition, Partition};
 pub use dynamics::{
     BaseRhs, BodyForce, DualSplitting, FieldVec, FnStateTerm, Mol, NoStateHook, SspRk3State,
     StateIntegrator, StateSemi, StateSemidiscretization, StateStageHook, StateTerm, ViscoModel,

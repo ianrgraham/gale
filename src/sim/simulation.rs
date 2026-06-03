@@ -16,6 +16,7 @@
 //! parameters), needs an interior-mutability/`TuneContext` redesign to be safe in
 //! Rust and is deferred; see api-design §3.3.
 
+use super::device::{Device, DomainDecomposition};
 use super::dynamics::{NoStateHook, StateIntegrator, StateStageHook};
 use super::state::State;
 
@@ -104,17 +105,38 @@ pub struct Simulation {
     pub operations: Operations,
     integrator: Option<Box<dyn StateIntegrator>>,
     hook: Box<dyn StateStageHook>,
+    device: Device,
 }
 
 impl Simulation {
-    /// A simulation over `state` with no operations and no integrator yet.
+    /// A simulation over `state` with no operations, no integrator, and the
+    /// default [`Device::Cpu`] backend.
     pub fn new(state: State) -> Self {
         Self {
             state,
             operations: Operations::default(),
             integrator: None,
             hook: Box::new(NoStateHook),
+            device: Device::Cpu,
         }
+    }
+
+    /// Select the execution backend. The default is [`Device::Cpu`]; setting a GPU
+    /// device does not change results (the physics is backend-agnostic and the CPU
+    /// path is the correctness oracle) — it selects how operations execute.
+    pub fn set_device(&mut self, device: Device) {
+        self.device = device;
+    }
+
+    /// The current execution backend.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Domain decomposition of the current mesh for the selected device (which
+    /// elements each device owns; trivial single-partition for CPU / single GPU).
+    pub fn decompose(&self) -> DomainDecomposition {
+        DomainDecomposition::new(self.state.mesh.n_elements(), &self.device)
     }
 
     /// Set the integrator (exactly one per simulation, HOOMD invariant). The
@@ -276,6 +298,34 @@ mod tests {
         sim.add_updater(ScaleU { factor: 0.9, calls: calls.clone() }, Periodic::new(5));
         sim.run(20);
         assert_eq!(*calls.borrow(), 4);
+    }
+
+    /// The Device plumbs through the Simulation, defaults to CPU, and the
+    /// decomposition tracks the selected backend without affecting CPU results.
+    #[test]
+    fn device_selection_plumbs_through() {
+        use crate::sim::device::{Device, Partition};
+
+        let (mut sim, _mesh) = advection_sim(1e-3);
+        assert_eq!(*sim.device(), Device::Cpu);
+        // CPU ⇒ single trivial partition.
+        assert_eq!(sim.decompose().n_parts, 1);
+
+        // Run on CPU (default) to a reference state.
+        sim.run(20);
+        let cpu_ref = sim.state.field("u").component(0).to_vec();
+
+        // Re-run an identical sim, but select a multi-GPU device first. Results are
+        // unchanged (the lib executes on CPU; the device selects how, not what), and
+        // the decomposition now reports the multi-device split.
+        let (mut sim2, _m) = advection_sim(1e-3);
+        sim2.set_device(Device::MultiGpu { ordinals: vec![0, 1], partition: Partition::Blocks });
+        assert_eq!(sim2.device().n_devices(), 2);
+        let dd = sim2.decompose();
+        assert_eq!(dd.n_parts, 2);
+        assert!(dd.is_balanced());
+        sim2.run(20);
+        assert_eq!(sim2.state.field("u").component(0), cpu_ref.as_slice());
     }
 
     /// A registered compute can be pulled on demand and returns a sensible value.
