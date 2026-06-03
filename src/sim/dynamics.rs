@@ -14,6 +14,7 @@
 
 use super::field::FieldId;
 use super::state::State;
+use crate::dg::stokes::Stokes;
 use std::collections::BTreeMap;
 
 /// A bundle of per-field values keyed by [`FieldId`] — used for both the evolving
@@ -188,14 +189,24 @@ impl StateStageHook for NoStateHook {
 
 /// A State-level time integrator: advances the evolving fields of `state` by one
 /// step, applying `hook` between stages and updating `state.time`.
+///
+/// The integrator **owns its dynamics**. Method-of-lines integrators ([`Mol`])
+/// hold a [`StateSemi`] and consume its additive rhs; structured schemes
+/// (`DualSplitting`, IMEX) hold their own configuration and orchestrate their
+/// stages internally. Both honor this one trait, so the
+/// [`Simulation`](super::simulation::Simulation) drives either uniformly — the
+/// "one Integrator trait, multiple families" contract of `docs/api-design.md`
+/// §3.2.
 pub trait StateIntegrator {
     fn dt(&self) -> f64;
-    fn step(&self, semi: &dyn StateSemi, state: &mut State, hook: &dyn StateStageHook);
+    fn step(&self, state: &mut State, hook: &dyn StateStageHook);
 }
 
-/// Explicit SSP-RK3 (Shu–Osher) over a multi-field [`State`]. The combination
-/// arithmetic mirrors the vector-level [`SspRk3`](super::integrate::SspRk3) so a
-/// single-field problem advances bit-for-bit identically.
+/// Explicit SSP-RK3 (Shu–Osher) *scheme* over a multi-field [`State`]. This is the
+/// stage logic only; bind it to a [`StateSemi`] with [`Mol`] to obtain a
+/// [`StateIntegrator`]. The combination arithmetic mirrors the vector-level
+/// [`SspRk3`](super::integrate::SspRk3) so a single-field problem advances
+/// bit-for-bit identically.
 #[derive(Clone, Copy, Debug)]
 pub struct SspRk3State {
     pub dt: f64,
@@ -205,14 +216,14 @@ impl SspRk3State {
     pub fn new(dt: f64) -> Self {
         Self { dt }
     }
-}
 
-impl StateIntegrator for SspRk3State {
-    fn dt(&self) -> f64 {
+    pub fn dt(&self) -> f64 {
         self.dt
     }
 
-    fn step(&self, semi: &dyn StateSemi, state: &mut State, hook: &dyn StateStageHook) {
+    /// Advance `state` by one SSP-RK3 step against `semi`, applying `hook` after
+    /// each stage.
+    pub fn advance(&self, semi: &dyn StateSemi, state: &mut State, hook: &dyn StateStageHook) {
         let t = state.time.t;
         let dt = self.dt;
         let ev = semi.evolving();
@@ -242,6 +253,126 @@ impl StateIntegrator for SspRk3State {
         hook.after_stage(state, 2);
 
         state.time.t = t + dt;
+        state.time.step += 1;
+    }
+}
+
+/// Method-of-lines integrator: binds a [`StateSemi`] (the additive spatial
+/// operator) to an explicit scheme (here [`SspRk3State`]). Owns the semi, so the
+/// [`Simulation`](super::simulation::Simulation) holds a single self-contained
+/// [`StateIntegrator`].
+pub struct Mol<S: StateSemi> {
+    pub semi: S,
+    pub scheme: SspRk3State,
+}
+
+impl<S: StateSemi> Mol<S> {
+    pub fn new(semi: S, scheme: SspRk3State) -> Self {
+        Self { semi, scheme }
+    }
+}
+
+impl<S: StateSemi> StateIntegrator for Mol<S> {
+    fn dt(&self) -> f64 {
+        self.scheme.dt()
+    }
+    fn step(&self, state: &mut State, hook: &dyn StateStageHook) {
+        self.scheme.advance(&self.semi, state, hook);
+    }
+}
+
+/// A nodal body force `(force_x, force_y)` over all DOFs, computed from the state
+/// and time — e.g. an external drive plus the polymer-stress divergence `∇·τ_p`
+/// read from the conformation field.
+pub type BodyForce = Box<dyn Fn(&State, f64) -> (Vec<f64>, Vec<f64>)>;
+
+/// **Structured** incompressible Navier–Stokes integrator: BDF1 dual-splitting
+/// (explicit convection + body force → pressure-Poisson projection → implicit
+/// viscous Helmholtz solve). Unlike [`Mol`], it has no additive semidiscretization
+/// — it orchestrates its own stages, drawing on the validated [`Stokes`] operator
+/// (constructed transiently from `state.mesh`, so nothing stores a mesh borrow).
+///
+/// This is the second [`StateIntegrator`] family, demonstrating the
+/// "one Integrator trait, multiple families" contract (`docs/api-design.md` §3.2):
+/// explicit method-of-lines ([`Mol`]) and structured projection coexist behind the
+/// same trait. The post-step [`StateStageHook`] is the home for the implicit
+/// volume-penalization (IBM) projection.
+pub struct DualSplitting {
+    pub dt: f64,
+    /// Solvent (kinematic) viscosity `η_s`.
+    pub nu: f64,
+    /// SIPG penalty parameter.
+    pub alpha: f64,
+    velocity: FieldId,
+    bc_u: Box<dyn Fn(f64, f64, f64) -> f64>,
+    bc_v: Box<dyn Fn(f64, f64, f64) -> f64>,
+    body_force: BodyForce,
+}
+
+impl DualSplitting {
+    /// New incompressible NS integrator advancing the 2-component `velocity` field,
+    /// with zero-velocity walls and no body force by default.
+    pub fn new(velocity: FieldId, dt: f64, nu: f64, alpha: f64) -> Self {
+        Self {
+            dt,
+            nu,
+            alpha,
+            velocity,
+            bc_u: Box::new(|_, _, _| 0.0),
+            bc_v: Box::new(|_, _, _| 0.0),
+            body_force: Box::new(|s: &State, _t: f64| {
+                let n = s.ndof();
+                (vec![0.0; n], vec![0.0; n])
+            }),
+        }
+    }
+
+    /// Set the Dirichlet velocity boundary conditions `(bc_u, bc_v)` as functions
+    /// of `(x, y, t)`.
+    pub fn boundary(
+        mut self,
+        bc_u: impl Fn(f64, f64, f64) -> f64 + 'static,
+        bc_v: impl Fn(f64, f64, f64) -> f64 + 'static,
+    ) -> Self {
+        self.bc_u = Box::new(bc_u);
+        self.bc_v = Box::new(bc_v);
+        self
+    }
+
+    /// Set the nodal body force, computed from the full state and the new time
+    /// level — e.g. `∇·τ_p` plus an external drive.
+    pub fn body_force(
+        mut self,
+        f: impl Fn(&State, f64) -> (Vec<f64>, Vec<f64>) + 'static,
+    ) -> Self {
+        self.body_force = Box::new(f);
+        self
+    }
+}
+
+impl StateIntegrator for DualSplitting {
+    fn dt(&self) -> f64 {
+        self.dt
+    }
+
+    fn step(&self, state: &mut State, hook: &dyn StateStageHook) {
+        let t_new = state.time.t + self.dt;
+        let stokes = Stokes::new(&state.mesh, self.alpha, self.nu, self.dt);
+        let (ux, uy) = {
+            let v = state.fields.by_id(self.velocity);
+            (v.component(0).to_vec(), v.component(1).to_vec())
+        };
+        let (bx, by) = (self.body_force)(state, t_new);
+        let (nux, nuy) =
+            stokes.step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by);
+        {
+            let v = state.fields.by_id_mut(self.velocity);
+            v.component_mut(0).copy_from_slice(&nux);
+            v.component_mut(1).copy_from_slice(&nuy);
+        }
+        // Per-stage hook: home for the implicit volume-penalization projection.
+        hook.after_stage(state, 0);
+        state.time.t = t_new;
         state.time.step += 1;
     }
 }
@@ -288,7 +419,7 @@ mod tests {
 
         for n in 0..30 {
             vstate = vinteg.step(&vsemi, &vstate, n as f64 * 1e-3);
-            sinteg.step(&ssemi, &mut st, &NoStateHook);
+            sinteg.advance(&ssemi, &mut st, &NoStateHook);
             assert_eq!(st.field("u").component(0), vstate[0].as_slice());
         }
         // sanity
@@ -360,7 +491,7 @@ mod tests {
 
             let integ = SspRk3State::new(2e-4);
             for _ in 0..500 {
-                integ.step(&semi, &mut st, &NoStateHook);
+                integ.advance(&semi, &mut st, &NoStateHook);
             }
             st
         };
@@ -418,5 +549,88 @@ mod tests {
         let hp = -0.5 * (0.5 * t).sin();
         let a = phi * (-t).exp();
         phi * hp + (ax * phix + ay * phiy) * h - a
+    }
+
+    /// The structured `DualSplitting` integrator, driven through the same
+    /// State-level API as the explicit `Mol`, must reproduce the decaying
+    /// Taylor–Green vortex (an exact NS solution) — and match a direct `Stokes`
+    /// loop bit-for-bit (faithful wrapping of the validated operator).
+    #[test]
+    fn dual_splitting_recovers_taylor_green() {
+        use crate::dg::stokes::Stokes;
+
+        let nu = 1.0;
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 4, 4, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let t_end = 0.1;
+        let nsteps = 20u64;
+        let dt = t_end / nsteps as f64;
+
+        // Exact Taylor–Green (move-captures nu only ⇒ 'static, boxable as BCs).
+        let eu = move |x: f64, y: f64, t: f64| {
+            -(PI * x).cos() * (PI * y).sin() * (-2.0 * PI * PI * nu * t).exp()
+        };
+        let ev = move |x: f64, y: f64, t: f64| {
+            (PI * x).sin() * (PI * y).cos() * (-2.0 * PI * PI * nu * t).exp()
+        };
+
+        // Framework run: velocity field + DualSplitting integrator.
+        let mut st = State::new(mesh.clone());
+        let vid = st.add_field_from(
+            "velocity",
+            &[
+                Box::new(move |x: f64, y: f64| eu(x, y, 0.0)) as Box<dyn Fn(f64, f64) -> f64>,
+                Box::new(move |x: f64, y: f64| ev(x, y, 0.0)),
+            ],
+        );
+        let integ = DualSplitting::new(vid, dt, nu, 5.0).boundary(eu, ev);
+        for _ in 0..nsteps {
+            integ.step(&mut st, &NoStateHook);
+        }
+
+        // Reference: the validated direct Stokes loop, identical setup.
+        let stokes = Stokes::new(&mesh, 5.0, nu, dt);
+        let mut rux: Vec<f64> = Vec::new();
+        let mut ruy: Vec<f64> = Vec::new();
+        for (e, el) in mesh.elements.iter().enumerate() {
+            let _ = e;
+            for k in 0..nn {
+                rux.push(eu(el.geom.x[k], el.geom.y[k], 0.0));
+                ruy.push(ev(el.geom.x[k], el.geom.y[k], 0.0));
+            }
+        }
+        let zero = |_: f64, _: f64, _: f64| 0.0;
+        let mut t = 0.0;
+        for _ in 0..nsteps {
+            t += dt;
+            let (nx, ny) = stokes.step_ns(&rux, &ruy, t, eu, ev, zero, zero);
+            rux = nx;
+            ruy = ny;
+        }
+
+        // Bit-for-bit: the framework wraps the operator faithfully.
+        assert_eq!(st.field("velocity").component(0), rux.as_slice());
+        assert_eq!(st.field("velocity").component(1), ruy.as_slice());
+
+        // Physics: the framework run matches the exact vortex.
+        let mut e2 = 0.0;
+        let mut n2 = 0.0;
+        let v = st.field("velocity");
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let (x, y) = (el.geom.x[k], el.geom.y[k]);
+                let du = v.component(0)[e * nn + k] - eu(x, y, t_end);
+                let dv = v.component(1)[e * nn + k] - ev(x, y, t_end);
+                e2 += el.geom.jw[k] * (du * du + dv * dv);
+                n2 += el.geom.jw[k] * (eu(x, y, t_end).powi(2) + ev(x, y, t_end).powi(2));
+            }
+        }
+        // Relative L2 error. BDF1 dual-splitting is first-order in time; at dt=5e-3
+        // this is ≈5e-3 relative (≈5e-4 absolute, inside the validated Stokes bound).
+        // The bit-for-bit equality above already pins the physics to that operator;
+        // this is a sanity floor.
+        let rel = (e2 / n2).sqrt();
+        assert!(rel < 1e-2, "Taylor–Green relative L2 error too large: {rel:e}");
     }
 }

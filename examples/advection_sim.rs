@@ -14,7 +14,7 @@
 
 use gale::dg::hyperbolic::{Hyperbolic, LinearAdvection};
 use gale::dg::mesh::Mesh2d;
-use gale::sim::dynamics::{BaseRhs, SspRk3State, StateSemidiscretization};
+use gale::sim::dynamics::{BaseRhs, Mol, SspRk3State, StateSemidiscretization};
 use gale::sim::{Compute, Periodic, Simulation, State, Writer};
 use std::f64::consts::PI;
 
@@ -67,7 +67,7 @@ fn main() {
     // 3. Assemble: one Simulation owns the State, the Operations, and (here) the
     //    integrator. Register a diagnostic and a progress writer on a trigger.
     let mut sim = Simulation::new(state);
-    sim.set_integrator(semi, SspRk3State::new(1e-3));
+    sim.set_integrator(Mol::new(semi, SspRk3State::new(1e-3)));
     sim.add_compute(L2Energy);
     sim.add_writer(Progress, Periodic::new(200));
 

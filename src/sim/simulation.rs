@@ -16,7 +16,7 @@
 //! parameters), needs an interior-mutability/`TuneContext` redesign to be safe in
 //! Rust and is deferred; see api-design §3.3.
 
-use super::dynamics::{NoStateHook, StateIntegrator, StateSemi, StateStageHook};
+use super::dynamics::{NoStateHook, StateIntegrator, StateStageHook};
 use super::state::State;
 
 /// A firing condition for a triggered operation — decouples *what* to do from
@@ -102,7 +102,6 @@ pub struct Operations {
 pub struct Simulation {
     pub state: State,
     pub operations: Operations,
-    semi: Option<Box<dyn StateSemi>>,
     integrator: Option<Box<dyn StateIntegrator>>,
     hook: Box<dyn StateStageHook>,
 }
@@ -113,20 +112,15 @@ impl Simulation {
         Self {
             state,
             operations: Operations::default(),
-            semi: None,
             integrator: None,
             hook: Box::new(NoStateHook),
         }
     }
 
-    /// Set the semidiscretization and integrator (exactly one integrator per
-    /// simulation, HOOMD invariant).
-    pub fn set_integrator(
-        &mut self,
-        semi: impl StateSemi + 'static,
-        integrator: impl StateIntegrator + 'static,
-    ) {
-        self.semi = Some(Box::new(semi));
+    /// Set the integrator (exactly one per simulation, HOOMD invariant). The
+    /// integrator owns its dynamics — a method-of-lines [`Mol`](super::dynamics::Mol)
+    /// carries its semidiscretization; a structured scheme carries its config.
+    pub fn set_integrator(&mut self, integrator: impl StateIntegrator + 'static) {
         self.integrator = Some(Box::new(integrator));
     }
 
@@ -162,9 +156,8 @@ impl Simulation {
     /// Advance the simulation `nsteps` steps. Per step: triggered updaters, then
     /// the integrator, then triggered writers (observing the produced state).
     pub fn run(&mut self, nsteps: u64) {
-        // Move the time-advance pieces out so the loop can borrow `state` and
-        // `operations` mutably without aliasing `self`.
-        let semi = self.semi.take().expect("Simulation::run: no integrator set");
+        // Move the integrator out so the loop can borrow `state` and `operations`
+        // mutably without aliasing `self`.
         let integ = self.integrator.take().expect("Simulation::run: no integrator set");
 
         for _ in 0..nsteps {
@@ -174,7 +167,7 @@ impl Simulation {
                     u.op.update(&mut self.state, step);
                 }
             }
-            integ.step(semi.as_ref(), &mut self.state, self.hook.as_ref());
+            integ.step(&mut self.state, self.hook.as_ref());
             let produced = self.state.time.step;
             for w in self.operations.writers.iter_mut() {
                 if w.trigger.fires(produced) {
@@ -183,7 +176,6 @@ impl Simulation {
             }
         }
 
-        self.semi = Some(semi);
         self.integrator = Some(integ);
     }
 }
@@ -193,7 +185,7 @@ mod tests {
     use super::*;
     use crate::dg::hyperbolic::{Hyperbolic, LinearAdvection};
     use crate::dg::mesh::Mesh2d;
-    use crate::sim::dynamics::{BaseRhs, SspRk3State, StateIntegrator, StateSemidiscretization};
+    use crate::sim::dynamics::{BaseRhs, Mol, SspRk3State, StateSemidiscretization};
     use std::cell::RefCell;
     use std::f64::consts::PI;
     use std::rc::Rc;
@@ -211,7 +203,7 @@ mod tests {
         });
         let semi = StateSemidiscretization::new().field(uid, base);
         let mut sim = Simulation::new(st);
-        sim.set_integrator(semi, SspRk3State::new(dt));
+        sim.set_integrator(Mol::new(semi, SspRk3State::new(dt)));
         (sim, mesh)
     }
 
@@ -253,7 +245,7 @@ mod tests {
         let integ = SspRk3State::new(dt);
         let hook = NoStateHook;
         for _ in 0..40 {
-            integ.step(&ref_semi, &mut ref_state, &hook);
+            integ.advance(&ref_semi, &mut ref_state, &hook);
         }
 
         sim.run(40);

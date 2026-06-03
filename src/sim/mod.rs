@@ -20,8 +20,8 @@ pub mod state;
 pub mod term;
 
 pub use dynamics::{
-    BaseRhs, FieldVec, FnStateTerm, NoStateHook, SspRk3State, StateIntegrator, StateSemi,
-    StateSemidiscretization, StateStageHook, StateTerm,
+    BaseRhs, BodyForce, DualSplitting, FieldVec, FnStateTerm, Mol, NoStateHook, SspRk3State,
+    StateIntegrator, StateSemi, StateSemidiscretization, StateStageHook, StateTerm,
 };
 pub use field::{Field, FieldId, FieldSet};
 pub use integrate::{ClosureSemi, Integrator, NoHook, Semi, SspRk3, StageHook};
