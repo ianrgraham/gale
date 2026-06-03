@@ -11,6 +11,7 @@
 //! the validated bespoke kernels rather than rewriting them. Step 1 (this commit)
 //! establishes the field-based [`State`] core.
 
+pub mod amr;
 pub mod dynamics;
 pub mod field;
 pub mod ibm;
@@ -20,6 +21,7 @@ pub mod stagehook;
 pub mod state;
 pub mod term;
 
+pub use amr::AmrUpdater;
 pub use dynamics::{
     BaseRhs, BodyForce, DualSplitting, FieldVec, FnStateTerm, Mol, NoStateHook, SspRk3State,
     StateIntegrator, StateSemi, StateSemidiscretization, StateStageHook, StateTerm, ViscoModel,

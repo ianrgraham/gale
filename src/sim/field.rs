@@ -78,6 +78,20 @@ impl Field {
         &mut self.components[c]
     }
 
+    /// Replace the components wholesale, updating `n_comp` and `ndof` — used when
+    /// the DOF count changes (e.g. after AMR remaps this field to a new mesh).
+    pub fn replace_components(&mut self, components: Vec<Vec<f64>>) {
+        assert!(!components.is_empty(), "field must have ≥1 component");
+        let ndof = components[0].len();
+        assert!(
+            components.iter().all(|c| c.len() == ndof),
+            "ragged field components in replace_components"
+        );
+        self.n_comp = components.len();
+        self.ndof = ndof;
+        self.components = components;
+    }
+
     /// Overwrite all components from a matching `[n_comp][ndof]` layout (e.g. the
     /// result of an integrator step). Shapes must match exactly.
     pub fn assign(&mut self, components: &[Vec<f64>]) {

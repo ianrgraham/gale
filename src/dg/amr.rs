@@ -55,13 +55,30 @@ pub fn remap_scalar(
     let rq = RefineQuad::new(order);
     let old_h: HashSet<(usize, usize)> = old_set.iter().copied().collect();
     let new_h: HashSet<(usize, usize)> = new_set.iter().copied().collect();
-    let old_map = cell_element_map(nx, ny, &old_h);
     let new_mesh = Mesh2d::cartesian_refined(order, nx, ny, xr, yr, new_set);
+    let u_new = remap_scalar_data(&rq, nx, ny, &old_h, &new_h, u_old);
+    (new_mesh, u_new)
+}
+
+/// Core element-ordered scalar transfer for a single 2:1 refinement transition
+/// (shared by [`remap_scalar`] and the flat/multi-field helpers). `u_old` is
+/// element-ordered for `old_set`; the result is element-ordered for `new_set`.
+/// Newly-refined cells are prolonged, newly-coarsened cells conservatively
+/// restricted, unchanged cells copied.
+fn remap_scalar_data(
+    rq: &RefineQuad,
+    nx: usize,
+    ny: usize,
+    old_set: &HashSet<(usize, usize)>,
+    new_set: &HashSet<(usize, usize)>,
+    u_old: &[Vec<f64>],
+) -> Vec<Vec<f64>> {
+    let old_map = cell_element_map(nx, ny, old_set);
     let mut u_new = Vec::new();
     for cy in 0..ny {
         for cx in 0..nx {
             let oe = &old_map[&(cx, cy)];
-            match (old_h.contains(&(cx, cy)), new_h.contains(&(cx, cy))) {
+            match (old_set.contains(&(cx, cy)), new_set.contains(&(cx, cy))) {
                 (false, false) => u_new.push(u_old[oe[0]].clone()),
                 (false, true) => {
                     for c in 0..4 {
@@ -80,7 +97,65 @@ pub fn remap_scalar(
             }
         }
     }
-    (new_mesh, u_new)
+    u_new
+}
+
+/// Remap a single **flat** scalar component (`[ndof] = [n_elem · n_nodes]`,
+/// element-ordered) between refinement states — the layout the framework `State`
+/// stores. Splits into per-element nodal blocks, applies the validated 2:1
+/// transfer, and flattens back to the new `[ndof]`. Multi-component fields call
+/// this once per component (the transfer is identical and independent per
+/// component). Use [`Mesh2d::cartesian_refined`] to build the matching new mesh.
+pub fn remap_component_flat(
+    order: usize,
+    nx: usize,
+    ny: usize,
+    old_set: &[(usize, usize)],
+    comp_old: &[f64],
+    new_set: &[(usize, usize)],
+) -> Vec<f64> {
+    let rq = RefineQuad::new(order);
+    let nn = (order + 1) * (order + 1);
+    let old_h: HashSet<(usize, usize)> = old_set.iter().copied().collect();
+    let new_h: HashSet<(usize, usize)> = new_set.iter().copied().collect();
+    let u_old: Vec<Vec<f64>> = comp_old.chunks(nn).map(|c| c.to_vec()).collect();
+    remap_scalar_data(&rq, nx, ny, &old_h, &new_h, &u_old).concat()
+}
+
+/// Per **base-cell** smoothness indicator from a flat scalar component on the
+/// *current* (possibly already-refined) mesh — level-aware: a cell that is
+/// currently refined is first conservatively [`restrict`](RefineQuad::restrict)ed
+/// to its base representation before the [`SmoothnessIndicator`] is evaluated, so
+/// the decision to keep/refine/coarsen is taken on the base cell. Returns one
+/// value per base cell in `cx + cy·nx` order. This is the indicator half of a
+/// dynamic, multi-field re-adaptation step.
+pub fn smoothness_per_cell(
+    order: usize,
+    nx: usize,
+    ny: usize,
+    old_set: &[(usize, usize)],
+    indic_comp: &[f64],
+) -> Vec<f64> {
+    let si = SmoothnessIndicator::new(order);
+    let rq = RefineQuad::new(order);
+    let nn = (order + 1) * (order + 1);
+    let old_h: HashSet<(usize, usize)> = old_set.iter().copied().collect();
+    let old_map = cell_element_map(nx, ny, &old_h);
+    let u: Vec<Vec<f64>> = indic_comp.chunks(nn).map(|c| c.to_vec()).collect();
+    let mut out = vec![0.0; nx * ny];
+    for cy in 0..ny {
+        for cx in 0..nx {
+            let oe = &old_map[&(cx, cy)];
+            let cell = if old_h.contains(&(cx, cy)) {
+                let children: [Vec<f64>; 4] = std::array::from_fn(|c| u[oe[c]].clone());
+                rq.restrict(&children)
+            } else {
+                u[oe[0]].clone()
+            };
+            out[cx + cy * nx] = si.indicator(&cell);
+        }
+    }
+    out
 }
 
 /// One round of indicator-driven `h`-adaptation of a *scalar* field on a Cartesian
