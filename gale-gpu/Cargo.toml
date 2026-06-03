@@ -1,0 +1,27 @@
+[package]
+name = "gale-gpu"
+version = "0.1.0"
+edition = "2024"
+
+# GPU device-code + host launch wrappers for gale's DG operators. Built ONLY via
+# `cargo oxide` (it contains `#[cuda_module]` device code the cuda-oxide codegen
+# backend must lower). Depends on the pure-host `gale` lib for State/mesh/operator
+# types; `gale` does NOT depend on this crate, so `gale`'s `cargo test` stays a
+# pure-host CPU oracle. Reusable across crates thanks to the fork's cross-crate
+# artifact-anchor fix.
+[lib]
+name = "gale_gpu"
+path = "src/lib.rs"
+
+[dependencies]
+gale = { path = ".." }
+cuda-device = { workspace = true }
+cuda-host = { workspace = true }
+cuda-core = { workspace = true }
+
+# Cross-crate validation: a consumer binary that calls the library kernel and
+# checks it against gale's CPU oracle (exercises the dependency-rlib link path).
+# Run: cargo oxide run --bin advection-check
+[[bin]]
+name = "advection-check"
+path = "src/bin/advection_check.rs"

@@ -5,6 +5,19 @@ edition = "2024"
 default-run = "gale"
 
 [workspace]
+members = ["gale-gpu"]
+
+# cuda-oxide runtime crates, pinned to our local fork checkout (path deps) so the
+# whole workspace shares ONE source and matches the codegen backend built from the
+# same checkout (CUDA_OXIDE_BACKEND in .cargo/config.toml). The fork carries our
+# fixes: typed-pointer bitcast, NVVM dialect default, memcpy_peer_async (P2P), and
+# the cross-crate artifact-anchor linking that makes `gale-gpu` reusable. The fork
+# branch (fix/typed-pointer-insertvalue-bitcast) is pushed to GitHub; switch these
+# to a git rev pin (or upstream NVlabs) once the fixes merge.
+[workspace.dependencies]
+cuda-device = { path = "/home/ian/src/cuda-oxide-101/crates/cuda-device" }
+cuda-host = { path = "/home/ian/src/cuda-oxide-101/crates/cuda-host" }
+cuda-core = { path = "/home/ian/src/cuda-oxide-101/crates/cuda-core" }
 
 # CPU-side solver library: reference elements, mesh, DG operators, solvers.
 # Pure host code (no cuda-oxide); GPU kernels live in the binaries / device modules.
@@ -56,22 +69,11 @@ name = "gpu-poisson-faces"
 path = "src/bin/gpu_poisson_faces.rs"
 
 [dependencies]
-# TEMPORARY PIN to our fork's `pr-101-typed-nvvm` branch (= cuda-oxide PR #101,
-# "typed NVVM IR for pre-Blackwell"), which fixes the libdevice
-# `nvvmCompileProgram: "parse expected type"` failure on the Volta Titan V (sm_70)
-# — issue #98, reproduced in docs/milestone-1-probe-results.md.
-# Pinned by rev for reproducibility; the branch is ours to carry our own follow-up
-# fixes (e.g. the residual typed-pointer bitcast bug). The matching codegen backend
-# must be built from this commit and exposed via CUDA_OXIDE_BACKEND — see
-# .cargo/config.toml. Revert to `{ git = "https://github.com/NVlabs/cuda-oxide.git" }`
-# once #101 (and our fixes) merge upstream.
-# Pinned to our fork branch fix/typed-pointer-insertvalue-bitcast, which carries the
-# typed-pointer bitcast fix (codegen backend) and cuda-core::memory::memcpy_peer_async
-# (multi-GPU P2P halo). The matching backend .so must be built from this commit and
-# exposed via CUDA_OXIDE_BACKEND (.cargo/config.toml). Revert to NVlabs once merged.
-cuda-device = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "965c4366d892dbbdacd72c87f08f429b9ea2b666" }
-cuda-host   = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "965c4366d892dbbdacd72c87f08f429b9ea2b666" }
-cuda-core   = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "965c4366d892dbbdacd72c87f08f429b9ea2b666" }
+# The GPU kernels live in the `gale-gpu` member crate now; the binaries remaining
+# in this package use these runtime crates from the shared workspace pins above.
+cuda-device = { workspace = true }
+cuda-host = { workspace = true }
+cuda-core = { workspace = true }
 
 # GPU port step 7c: full SIPG operator (volume + faces, 2-kernel pipeline).
 # Run: cargo oxide run --bin gpu-poisson-operator
@@ -91,11 +93,9 @@ path = "src/bin/gpu_poisson_cg.rs"
 name = "gpu-poisson-pcg"
 path = "src/bin/gpu_poisson_pcg.rs"
 
-# GPU port: hyperbolic conservation-law operator (weak form, linear advection).
-# Run: cargo oxide run --bin gpu-advection
-[[bin]]
-name = "gpu-advection"
-path = "src/bin/gpu_advection.rs"
+# NOTE: `gpu-advection` migrated to the `gale-gpu` crate as a reusable library
+# component (gale_gpu::advection — see gale-gpu/). The remaining gpu_* bins below
+# are pending the same migration.
 
 # GPU port: 3D hyperbolic operator on hexes (weak form, linear advection).
 # Run: cargo oxide run --bin gpu-advection3d
