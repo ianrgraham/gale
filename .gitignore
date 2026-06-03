@@ -1,0 +1,10 @@
+/oxide-artifacts
+
+*.ltoir
+*.ll
+*.cubin
+*.ptx
+*.deb
+
+target
+rustc-ice-*.txt

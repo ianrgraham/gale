@@ -1,0 +1,14 @@
+# TEMPORARY: point cuda-oxide's codegen backend at the build of PR #101
+# ("typed NVVM IR for pre-Blackwell"), which fixes the libdevice
+# `nvvmCompileProgram: "parse expected type"` failure on the Volta Titan V
+# (sm_70). This is backend.rs discovery priority #1 (CUDA_OXIDE_BACKEND override).
+#
+# The .so is built from the #101 checkout at ~/src/cuda-oxide-101 with:
+#   SYSROOT=$(rustc --print sysroot)
+#   cd ~/src/cuda-oxide-101/crates/rustc-codegen-cuda
+#   LIBRARY_PATH="$SYSROOT/lib" LD_LIBRARY_PATH="$SYSROOT/lib" cargo build
+#
+# Remove this whole file (and the dep pins in Cargo.toml) once #101 merges
+# upstream and gale points back at NVlabs/cuda-oxide.
+[env]
+CUDA_OXIDE_BACKEND = "/home/ian/src/cuda-oxide-101/crates/rustc-codegen-cuda/target/debug/librustc_codegen_cuda.so"

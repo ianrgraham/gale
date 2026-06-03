@@ -1,0 +1,534 @@
+//! Scalar elliptic solve: the **Symmetric Interior Penalty (SIPG)** DG Laplacian
+//! for `−∇²u = f` with weak (Nitsche) Dirichlet BCs, applied matrix-free, and a
+//! conjugate-gradient solver. This is the CPU scalar-elliptic oracle (build-order
+//! step 1 of `docs/implicit-solver-strategy.md`) the GPU port will validate against.
+//!
+//! Discretization (per `docs/dg-gpu-fluid-simulation.md` §3.4): nodal DG-SEM on
+//! quads, LGL collocation (diagonal mass), volume stiffness `Dxᵀ W Dx + Dyᵀ W Dy`,
+//! and the standard SIPG face terms — consistency `−∮{∇u·n}[v]`, symmetry
+//! `−∮{∇v·n}[u]`, penalty `+∮ τ[u][v]` — with the same form on Dirichlet boundary
+//! faces (jump = `u`, single-sided average). Penalty `τ = α (p+1)² / h`.
+//!
+//! Global DOF layout: element `e`, local node `k` → index `e·nn + k` (DG: no shared
+//! nodes between elements).
+
+use super::face::Edge;
+use super::mesh::{Mesh2d, Neighbor};
+
+/// The SIPG Poisson operator over a mesh, with a penalty coefficient.
+pub struct Poisson<'m> {
+    pub mesh: &'m Mesh2d,
+    /// Penalty scale α in `τ = α (p+1)² / h`.
+    pub alpha: f64,
+    /// Helmholtz reaction coefficient λ in the operator `λM + A` (0 ⇒ pure Poisson).
+    /// Used for the implicit viscous solve `(γ₀/(νΔt) I − ∇²)u` of the Stokes
+    /// dual-splitting scheme.
+    pub reaction: f64,
+    /// Boundary tags treated as **Neumann** (natural BC). Tags not listed are
+    /// Dirichlet (weak/Nitsche). Empty ⇒ all-Dirichlet (the pure Poisson default).
+    /// The pressure-Poisson of the splitting uses all-Neumann.
+    pub neumann_tags: Vec<u32>,
+    /// Per-element length scale `h = √area`.
+    h: Vec<f64>,
+}
+
+#[inline]
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+impl<'m> Poisson<'m> {
+    pub fn new(mesh: &'m Mesh2d, alpha: f64) -> Self {
+        Self::with_reaction(mesh, alpha, 0.0)
+    }
+
+    /// Helmholtz operator `λM + A` (reaction `λ ≥ 0`); `λ = 0` is the pure Poisson.
+    pub fn with_reaction(mesh: &'m Mesh2d, alpha: f64, reaction: f64) -> Self {
+        Self::with_bc(mesh, alpha, reaction, Vec::new())
+    }
+
+    /// Full constructor: reaction `λ` and the set of Neumann boundary tags.
+    pub fn with_bc(mesh: &'m Mesh2d, alpha: f64, reaction: f64, neumann_tags: Vec<u32>) -> Self {
+        let h = mesh
+            .elements
+            .iter()
+            .map(|e| e.geom.jw.iter().sum::<f64>().sqrt())
+            .collect();
+        Self { mesh, alpha, reaction, neumann_tags, h }
+    }
+
+    fn is_neumann(&self, tag: u32) -> bool {
+        self.neumann_tags.contains(&tag)
+    }
+
+    fn penalty(&self, e: usize, neighbor: Option<usize>) -> f64 {
+        let p1 = (self.mesh.order + 1) as f64;
+        let h = match neighbor {
+            Some(r) => self.h[e].min(self.h[r]),
+            None => self.h[e],
+        };
+        self.alpha * p1 * p1 / h
+    }
+
+    /// Total DOF count (`n_elements · (p+1)²`).
+    pub fn ndof(&self) -> usize {
+        self.mesh.n_elements() * self.mesh.refq.n_nodes()
+    }
+
+    /// Matrix-free SIPG operator action `A u`.
+    pub fn apply(&self, u: &[f64]) -> Vec<f64> {
+        let m = self.mesh;
+        let refq = &m.refq;
+        let nn = refq.n_nodes();
+        let ne = m.n_elements();
+        // Per-element physical gradients (reused by the face terms).
+        let mut gx = Vec::with_capacity(ne);
+        let mut gy = Vec::with_capacity(ne);
+        for (e, el) in m.elements.iter().enumerate() {
+            let ue = &u[e * nn..(e + 1) * nn];
+            gx.push(el.geom.grad_x(refq, ue));
+            gy.push(el.geom.grad_y(refq, ue));
+        }
+
+        // Volume stiffness (fused form — the same operator the GPU kernel computes),
+        // so that `apply − apply_volume` is exactly the face contribution.
+        let mut r = self.apply_volume(u);
+
+        // Face terms.
+        for (e, el) in m.elements.iter().enumerate() {
+            for edge in Edge::ALL {
+                let f = &el.faces[edge as usize];
+                match &el.neighbors[edge as usize] {
+                    Neighbor::Interior { elem: re, edge: redge, perm } => {
+                        if e >= *re {
+                            continue; // process each interior face once (from low side)
+                        }
+                        let rel = &m.elements[*re];
+                        let rf = &rel.faces[*redge as usize];
+                        let tau = self.penalty(e, Some(*re));
+                        let mut hxl = vec![0.0; nn];
+                        let mut hyl = vec![0.0; nn];
+                        let mut hxr = vec![0.0; nn];
+                        let mut hyr = vec![0.0; nn];
+                        for a in 0..f.nodes.len() {
+                            let b = perm[a];
+                            let (vl, vr) = (f.nodes[a], rf.nodes[b]);
+                            let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
+                            let dun_l = nx * gx[e][vl] + ny * gy[e][vl];
+                            let dun_r = nx * gx[*re][vr] + ny * gy[*re][vr];
+                            let avg = 0.5 * (dun_l + dun_r);
+                            let jump = u[e * nn + vl] - u[*re * nn + vr];
+                            // consistency  −∮{∇u·n}[v]
+                            r[e * nn + vl] += -sw * avg;
+                            r[*re * nn + vr] += sw * avg;
+                            // penalty  +∮ τ[u][v]
+                            r[e * nn + vl] += tau * sw * jump;
+                            r[*re * nn + vr] += -tau * sw * jump;
+                            // symmetry  −∮{∇v·n}[u]  (lift, average factor ½, same normal n_L)
+                            let g = 0.5 * sw * jump;
+                            hxl[vl] += g * nx;
+                            hyl[vl] += g * ny;
+                            hxr[vr] += g * nx;
+                            hyr[vr] += g * ny;
+                        }
+                        let ll = add(el.geom.gradx_t(refq, &hxl), el.geom.grady_t(refq, &hyl));
+                        let lr = add(rel.geom.gradx_t(refq, &hxr), rel.geom.grady_t(refq, &hyr));
+                        for k in 0..nn {
+                            r[e * nn + k] -= ll[k];
+                            r[*re * nn + k] -= lr[k];
+                        }
+                    }
+                    Neighbor::Boundary { tag } => {
+                        if self.is_neumann(*tag) {
+                            // Natural (Neumann) BC: no operator contribution; the
+                            // prescribed flux enters the RHS instead.
+                            continue;
+                        }
+                        let tau = self.penalty(e, None);
+                        let mut hx = vec![0.0; nn];
+                        let mut hy = vec![0.0; nn];
+                        for a in 0..f.nodes.len() {
+                            let v = f.nodes[a];
+                            let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
+                            let dun = nx * gx[e][v] + ny * gy[e][v];
+                            let uval = u[e * nn + v];
+                            r[e * nn + v] += -sw * dun; // consistency  −∮(∇u·n)v
+                            r[e * nn + v] += tau * sw * uval; // penalty  +∮ τ u v
+                            hx[v] += sw * uval * nx; // symmetry  −∮(∇v·n)u
+                            hy[v] += sw * uval * ny;
+                        }
+                        let l = add(el.geom.gradx_t(refq, &hx), el.geom.grady_t(refq, &hy));
+                        for k in 0..nn {
+                            r[e * nn + k] -= l[k];
+                        }
+                    }
+                }
+            }
+        }
+        // Helmholtz reaction term: + λ M u (diagonal mass).
+        if self.reaction != 0.0 {
+            for (e, el) in m.elements.iter().enumerate() {
+                for k in 0..nn {
+                    r[e * nn + k] += self.reaction * el.geom.jw[k] * u[e * nn + k];
+                }
+            }
+        }
+        r
+    }
+
+    /// Volume-stiffness action only (no face terms): `Dxᵀ W Dx u + Dyᵀ W Dy u`,
+    /// element-local. Written in the fused `pr/ps` form the GPU kernel uses, so it
+    /// is the bit-for-bit reference for the GPU volume-operator port.
+    pub fn apply_volume(&self, u: &[f64]) -> Vec<f64> {
+        let m = self.mesh;
+        let refq = &m.refq;
+        let nn = refq.n_nodes();
+        let mut r = vec![0.0; self.ndof()];
+        for (e, el) in m.elements.iter().enumerate() {
+            let ue = &u[e * nn..(e + 1) * nn];
+            let gx = el.geom.grad_x(refq, ue);
+            let gy = el.geom.grad_y(refq, ue);
+            let mut pr = vec![0.0; nn];
+            let mut ps = vec![0.0; nn];
+            for k in 0..nn {
+                let wx = el.geom.jw[k] * gx[k];
+                let wy = el.geom.jw[k] * gy[k];
+                pr[k] = el.geom.rx[k] * wx + el.geom.ry[k] * wy;
+                ps[k] = el.geom.sx[k] * wx + el.geom.sy[k] * wy;
+            }
+            let a = refq.diff_r_t(&pr);
+            let b = refq.diff_s_t(&ps);
+            for k in 0..nn {
+                r[e * nn + k] = a[k] + b[k];
+            }
+        }
+        r
+    }
+
+    /// RHS for `−∇²u = f` with all-Dirichlet data `u = g`.
+    pub fn rhs(&self, f: &[f64], g: impl Fn(f64, f64) -> f64) -> Vec<f64> {
+        self.rhs_mixed(f, g, |_, _| 0.0)
+    }
+
+    /// RHS for mixed boundaries: `g` (value) on Dirichlet faces, `q = ∂u/∂n` (flux)
+    /// on Neumann faces (those whose tag is in `neumann_tags`).
+    pub fn rhs_mixed(
+        &self,
+        f: &[f64],
+        g: impl Fn(f64, f64) -> f64,
+        q: impl Fn(f64, f64) -> f64,
+    ) -> Vec<f64> {
+        let m = self.mesh;
+        let refq = &m.refq;
+        let nn = refq.n_nodes();
+        let mut b = vec![0.0; self.ndof()];
+
+        // Volume load (M f), diagonal mass = Jw.
+        for (e, el) in m.elements.iter().enumerate() {
+            for k in 0..nn {
+                b[e * nn + k] += el.geom.jw[k] * f[e * nn + k];
+            }
+        }
+        for (e, el) in m.elements.iter().enumerate() {
+            for edge in Edge::ALL {
+                let Neighbor::Boundary { tag } = el.neighbors[edge as usize] else {
+                    continue;
+                };
+                let face = &el.faces[edge as usize];
+                if self.is_neumann(tag) {
+                    // Neumann flux: + ∮ q v ds (at the face nodes).
+                    for a in 0..face.nodes.len() {
+                        let v = face.nodes[a];
+                        b[e * nn + v] += face.sw[a] * q(el.geom.x[v], el.geom.y[v]);
+                    }
+                } else {
+                    // Dirichlet data: −∮(∇v·n)g + ∮ τ g v.
+                    let tau = self.penalty(e, None);
+                    let mut hx = vec![0.0; nn];
+                    let mut hy = vec![0.0; nn];
+                    for a in 0..face.nodes.len() {
+                        let v = face.nodes[a];
+                        let (nx, ny, sw) = (face.nx[a], face.ny[a], face.sw[a]);
+                        let gv = g(el.geom.x[v], el.geom.y[v]);
+                        b[e * nn + v] += tau * sw * gv;
+                        hx[v] += sw * gv * nx;
+                        hy[v] += sw * gv * ny;
+                    }
+                    let l = add(el.geom.gradx_t(refq, &hx), el.geom.grady_t(refq, &hy));
+                    for k in 0..nn {
+                        b[e * nn + k] -= l[k];
+                    }
+                }
+            }
+        }
+        b
+    }
+
+    /// CG for the singular (pure-Neumann) system: deflates the constant nullspace
+    /// (`A·1 = 0`) by removing the mean from the residual each iteration. Returns
+    /// `(u, iterations)`; the solution is determined up to an additive constant.
+    pub fn cg_deflated(&self, b: &[f64], tol: f64, maxit: usize) -> (Vec<f64>, usize) {
+        let n = b.len();
+        let deflate = |v: &mut [f64]| {
+            let mean = v.iter().sum::<f64>() / n as f64;
+            v.iter_mut().for_each(|x| *x -= mean);
+        };
+        let mut x = vec![0.0; n];
+        let mut r = b.to_vec();
+        deflate(&mut r);
+        let mut p = r.clone();
+        let mut rs = dot(&r, &r);
+        let bn = rs.sqrt().max(1e-300);
+        for it in 0..maxit {
+            let ap = self.apply(&p);
+            let alpha = rs / dot(&p, &ap);
+            for i in 0..n {
+                x[i] += alpha * p[i];
+                r[i] -= alpha * ap[i];
+            }
+            deflate(&mut r);
+            let rs_new = dot(&r, &r);
+            if rs_new.sqrt() / bn < tol {
+                return (x, it + 1);
+            }
+            let beta = rs_new / rs;
+            for i in 0..n {
+                p[i] = r[i] + beta * p[i];
+            }
+            rs = rs_new;
+        }
+        (x, maxit)
+    }
+
+    /// Conjugate gradient for the SPD operator. Returns `(u, iterations, residual)`.
+    pub fn cg(&self, b: &[f64], tol: f64, maxit: usize) -> (Vec<f64>, usize, f64) {
+        let n = b.len();
+        let mut x = vec![0.0; n];
+        let mut r = b.to_vec(); // r = b − A·0
+        let mut p = r.clone();
+        let mut rs = dot(&r, &r);
+        let bnorm = dot(b, b).sqrt().max(1e-300);
+        for it in 0..maxit {
+            let ap = self.apply(&p);
+            let denom = dot(&p, &ap);
+            let alpha = rs / denom;
+            for i in 0..n {
+                x[i] += alpha * p[i];
+                r[i] -= alpha * ap[i];
+            }
+            let rs_new = dot(&r, &r);
+            if rs_new.sqrt() / bnorm < tol {
+                return (x, it + 1, rs_new.sqrt());
+            }
+            let beta = rs_new / rs;
+            for i in 0..n {
+                p[i] = r[i] + beta * p[i];
+            }
+            rs = rs_new;
+        }
+        (x, maxit, rs.sqrt())
+    }
+
+    /// L2 norm of a nodal field: `√(Σ Jw·v²)`.
+    pub fn l2_norm(&self, v: &[f64]) -> f64 {
+        let nn = self.mesh.refq.n_nodes();
+        let mut s = 0.0;
+        for (e, el) in self.mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                s += el.geom.jw[k] * v[e * nn + k] * v[e * nn + k];
+            }
+        }
+        s.sqrt()
+    }
+}
+
+#[inline]
+fn add(mut a: Vec<f64>, b: Vec<f64>) -> Vec<f64> {
+    for (x, y) in a.iter_mut().zip(b) {
+        *x += y;
+    }
+    a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sample a closure at every node into the global layout.
+    fn nodal(mesh: &Mesh2d, func: impl Fn(f64, f64) -> f64) -> Vec<f64> {
+        let nn = mesh.refq.n_nodes();
+        let mut v = vec![0.0; mesh.n_elements() * nn];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                v[e * nn + k] = func(el.geom.x[k], el.geom.y[k]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn operator_is_symmetric() {
+        let mesh = Mesh2d::rectangular(3, 3, 2, [0.0, 1.5], [0.0, 1.0]);
+        let a = Poisson::new(&mesh, 4.0);
+        // Deterministic pseudo-random vectors.
+        let mk = |seed: u64| -> Vec<f64> {
+            let mut s = seed;
+            (0..a.ndof())
+                .map(|_| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    ((s >> 33) as f64) / (1u64 << 31) as f64 - 1.0
+                })
+                .collect()
+        };
+        let (u, v) = (mk(1), mk(2));
+        let uav = dot(&u, &a.apply(&v));
+        let vau = dot(&v, &a.apply(&u));
+        assert!((uav - vau).abs() < 1e-9 * (1.0 + uav.abs()), "uᵀAv={uav} vᵀAu={vau}");
+    }
+
+    #[test]
+    fn spd_positive_on_nonzero() {
+        let mesh = Mesh2d::rectangular(3, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let a = Poisson::new(&mesh, 5.0);
+        let u = nodal(&mesh, |x, y| (x - 0.3) * (y + 0.7) + 0.21);
+        let q = dot(&u, &a.apply(&u));
+        assert!(q > 0.0, "uᵀAu = {q} not positive");
+    }
+
+    #[test]
+    fn patch_test_exact_on_quadratic() {
+        // u = x² + y² ⇒ −Δu = −4. Degree 2 ≤ p ⇒ the DG solution is exact.
+        for p in 2..=4 {
+            let mesh = Mesh2d::rectangular(p, 3, 2, [0.0, 1.5], [-1.0, 1.0]);
+            let a = Poisson::new(&mesh, 5.0);
+            let u_exact = nodal(&mesh, |x, y| x * x + y * y);
+            let f = nodal(&mesh, |_, _| -4.0);
+            let b = a.rhs(&f, |x, y| x * x + y * y);
+            let (uh, _it, _res) = a.cg(&b, 1e-13, 5000);
+            let err: Vec<f64> = uh.iter().zip(&u_exact).map(|(a, b)| a - b).collect();
+            let e = a.l2_norm(&err);
+            assert!(e < 1e-8, "p={p} patch-test L2 error {e}");
+        }
+    }
+
+    #[test]
+    fn patch_test_exact_on_harmonic_cubic() {
+        // u = x³ − 3xy² is harmonic ⇒ f = 0. Exact for p ≥ 3.
+        for p in 3..=4 {
+            let mesh = Mesh2d::rectangular(p, 2, 3, [-0.5, 1.0], [0.0, 1.2]);
+            let a = Poisson::new(&mesh, 5.0);
+            let exact = |x: f64, y: f64| x * x * x - 3.0 * x * y * y;
+            let u_exact = nodal(&mesh, exact);
+            let f = vec![0.0; a.ndof()];
+            let b = a.rhs(&f, exact);
+            let (uh, _it, _res) = a.cg(&b, 1e-13, 5000);
+            let err: Vec<f64> = uh.iter().zip(&u_exact).map(|(a, b)| a - b).collect();
+            assert!(a.l2_norm(&err) < 1e-7, "p={p} harmonic patch error {}", a.l2_norm(&err));
+        }
+    }
+
+    /// Mass-weighted mean of a nodal field.
+    fn mass_mean(mesh: &Mesh2d, v: &[f64]) -> f64 {
+        let nn = mesh.refq.n_nodes();
+        let mut s = 0.0;
+        let mut w = 0.0;
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                s += el.geom.jw[k] * v[e * nn + k];
+                w += el.geom.jw[k];
+            }
+        }
+        s / w
+    }
+
+    #[test]
+    fn neumann_poisson_converges_up_to_a_constant() {
+        // u = cos(πx)cos(πy) on [0,1]² has homogeneous Neumann on all sides;
+        // −∇²u = 2π²u = f, ∂u/∂n = 0. Pure-Neumann ⇒ singular; deflated CG + shift.
+        use std::f64::consts::PI;
+        let p = 4;
+        let exact = |x: f64, y: f64| (PI * x).cos() * (PI * y).cos();
+        let mut errs = Vec::new();
+        for &nx in &[2usize, 4, 8] {
+            let mesh = Mesh2d::rectangular(p, nx, nx, [0.0, 1.0], [0.0, 1.0]);
+            // All four box boundaries (tags 0..3) are Neumann.
+            let a = Poisson::with_bc(&mesh, 5.0, 0.0, vec![0, 1, 2, 3]);
+            let f = nodal(&mesh, |x, y| 2.0 * PI * PI * exact(x, y));
+            let b = a.rhs_mixed(&f, |_, _| 0.0, |_, _| 0.0); // homogeneous Neumann flux
+            let (mut uh, _it) = a.cg_deflated(&b, 1e-11, 20000);
+            let u_exact = nodal(&mesh, exact);
+            // Fix the constant: match the exact solution's mass-weighted mean.
+            let shift = mass_mean(&mesh, &u_exact) - mass_mean(&mesh, &uh);
+            uh.iter_mut().for_each(|x| *x += shift);
+            let err: Vec<f64> = uh.iter().zip(&u_exact).map(|(a, b)| a - b).collect();
+            errs.push(a.l2_norm(&err));
+        }
+        assert!(errs[1] < errs[0] && errs[2] < errs[1], "Neumann not converging: {errs:?}");
+        assert!(errs[2] < 1e-4, "final Neumann error {}", errs[2]);
+    }
+
+    #[test]
+    fn helmholtz_patch_test_exact_on_quadratic() {
+        // (λ − ∇²)u = f with u = x²+y², −∇²u = −4 ⇒ f = λ(x²+y²) − 4. Exact for p≥2.
+        let lambda = 12.0;
+        for p in 2..=4 {
+            let mesh = Mesh2d::rectangular(p, 3, 2, [0.0, 1.5], [-1.0, 1.0]);
+            let a = Poisson::with_reaction(&mesh, 5.0, lambda);
+            let u_exact = nodal(&mesh, |x, y| x * x + y * y);
+            let f = nodal(&mesh, |x, y| lambda * (x * x + y * y) - 4.0);
+            let b = a.rhs(&f, |x, y| x * x + y * y);
+            let (uh, _it, _res) = a.cg(&b, 1e-13, 5000);
+            let err: Vec<f64> = uh.iter().zip(&u_exact).map(|(a, b)| a - b).collect();
+            assert!(a.l2_norm(&err) < 1e-8, "p={p} Helmholtz patch error {}", a.l2_norm(&err));
+        }
+    }
+
+    #[test]
+    fn helmholtz_converges_and_is_spd() {
+        // (λ − ∇²)u = (λ + 2π²)u for u = sin πx sin πy on [0,1]², homogeneous Dirichlet.
+        use std::f64::consts::PI;
+        let lambda = 50.0; // ~ 1/(νΔt) scale of the viscous solve
+        let p = 4;
+        let exact = |x: f64, y: f64| (PI * x).sin() * (PI * y).sin();
+        let mut errs = Vec::new();
+        for &nx in &[2usize, 4, 8] {
+            let mesh = Mesh2d::rectangular(p, nx, nx, [0.0, 1.0], [0.0, 1.0]);
+            let a = Poisson::with_reaction(&mesh, 5.0, lambda);
+            let f = nodal(&mesh, |x, y| (lambda + 2.0 * PI * PI) * exact(x, y));
+            let b = a.rhs(&f, |_, _| 0.0);
+            // SPD: a few CG iters must not break down (denominators stay positive).
+            let (uh, _it, _res) = a.cg(&b, 1e-12, 20000);
+            let u_exact = nodal(&mesh, exact);
+            let err: Vec<f64> = uh.iter().zip(&u_exact).map(|(a, b)| a - b).collect();
+            errs.push(a.l2_norm(&err));
+        }
+        assert!(errs[1] < errs[0] && errs[2] < errs[1], "Helmholtz not converging: {errs:?}");
+        assert!(errs[2] < 1e-5, "final Helmholtz error {}", errs[2]);
+    }
+
+    #[test]
+    fn manufactured_solution_converges_at_high_order() {
+        // u = sin(πx) sin(πy) on [0,1]² (homogeneous Dirichlet), −Δu = 2π² u.
+        use std::f64::consts::PI;
+        let p = 4;
+        let exact = |x: f64, y: f64| (PI * x).sin() * (PI * y).sin();
+        let rhs_f = |x: f64, y: f64| 2.0 * PI * PI * (PI * x).sin() * (PI * y).sin();
+
+        let mut errs = Vec::new();
+        for &nx in &[2usize, 4, 8] {
+            let mesh = Mesh2d::rectangular(p, nx, nx, [0.0, 1.0], [0.0, 1.0]);
+            let a = Poisson::new(&mesh, 5.0);
+            let f = nodal(&mesh, rhs_f);
+            let b = a.rhs(&f, |_, _| 0.0);
+            let (uh, _it, _res) = a.cg(&b, 1e-12, 20000);
+            let u_exact = nodal(&mesh, exact);
+            let err: Vec<f64> = uh.iter().zip(&u_exact).map(|(a, b)| a - b).collect();
+            errs.push(a.l2_norm(&err));
+        }
+        // Errors decrease, and the observed h-rate is high-order (≥ p, expecting ~p+1).
+        assert!(errs[1] < errs[0] && errs[2] < errs[1], "errors not decreasing: {errs:?}");
+        let rate = (errs[1] / errs[2]).log2();
+        assert!(rate >= p as f64, "observed order {rate} (errs {errs:?})");
+        assert!(errs[2] < 1e-5, "final error {} too large", errs[2]);
+    }
+}
