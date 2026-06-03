@@ -228,7 +228,7 @@ mod tests {
         let xr = [0.0, 1.0];
         let yr = [0.0, 1.0];
         let mut st = State::new(Mesh2d::rectangular(order, nx, ny, xr, yr));
-        st.add_field_from("wiggle", &[|x: f64, y: f64| (20.0 * PI * x).sin()]);
+        st.add_field_from("wiggle", &[|x: f64, _y: f64| (20.0 * PI * x).sin()]);
         let n0 = st.mesh.n_elements();
 
         let mut sim = Simulation::new(st);

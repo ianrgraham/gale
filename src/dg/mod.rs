@@ -8,6 +8,8 @@ pub mod distributed;
 pub mod face;
 pub mod filter;
 pub mod geometry;
+pub mod geometry3d;
+pub mod hex;
 pub mod hyperbolic;
 pub mod immersed;
 pub mod membrane;
@@ -28,6 +30,8 @@ pub use distributed::{distributed_advection_rhs, halo_exchange, partition_blocks
 pub use face::{quad_faces, Edge, FaceData};
 pub use filter::ModalFilter;
 pub use geometry::QuadGeometry;
+pub use geometry3d::HexGeometry;
+pub use hex::Reference3dHex;
 pub use immersed::{Disk, ImmersedSolid, RigidBody, Shape, VolumePenalization};
 pub use hyperbolic::{
     Burgers, ConservationLaw, Euler, Hyperbolic, IncompressibleConvection, LinearAdvection,
