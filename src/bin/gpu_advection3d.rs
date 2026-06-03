@@ -8,15 +8,14 @@
 //! This extends the validated GPU operator coverage to 3D (the prerequisite for 3D
 //! multi-GPU); `n_nodes = (p+1)³` per block, `n1²` diff entries.
 //!
-//! STATUS — blocked on a cuda-oxide backend bug (see
-//! `docs/cuda-oxide-codegen-notes.md`). This kernel's NVVM IR is emitted with
-//! **opaque pointers** (`ptr`) instead of the **typed pointers** (`i8*`) the 2D
-//! kernels get, and libNVVM rejects it: `nvvmCompileProgram ... parse expected
-//! type` at the first parameter. The CPU operator (`Hyperbolic3d`) it validates
-//! against is correct and tested; this binary is the minimal reproducer for the
-//! backend's missing typed-pointer conversion on this kernel.
+//! Validated bit-for-bit vs `Hyperbolic3d` on the 2× Titan V (max relative error
+//! ~5e-16). Note: this kernel auto-routes through the libdevice/NVVM-IR path (it
+//! uses `f64::abs`), which originally hit a cuda-oxide backend bug — the embedded
+//! NVVM IR was emitted with opaque pointers and pre-Blackwell libNVVM rejected it.
+//! Fixed in the fork (`NvvmIrDialect::for_target` now defaults unknown targets to
+//! typed pointers; see `docs/cuda-oxide-codegen-notes.md` §3).
 //!
-//! Run: cargo oxide run --bin gpu-advection3d   (currently fails at NVVM compile)
+//! Run: cargo oxide run --bin gpu-advection3d
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};

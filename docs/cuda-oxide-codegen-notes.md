@@ -314,3 +314,32 @@ lowering to cover whatever pattern this kernel hits — candidates: the 3-way te
 volume contraction indexing, or the `met[b*9+c]` packed-stride loads). This blocks
 the 3D GPU operator (and thus 3D multi-GPU GPU execution) until fixed upstream; the
 2D GPU path and the whole CPU 3D stack are unaffected.
+
+#### Resolution
+
+Root cause: **`NvvmIrDialect::for_target` defaulted unknown/`None`/sentinel targets
+to `OpaquePointers`.** The 3D hex kernels use `f64::abs` (`__nv_fabs`), so the
+pipeline auto-switches to the NVVM-IR path (`needs_libdevice`). In that path the
+embedded `.ll` is exported once at codegen time and compiled by `nvvmCompileProgram
+-gen-lto` at *runtime* on the host GPU. When `CUDA_OXIDE_TARGET` was not threaded
+through, the export saw the `"nvvm-ir"` sentinel / `None` and picked OpaquePointers
+→ opaque `ptr` → pre-Blackwell libNVVM `parse expected type`. (The 2D kernels
+happened to get a concrete `sm_70` and so rendered typed `i8*`.)
+
+Fix (fork `crates/dialect-llvm/src/export/config.rs`): invert the default so only
+an **explicit** Blackwell-or-newer target gets opaque pointers; pre-Blackwell **and
+unknown** targets get the typed-pointer dialect, which is always loadable on
+pre-Blackwell libNVVM:
+
+```rust
+match target.and_then(cuda_arch_major) {
+    Some(major) if major >= 10 => Self::OpaquePointers,
+    _ => Self::TypedPointers,   // pre-Blackwell AND unknown → typed (libNVVM-safe)
+}
+```
+
+After rebuilding the backend, `gpu-advection3d` (p=4, 125 nodes/elem, 3375 dofs)
+emits typed `i8*` + the legacy NVVM datalayout and matches the CPU `Hyperbolic3d`
+operator to **5.078e-16** on the 2× Titan V. This is a clean upstream contribution
+(PR-ready, following the §1/§2 typed-pointer fixes). The 3D GPU operator — and thus
+the 3D multi-GPU path — is unblocked.
