@@ -208,7 +208,7 @@ pub fn adapt_scalar(
 }
 
 /// 1D Lagrange basis `ℓ_j(x)` at the reference nodes, evaluated at `x`.
-fn lagrange_basis(nodes: &[f64], x: f64) -> Vec<f64> {
+pub(crate) fn lagrange_basis(nodes: &[f64], x: f64) -> Vec<f64> {
     let n = nodes.len();
     (0..n)
         .map(|i| {

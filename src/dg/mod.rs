@@ -4,6 +4,7 @@
 //! reference element → mesh (face-based) → operators → scalar elliptic solve → flow.
 
 pub mod amr;
+pub mod amr3d;
 pub mod dgmesh;
 pub mod distributed;
 pub mod face;
@@ -34,6 +35,7 @@ pub use amr::{
     adapt_scalar, remap_component_flat, remap_scalar, smoothness_per_cell, RefineQuad,
     SmoothnessIndicator,
 };
+pub use amr3d::{RefineHex, SmoothnessIndicator3d};
 pub use dgmesh::DgMesh;
 pub use distributed::{distributed_advection_rhs, halo_exchange, partition_blocks};
 pub use face::{quad_faces, Edge, FaceData};
