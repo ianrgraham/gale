@@ -11,3 +11,4 @@
 //! for the design and build order.
 
 pub mod dg;
+pub mod sim;
