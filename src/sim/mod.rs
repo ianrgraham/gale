@@ -13,6 +13,7 @@
 
 pub mod dynamics;
 pub mod field;
+pub mod ibm;
 pub mod integrate;
 pub mod simulation;
 pub mod stagehook;
@@ -25,6 +26,7 @@ pub use dynamics::{
     ViscoelasticDualSplitting,
 };
 pub use field::{Field, FieldId, FieldSet};
+pub use ibm::{PenalizationDrag, PenalizationHook};
 pub use integrate::{ClosureSemi, Integrator, NoHook, Semi, SspRk3, StageHook};
 pub use simulation::{
     Always, Compute, OnStep, Operations, Periodic, Simulation, Trigger, Triggered, Updater, Writer,

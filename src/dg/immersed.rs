@@ -127,6 +127,7 @@ impl ImmersedSolid for RigidBody {
 }
 
 /// Precomputed nodal volume-penalization operator for one (rigid) solid.
+#[derive(Clone, Debug)]
 pub struct VolumePenalization {
     /// Nodal indicator `χ`.
     pub mask: Vec<f64>,
