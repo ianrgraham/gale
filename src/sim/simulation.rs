@@ -19,6 +19,8 @@
 use super::device::{Device, DomainDecomposition};
 use super::dynamics::{NoStateHook, StateIntegrator, StateStageHook};
 use super::state::State;
+use crate::dg::dgmesh::DgMesh;
+use crate::dg::mesh::Mesh2d;
 
 /// A firing condition for a triggered operation — decouples *what* to do from
 /// *when* (HOOMD TriggeredOperation, api-design §3.5).
@@ -68,20 +70,20 @@ impl Trigger for Always {
 }
 
 /// A read-only diagnostic computed from the state (energy, drag, max-Wi, …).
-pub trait Compute {
+pub trait Compute<M: DgMesh = Mesh2d> {
     fn name(&self) -> &str;
-    fn compute(&self, state: &State) -> f64;
+    fn compute(&self, state: &State<M>) -> f64;
 }
 
 /// An operation that mutates the state when triggered (AMR, body advection, …).
-pub trait Updater {
-    fn update(&mut self, state: &mut State, step: u64);
+pub trait Updater<M: DgMesh = Mesh2d> {
+    fn update(&mut self, state: &mut State<M>, step: u64);
 }
 
 /// An operation that reads the state and emits output when triggered (I/O,
 /// checkpoint, progress). Must not mutate the state.
-pub trait Writer {
-    fn write(&mut self, state: &State, step: u64);
+pub trait Writer<M: DgMesh = Mesh2d> {
+    fn write(&mut self, state: &State<M>, step: u64);
 }
 
 /// Binds a triggered operation to its firing condition.
@@ -91,27 +93,32 @@ pub struct Triggered<T: ?Sized> {
 }
 
 /// The collection of operations applied during a run.
-#[derive(Default)]
-pub struct Operations {
-    pub computes: Vec<Box<dyn Compute>>,
-    pub updaters: Vec<Triggered<dyn Updater>>,
-    pub writers: Vec<Triggered<dyn Writer>>,
+pub struct Operations<M: DgMesh = Mesh2d> {
+    pub computes: Vec<Box<dyn Compute<M>>>,
+    pub updaters: Vec<Triggered<dyn Updater<M>>>,
+    pub writers: Vec<Triggered<dyn Writer<M>>>,
+}
+
+impl<M: DgMesh> Default for Operations<M> {
+    fn default() -> Self {
+        Self { computes: Vec::new(), updaters: Vec::new(), writers: Vec::new() }
+    }
 }
 
 /// The central object: owns the state, the operations, and the time-advance
 /// machinery (semidiscretization + integrator + stage hook).
-pub struct Simulation {
-    pub state: State,
-    pub operations: Operations,
-    integrator: Option<Box<dyn StateIntegrator>>,
-    hook: Box<dyn StateStageHook>,
+pub struct Simulation<M: DgMesh = Mesh2d> {
+    pub state: State<M>,
+    pub operations: Operations<M>,
+    integrator: Option<Box<dyn StateIntegrator<M>>>,
+    hook: Box<dyn StateStageHook<M>>,
     device: Device,
 }
 
-impl Simulation {
+impl<M: DgMesh> Simulation<M> {
     /// A simulation over `state` with no operations, no integrator, and the
     /// default [`Device::Cpu`] backend.
-    pub fn new(state: State) -> Self {
+    pub fn new(state: State<M>) -> Self {
         Self {
             state,
             operations: Operations::default(),
@@ -142,29 +149,29 @@ impl Simulation {
     /// Set the integrator (exactly one per simulation, HOOMD invariant). The
     /// integrator owns its dynamics — a method-of-lines [`Mol`](super::dynamics::Mol)
     /// carries its semidiscretization; a structured scheme carries its config.
-    pub fn set_integrator(&mut self, integrator: impl StateIntegrator + 'static) {
+    pub fn set_integrator(&mut self, integrator: impl StateIntegrator<M> + 'static) {
         self.integrator = Some(Box::new(integrator));
     }
 
     /// Set the per-stage hook (limiters / filter / penalization projection).
-    pub fn set_stage_hook(&mut self, hook: impl StateStageHook + 'static) {
+    pub fn set_stage_hook(&mut self, hook: impl StateStageHook<M> + 'static) {
         self.hook = Box::new(hook);
     }
 
     /// Register a read-only compute.
-    pub fn add_compute(&mut self, compute: impl Compute + 'static) {
+    pub fn add_compute(&mut self, compute: impl Compute<M> + 'static) {
         self.operations.computes.push(Box::new(compute));
     }
 
     /// Register a triggered updater.
-    pub fn add_updater(&mut self, updater: impl Updater + 'static, trigger: impl Trigger + 'static) {
+    pub fn add_updater(&mut self, updater: impl Updater<M> + 'static, trigger: impl Trigger + 'static) {
         self.operations
             .updaters
             .push(Triggered { trigger: Box::new(trigger), op: Box::new(updater) });
     }
 
     /// Register a triggered writer.
-    pub fn add_writer(&mut self, writer: impl Writer + 'static, trigger: impl Trigger + 'static) {
+    pub fn add_writer(&mut self, writer: impl Writer<M> + 'static, trigger: impl Trigger + 'static) {
         self.operations
             .writers
             .push(Triggered { trigger: Box::new(trigger), op: Box::new(writer) });
@@ -326,6 +333,65 @@ mod tests {
         assert!(dd.is_balanced());
         sim2.run(20);
         assert_eq!(sim2.state.field("u").component(0), cpu_ref.as_slice());
+    }
+
+    /// The same HOOMD-style API assembles and runs a **3D** simulation: a
+    /// `Simulation<Mesh3d>` with a `Mol` integrator over a 3D advection
+    /// semidiscretization, a Compute, and a multi-GPU Device — exercising the
+    /// dimension-generic framework (`State<M>`, `Simulation<M>`).
+    #[test]
+    fn drives_a_3d_simulation_through_the_hoomd_api() {
+        use crate::dg::hyperbolic3d::{Hyperbolic3d, LinearAdvection3d};
+        use crate::dg::mesh3d::Mesh3d;
+        use crate::sim::device::{Device, Partition};
+        use crate::sim::dynamics::BaseRhs;
+
+        let (ax, ay, az) = (1.0, 0.5, 0.25);
+        let mesh = Mesh3d::rectangular_periodic(3, 3, 3, 3, [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]);
+        let mut st: State<Mesh3d> = State::new(mesh);
+        let uid = st.add_field_from("u", &[|x: f64, y: f64, z: f64| {
+            (2.0 * PI * x).sin() * (2.0 * PI * y).sin() * (2.0 * PI * z).sin()
+        }]);
+        let base: BaseRhs<Mesh3d> = Box::new(move |s: &State<Mesh3d>, t: f64| {
+            let h = Hyperbolic3d::new(&s.mesh, LinearAdvection3d { ax, ay, az });
+            let bc = |_x: f64, _y: f64, _z: f64, _t: f64, _o: &mut [f64]| {};
+            h.rhs(s.field("u").components(), t, &bc)
+        });
+        let semi = StateSemidiscretization::<Mesh3d>::new().field(uid, base);
+
+        // L2 energy as a Compute<Mesh3d>.
+        struct Energy3d;
+        impl Compute<Mesh3d> for Energy3d {
+            fn name(&self) -> &str {
+                "energy"
+            }
+            fn compute(&self, state: &State<Mesh3d>) -> f64 {
+                let nn = state.mesh.refh.n_nodes();
+                let f = state.field("u");
+                let mut s = 0.0;
+                for (e, el) in state.mesh.elements.iter().enumerate() {
+                    for k in 0..nn {
+                        s += el.geom.jw[k] * f.component(0)[e * nn + k].powi(2);
+                    }
+                }
+                s
+            }
+        }
+
+        let mut sim = Simulation::new(st);
+        sim.set_integrator(Mol::new(semi, SspRk3State::new(1e-3)));
+        sim.add_compute(Energy3d);
+        // The Device abstraction is dimension-agnostic too.
+        sim.set_device(Device::MultiGpu { ordinals: vec![0, 1], partition: Partition::Blocks });
+        assert_eq!(sim.decompose().n_parts, 2);
+
+        let e0 = sim.compute("energy").unwrap();
+        assert!(e0 > 0.0);
+        sim.run(200);
+        assert_eq!(sim.state.time.step, 200);
+        let e1 = sim.compute("energy").unwrap();
+        // Linear advection is (near) energy-conserving.
+        assert!((e1 - e0).abs() / e0 < 1e-2, "3D advection energy drift {}", (e1 - e0) / e0);
     }
 
     /// A registered compute can be pulled on demand and returns a sensible value.

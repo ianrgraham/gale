@@ -14,6 +14,8 @@
 
 use super::field::FieldId;
 use super::state::State;
+use crate::dg::dgmesh::DgMesh;
+use crate::dg::mesh::Mesh2d;
 use crate::dg::stokes::Stokes;
 use crate::dg::viscoelastic::{ConstitutiveModel, LogConfOldroydB, OldroydB, ViscoelasticFlow};
 use std::collections::BTreeMap;
@@ -33,7 +35,7 @@ impl FieldVec {
     }
 
     /// Copy the listed fields' components out of `state`.
-    pub fn extract(state: &State, ids: &[FieldId]) -> Self {
+    pub fn extract<M: DgMesh>(state: &State<M>, ids: &[FieldId]) -> Self {
         let mut data = BTreeMap::new();
         for &id in ids {
             data.insert(id.0, state.fields.by_id(id).components().to_vec());
@@ -68,7 +70,7 @@ impl FieldVec {
     }
 
     /// Write all held fields back into `state`.
-    pub fn scatter_into(&self, state: &mut State) {
+    pub fn scatter_into<M: DgMesh>(&self, state: &mut State<M>) {
         for (&k, comps) in &self.data {
             state.fields.by_id_mut(FieldId(k)).assign(comps);
         }
@@ -97,73 +99,73 @@ impl FieldVec {
 /// An additive contribution to the State-level rhs. Unlike the vector-level
 /// [`Term`](super::term::Term), a `StateTerm` sees the **whole** `State`, so it can
 /// read any field and accumulate into any (evolving) field's derivative.
-pub trait StateTerm {
-    fn accumulate(&self, state: &State, t: f64, dot: &mut FieldVec);
+pub trait StateTerm<M: DgMesh = Mesh2d> {
+    fn accumulate(&self, state: &State<M>, t: f64, dot: &mut FieldVec);
 }
 
 /// Adapter wrapping a closure as a [`StateTerm`].
 pub struct FnStateTerm<F>(pub F);
 
-impl<F> StateTerm for FnStateTerm<F>
+impl<M: DgMesh, F> StateTerm<M> for FnStateTerm<F>
 where
-    F: Fn(&State, f64, &mut FieldVec),
+    F: Fn(&State<M>, f64, &mut FieldVec),
 {
-    fn accumulate(&self, state: &State, t: f64, dot: &mut FieldVec) {
+    fn accumulate(&self, state: &State<M>, t: f64, dot: &mut FieldVec) {
         (self.0)(state, t, dot)
     }
 }
 
 /// A State-level semi-discrete operator: produces `∂ₜ(evolving fields)`.
-pub trait StateSemi {
+pub trait StateSemi<M: DgMesh = Mesh2d> {
     /// The fields this operator evolves in time.
     fn evolving(&self) -> Vec<FieldId>;
     /// Fill `dot` with the time derivative of every evolving field, given the full
     /// `state` at time `t`. `dot` arrives zeroed with the right shapes.
-    fn rhs(&self, state: &State, t: f64, dot: &mut FieldVec);
+    fn rhs(&self, state: &State<M>, t: f64, dot: &mut FieldVec);
 }
 
 /// Per-field base rhs: given the full state and time, returns that field's base
 /// (un-coupled) time derivative in `[n_comp][ndof]` layout. Built to construct its
 /// operator transiently from `state.mesh`, avoiding any stored mesh borrow.
-pub type BaseRhs = Box<dyn Fn(&State, f64) -> Vec<Vec<f64>>>;
+pub type BaseRhs<M = Mesh2d> = Box<dyn Fn(&State<M>, f64) -> Vec<Vec<f64>>>;
 
 /// The concrete State-level semidiscretization: one base rhs per evolving field
 /// plus a list of additive cross-field [`StateTerm`]s.
-pub struct StateSemidiscretization {
-    bases: Vec<(FieldId, BaseRhs)>,
-    terms: Vec<Box<dyn StateTerm>>,
+pub struct StateSemidiscretization<M: DgMesh = Mesh2d> {
+    bases: Vec<(FieldId, BaseRhs<M>)>,
+    terms: Vec<Box<dyn StateTerm<M>>>,
 }
 
-impl StateSemidiscretization {
+impl<M: DgMesh> StateSemidiscretization<M> {
     pub fn new() -> Self {
         Self { bases: Vec::new(), terms: Vec::new() }
     }
 
     /// Register the base rhs for an evolving field.
-    pub fn field(mut self, id: FieldId, base: BaseRhs) -> Self {
+    pub fn field(mut self, id: FieldId, base: BaseRhs<M>) -> Self {
         self.bases.push((id, base));
         self
     }
 
     /// Append an additive cross-field term.
-    pub fn with_term(mut self, term: impl StateTerm + 'static) -> Self {
+    pub fn with_term(mut self, term: impl StateTerm<M> + 'static) -> Self {
         self.terms.push(Box::new(term));
         self
     }
 }
 
-impl Default for StateSemidiscretization {
+impl<M: DgMesh> Default for StateSemidiscretization<M> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl StateSemi for StateSemidiscretization {
+impl<M: DgMesh> StateSemi<M> for StateSemidiscretization<M> {
     fn evolving(&self) -> Vec<FieldId> {
         self.bases.iter().map(|(id, _)| *id).collect()
     }
 
-    fn rhs(&self, state: &State, t: f64, dot: &mut FieldVec) {
+    fn rhs(&self, state: &State<M>, t: f64, dot: &mut FieldVec) {
         // Base rhs for each evolving field (overwrite), then additive terms (+=).
         for (id, base) in &self.bases {
             dot.set(*id, base(state, t));
@@ -177,15 +179,15 @@ impl StateSemi for StateSemidiscretization {
 /// A per-stage `state ← g(state)` operation at the State level (limiters, SVV
 /// filter, implicit penalization projection). `stage` is the just-completed RK
 /// stage (0-based).
-pub trait StateStageHook {
-    fn after_stage(&self, state: &mut State, stage: usize);
+pub trait StateStageHook<M: DgMesh = Mesh2d> {
+    fn after_stage(&self, state: &mut State<M>, stage: usize);
 }
 
 /// The no-op State-level stage hook.
 pub struct NoStateHook;
 
-impl StateStageHook for NoStateHook {
-    fn after_stage(&self, _state: &mut State, _stage: usize) {}
+impl<M: DgMesh> StateStageHook<M> for NoStateHook {
+    fn after_stage(&self, _state: &mut State<M>, _stage: usize) {}
 }
 
 /// A State-level time integrator: advances the evolving fields of `state` by one
@@ -198,9 +200,9 @@ impl StateStageHook for NoStateHook {
 /// [`Simulation`](super::simulation::Simulation) drives either uniformly — the
 /// "one Integrator trait, multiple families" contract of `docs/api-design.md`
 /// §3.2.
-pub trait StateIntegrator {
+pub trait StateIntegrator<M: DgMesh = Mesh2d> {
     fn dt(&self) -> f64;
-    fn step(&self, state: &mut State, hook: &dyn StateStageHook);
+    fn step(&self, state: &mut State<M>, hook: &dyn StateStageHook<M>);
 }
 
 /// Explicit SSP-RK3 (Shu–Osher) *scheme* over a multi-field [`State`]. This is the
@@ -224,13 +226,18 @@ impl SspRk3State {
 
     /// Advance `state` by one SSP-RK3 step against `semi`, applying `hook` after
     /// each stage.
-    pub fn advance(&self, semi: &dyn StateSemi, state: &mut State, hook: &dyn StateStageHook) {
+    pub fn advance<M: DgMesh>(
+        &self,
+        semi: &dyn StateSemi<M>,
+        state: &mut State<M>,
+        hook: &dyn StateStageHook<M>,
+    ) {
         let t = state.time.t;
         let dt = self.dt;
         let ev = semi.evolving();
         let u0 = FieldVec::extract(state, &ev);
 
-        let eval = |state: &State, t: f64| -> FieldVec {
+        let eval = |state: &State<M>, t: f64| -> FieldVec {
             let mut dot = u0.zeros_like();
             semi.rhs(state, t, &mut dot);
             dot
@@ -262,22 +269,22 @@ impl SspRk3State {
 /// operator) to an explicit scheme (here [`SspRk3State`]). Owns the semi, so the
 /// [`Simulation`](super::simulation::Simulation) holds a single self-contained
 /// [`StateIntegrator`].
-pub struct Mol<S: StateSemi> {
+pub struct Mol<S> {
     pub semi: S,
     pub scheme: SspRk3State,
 }
 
-impl<S: StateSemi> Mol<S> {
+impl<S> Mol<S> {
     pub fn new(semi: S, scheme: SspRk3State) -> Self {
         Self { semi, scheme }
     }
 }
 
-impl<S: StateSemi> StateIntegrator for Mol<S> {
+impl<M: DgMesh, S: StateSemi<M>> StateIntegrator<M> for Mol<S> {
     fn dt(&self) -> f64 {
         self.scheme.dt()
     }
-    fn step(&self, state: &mut State, hook: &dyn StateStageHook) {
+    fn step(&self, state: &mut State<M>, hook: &dyn StateStageHook<M>) {
         self.scheme.advance(&self.semi, state, hook);
     }
 }
@@ -285,7 +292,7 @@ impl<S: StateSemi> StateIntegrator for Mol<S> {
 /// A nodal body force `(force_x, force_y)` over all DOFs, computed from the state
 /// and time — e.g. an external drive plus the polymer-stress divergence `∇·τ_p`
 /// read from the conformation field.
-pub type BodyForce = Box<dyn Fn(&State, f64) -> (Vec<f64>, Vec<f64>)>;
+pub type BodyForce<M = Mesh2d> = Box<dyn Fn(&State<M>, f64) -> (Vec<f64>, Vec<f64>)>;
 
 /// **Structured** incompressible Navier–Stokes integrator: BDF1 dual-splitting
 /// (explicit convection + body force → pressure-Poisson projection → implicit
