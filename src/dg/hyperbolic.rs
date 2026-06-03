@@ -447,6 +447,21 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
         let (mut ui, mut um) = (vec![0.0; nv], vec![0.0; nv]);
         let (mut fpx, mut fpy) = (vec![0.0; nv], vec![0.0; nv]);
 
+        // Mortar (for 2:1 non-conforming surfaces).
+        let mortar = super::amr::RefineQuad::new(mesh.order);
+        let sorted = |e: usize, edge: Edge| -> Vec<usize> {
+            let f = &mesh.elements[e].faces[edge as usize];
+            let gg = &mesh.elements[e].geom;
+            let vert = matches!(edge, Edge::East | Edge::West);
+            let mut idx: Vec<usize> = (0..f.nodes.len()).collect();
+            idx.sort_by(|&a, &b| {
+                let ca = if vert { gg.y[f.nodes[a]] } else { gg.x[f.nodes[a]] };
+                let cb = if vert { gg.y[f.nodes[b]] } else { gg.x[f.nodes[b]] };
+                ca.partial_cmp(&cb).unwrap()
+            });
+            idx
+        };
+
         for (e, el) in mesh.elements.iter().enumerate() {
             let g = &el.geom;
             // Volume: flux-differencing along each reference direction.
@@ -493,44 +508,101 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
                     }
                 }
             }
-            // Strong-form surface: + (1/Jw)(F(uᵢ)·n − F*·n).
+            // Strong-form surface: + (1/Jw)(F(uᵢ)·n − F*·n), with 2:1 mortar coupling.
             let (mut sm, mut sp) = (vec![0.0; nv], vec![0.0; nv]);
             let (mut fxm, mut fym) = (vec![0.0; nv], vec![0.0; nv]);
             let (mut fxp, mut fyp) = (vec![0.0; nv], vec![0.0; nv]);
+            let mut fbuf = vec![0.0; nv];
             for edge in Edge::ALL {
                 let face = &el.faces[edge as usize];
-                let nb = &el.neighbors[edge as usize];
-                for ai in 0..face.nodes.len() {
-                    let vl = face.nodes[ai];
-                    let (nx, ny, sw) = (face.nx[ai], face.ny[ai], face.sw[ai]);
-                    for v in 0..nv {
-                        sm[v] = state[v][e * nn + vl];
-                    }
-                    match nb {
-                        Neighbor::Interior { elem: re, edge: redge, perm } => {
-                            let rf = &mesh.elements[*re].faces[*redge as usize];
-                            let rnode = rf.nodes[perm[ai]];
+                match &el.neighbors[edge as usize] {
+                    Neighbor::FineToCoarse { .. } => {} // handled from the coarse side
+                    Neighbor::Interior { .. } | Neighbor::Boundary { .. } => {
+                        for ai in 0..face.nodes.len() {
+                            let vl = face.nodes[ai];
+                            let (nx, ny, sw) = (face.nx[ai], face.ny[ai], face.sw[ai]);
                             for v in 0..nv {
-                                sp[v] = state[v][*re * nn + rnode];
+                                sm[v] = state[v][e * nn + vl];
+                            }
+                            match &el.neighbors[edge as usize] {
+                                Neighbor::Interior { elem: re, edge: redge, perm } => {
+                                    let rnode = mesh.elements[*re].faces[*redge as usize].nodes[perm[ai]];
+                                    for v in 0..nv {
+                                        sp[v] = state[v][*re * nn + rnode];
+                                    }
+                                }
+                                _ => bc(g.x[vl], g.y[vl], t, &mut sp),
+                            }
+                            self.law.flux(&sm, &mut fxm, &mut fym);
+                            self.law.flux(&sp, &mut fxp, &mut fyp);
+                            let lam = self
+                                .law
+                                .max_wave_speed(&sm, nx, ny)
+                                .max(self.law.max_wave_speed(&sp, nx, ny));
+                            let diss = if self.dissipation { lam } else { 0.0 };
+                            for v in 0..nv {
+                                let fnm = fxm[v] * nx + fym[v] * ny;
+                                let fnp = fxp[v] * nx + fyp[v] * ny;
+                                let fstar = 0.5 * (fnm + fnp) - 0.5 * diss * (sp[v] - sm[v]);
+                                dudt[v][e * nn + vl] += sw * (fnm - fstar) / g.jw[vl];
                             }
                         }
-                        Neighbor::Boundary { .. } => bc(g.x[vl], g.y[vl], t, &mut sp),
-                        Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => {
-                            panic!("split-form does not support non-conforming meshes; use VolumeForm::Weak")
-                        }
                     }
-                    self.law.flux(&sm, &mut fxm, &mut fym);
-                    self.law.flux(&sp, &mut fxp, &mut fyp);
-                    let lam = self
-                        .law
-                        .max_wave_speed(&sm, nx, ny)
-                        .max(self.law.max_wave_speed(&sp, nx, ny));
-                    let diss = if self.dissipation { lam } else { 0.0 };
-                    for v in 0..nv {
-                        let fnm = fxm[v] * nx + fym[v] * ny;
-                        let fnp = fxp[v] * nx + fyp[v] * ny;
-                        let fstar = 0.5 * (fnm + fnp) - 0.5 * diss * (sp[v] - sm[v]);
-                        dudt[v][e * nn + vl] += sw * (fnm - fstar) / g.jw[vl];
+                    Neighbor::CoarseToFine { fine } => {
+                        let ce = sorted(e, edge);
+                        let (ncx, ncy) = (face.nx[ce[0]], face.ny[ce[0]]);
+                        let uc: Vec<Vec<f64>> = (0..nv)
+                            .map(|v| ce.iter().map(|&i| state[v][e * nn + face.nodes[i]]).collect())
+                            .collect();
+                        // Accumulate Σ_h Pᵀ(sw_m F*·n_c) for the coarse F* term.
+                        let mut fback: Vec<Vec<f64>> = (0..nv).map(|_| vec![0.0; ce.len()]).collect();
+                        for h in 0..2 {
+                            let (re, redge) = (fine[h].0, fine[h].1);
+                            let rw = sorted(re, redge);
+                            let frw = &mesh.elements[re].faces[redge as usize];
+                            let rg = &mesh.elements[re].geom;
+                            let uc_h: Vec<Vec<f64>> = (0..nv).map(|v| mortar.mortar_to_fine(&uc[v], h)).collect();
+                            let mut swfc: Vec<Vec<f64>> = (0..nv).map(|_| vec![0.0; rw.len()]).collect();
+                            for (mi, &i) in rw.iter().enumerate() {
+                                let k = frw.nodes[i];
+                                let (fnx, fny, fsw) = (frw.nx[i], frw.ny[i], frw.sw[i]);
+                                for v in 0..nv {
+                                    um[v] = uc_h[v][mi]; // coarse projected
+                                    sp[v] = state[v][re * nn + k]; // fine local
+                                }
+                                // Fine: (F(u_f)·n_f − F*·n_f)/Jw, neighbour = projected coarse.
+                                self.law.flux(&sp, &mut fxp, &mut fyp);
+                                self.rusanov(&sp, &um, fnx, fny, &mut fbuf);
+                                for v in 0..nv {
+                                    let fnm = fxp[v] * fnx + fyp[v] * fny;
+                                    dudt[v][re * nn + k] += fsw * (fnm - fbuf[v]) / rg.jw[k];
+                                }
+                                // Coarse F* (coarse normal), weighted for Pᵀ back-projection.
+                                self.rusanov(&um, &sp, ncx, ncy, &mut fbuf);
+                                for v in 0..nv {
+                                    swfc[v][mi] = fsw * fbuf[v];
+                                }
+                            }
+                            for v in 0..nv {
+                                let cc = mortar.mortar_gather(&swfc[v], h);
+                                for (m_, val) in cc.iter().enumerate() {
+                                    fback[v][m_] += val;
+                                }
+                            }
+                        }
+                        // Coarse: (sw_c F(u_c)·n_c − Σ_h Pᵀ(sw_m F*·n_c))/Jw.
+                        for (m_, &cf) in ce.iter().enumerate() {
+                            let vl = face.nodes[cf];
+                            let sw = face.sw[cf];
+                            for v in 0..nv {
+                                um[v] = state[v][e * nn + vl];
+                            }
+                            self.law.flux(&um, &mut fxm, &mut fym);
+                            for v in 0..nv {
+                                let fnm = fxm[v] * ncx + fym[v] * ncy;
+                                dudt[v][e * nn + vl] += (sw * fnm - fback[v][m_]) / g.jw[vl];
+                            }
+                        }
                     }
                 }
             }
@@ -617,6 +689,21 @@ mod tests {
         let r = op.rhs(&state, 0.0, &move |_, _, _, out: &mut [f64]| out.copy_from_slice(&c));
         let md = (0..4).flat_map(|v| r[v].iter().cloned()).fold(0.0f64, |a, x| a.max(x.abs()));
         assert!(md < 1e-9, "Euler free-stream not preserved on refined mesh: {md}");
+    }
+
+    #[test]
+    fn euler_split_form_free_stream_on_refined_mesh() {
+        // Split-form (entropy-stable) Euler on a non-conforming mesh: the strong-form
+        // surface ∮φ(F(u)·n − F*·n) must cancel for a uniform state across the 2:1
+        // mortar (coarse-edge Jacobian ½ × Pᵀ partition = fine Jacobian).
+        let mesh = Mesh2d::cartesian_refined(4, 3, 3, [0.0, 3.0], [0.0, 3.0], &[(1, 1)]);
+        let op = Hyperbolic::with_options(&mesh, Euler { gamma: 1.4 }, VolumeForm::SplitForm, true);
+        let c = euler_cons(1.4, 1.2, 0.3, -0.1, 1.0);
+        let ndof = mesh.n_elements() * mesh.refq.n_nodes();
+        let state: Vec<Vec<f64>> = (0..4).map(|v| vec![c[v]; ndof]).collect();
+        let r = op.rhs(&state, 0.0, &move |_, _, _, out: &mut [f64]| out.copy_from_slice(&c));
+        let md = (0..4).flat_map(|v| r[v].iter().cloned()).fold(0.0f64, |a, x| a.max(x.abs()));
+        assert!(md < 1e-9, "split-form free-stream not preserved on refined mesh: {md}");
     }
 
     #[test]
