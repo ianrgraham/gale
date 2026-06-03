@@ -21,7 +21,8 @@ pub mod term;
 
 pub use dynamics::{
     BaseRhs, BodyForce, DualSplitting, FieldVec, FnStateTerm, Mol, NoStateHook, SspRk3State,
-    StateIntegrator, StateSemi, StateSemidiscretization, StateStageHook, StateTerm,
+    StateIntegrator, StateSemi, StateSemidiscretization, StateStageHook, StateTerm, ViscoModel,
+    ViscoelasticDualSplitting,
 };
 pub use field::{Field, FieldId, FieldSet};
 pub use integrate::{ClosureSemi, Integrator, NoHook, Semi, SspRk3, StageHook};

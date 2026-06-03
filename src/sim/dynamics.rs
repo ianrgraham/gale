@@ -15,6 +15,7 @@
 use super::field::FieldId;
 use super::state::State;
 use crate::dg::stokes::Stokes;
+use crate::dg::viscoelastic::{ConstitutiveModel, LogConfOldroydB, OldroydB, ViscoelasticFlow};
 use std::collections::BTreeMap;
 
 /// A bundle of per-field values keyed by [`FieldId`] — used for both the evolving
@@ -377,6 +378,161 @@ impl StateIntegrator for DualSplitting {
     }
 }
 
+/// Which constitutive model the viscoelastic integrator uses. The model borrows
+/// the mesh, so it cannot be stored in a `'static` boxed integrator; instead the
+/// integrator stores this selector + parameters and builds the concrete model
+/// transiently from `state.mesh` each step. (Extending to user-defined models
+/// would mean a model-builder hook; the two validated models are covered here.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViscoModel {
+    /// Direct Oldroyd-B conformation transport.
+    OldroydB,
+    /// Log-conformation Oldroyd-B (Fattal–Kupferman) for high-Wi robustness.
+    LogConf,
+}
+
+/// **Coupled** viscoelastic integrator: one tightly-coupled advance of velocity
+/// **and** the conformation field, in the dual-splitting split order — velocity
+/// updates using `∇·τ_p` from the *old* conformation, then the conformation
+/// advances with the *new* velocity. Wraps the validated
+/// [`ViscoelasticFlow::step`], so it reproduces that operator bit-for-bit.
+///
+/// This is the third [`StateIntegrator`] family. The coupling is owned by the
+/// integrator (not expressed as a separate composable op) precisely because the
+/// split order does not fit the `updaters → integrator → writers` schedule — the
+/// faithful, validated mapping chosen in `docs/api-design.md` (VE coupling fork).
+pub struct ViscoelasticDualSplitting {
+    pub dt: f64,
+    pub eta_s: f64,
+    pub eta_p: f64,
+    pub lambda: f64,
+    pub alpha: f64,
+    pub model: ViscoModel,
+    velocity: FieldId,
+    conformation: FieldId,
+    bc_u: Box<dyn Fn(f64, f64, f64) -> f64>,
+    bc_v: Box<dyn Fn(f64, f64, f64) -> f64>,
+    fx: Box<dyn Fn(f64, f64, f64) -> f64>,
+    fy: Box<dyn Fn(f64, f64, f64) -> f64>,
+}
+
+impl ViscoelasticDualSplitting {
+    /// New coupled integrator over the 2-component `velocity` and 3-component
+    /// `conformation` (symmetric tensor `(xx, xy, yy)`) fields. Zero walls and no
+    /// external drive by default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        velocity: FieldId,
+        conformation: FieldId,
+        dt: f64,
+        eta_s: f64,
+        eta_p: f64,
+        lambda: f64,
+        alpha: f64,
+        model: ViscoModel,
+    ) -> Self {
+        Self {
+            dt,
+            eta_s,
+            eta_p,
+            lambda,
+            alpha,
+            model,
+            velocity,
+            conformation,
+            bc_u: Box::new(|_, _, _| 0.0),
+            bc_v: Box::new(|_, _, _| 0.0),
+            fx: Box::new(|_, _, _| 0.0),
+            fy: Box::new(|_, _, _| 0.0),
+        }
+    }
+
+    /// Set the Dirichlet velocity boundary conditions `(bc_u, bc_v)`.
+    pub fn boundary(
+        mut self,
+        bc_u: impl Fn(f64, f64, f64) -> f64 + 'static,
+        bc_v: impl Fn(f64, f64, f64) -> f64 + 'static,
+    ) -> Self {
+        self.bc_u = Box::new(bc_u);
+        self.bc_v = Box::new(bc_v);
+        self
+    }
+
+    /// Set the external body force / drive `(fx, fy)` as functions of `(x, y, t)`.
+    pub fn drive(
+        mut self,
+        fx: impl Fn(f64, f64, f64) -> f64 + 'static,
+        fy: impl Fn(f64, f64, f64) -> f64 + 'static,
+    ) -> Self {
+        self.fx = Box::new(fx);
+        self.fy = Box::new(fy);
+        self
+    }
+
+    /// The model's equilibrium conformation `[xx, xy, yy]` over `mesh` (identity
+    /// for direct Oldroyd-B; `Ψ = log I = 0` for log-conformation). Use to
+    /// initialize the conformation field.
+    pub fn equilibrium(&self, state: &State) -> [Vec<f64>; 3] {
+        match self.model {
+            ViscoModel::OldroydB => OldroydB::new(&state.mesh, self.lambda, self.eta_p).equilibrium(),
+            ViscoModel::LogConf => {
+                LogConfOldroydB::new(&state.mesh, self.lambda, self.eta_p).equilibrium()
+            }
+        }
+    }
+}
+
+impl StateIntegrator for ViscoelasticDualSplitting {
+    fn dt(&self) -> f64 {
+        self.dt
+    }
+
+    fn step(&self, state: &mut State, hook: &dyn StateStageHook) {
+        let t_new = state.time.t + self.dt;
+
+        // Read velocity + conformation, then run the coupled advance against a
+        // transient ViscoelasticFlow built from state.mesh. The flow (which borrows
+        // state.mesh) is fully consumed inside this block before we mutate fields.
+        let (nux, nuy, npsi) = {
+            let (ux, uy) = {
+                let v = state.fields.by_id(self.velocity);
+                (v.component(0).to_vec(), v.component(1).to_vec())
+            };
+            let c = {
+                let f = state.fields.by_id(self.conformation);
+                [f.component(0).to_vec(), f.component(1).to_vec(), f.component(2).to_vec()]
+            };
+            match self.model {
+                ViscoModel::OldroydB => {
+                    let m = OldroydB::new(&state.mesh, self.lambda, self.eta_p);
+                    let ve = ViscoelasticFlow::with_model(&state.mesh, self.eta_s, self.dt, self.alpha, m);
+                    ve.step(&ux, &uy, &c, t_new, &self.bc_u, &self.bc_v, &self.fx, &self.fy)
+                }
+                ViscoModel::LogConf => {
+                    let m = LogConfOldroydB::new(&state.mesh, self.lambda, self.eta_p);
+                    let ve = ViscoelasticFlow::with_model(&state.mesh, self.eta_s, self.dt, self.alpha, m);
+                    ve.step(&ux, &uy, &c, t_new, &self.bc_u, &self.bc_v, &self.fx, &self.fy)
+                }
+            }
+        };
+
+        {
+            let v = state.fields.by_id_mut(self.velocity);
+            v.component_mut(0).copy_from_slice(&nux);
+            v.component_mut(1).copy_from_slice(&nuy);
+        }
+        {
+            let cf = state.fields.by_id_mut(self.conformation);
+            for j in 0..3 {
+                cf.component_mut(j).copy_from_slice(&npsi[j]);
+            }
+        }
+        hook.after_stage(state, 0);
+        state.time.t = t_new;
+        state.time.step += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +788,83 @@ mod tests {
         // this is a sanity floor.
         let rel = (e2 / n2).sqrt();
         assert!(rel < 1e-2, "Taylor–Green relative L2 error too large: {rel:e}");
+    }
+
+    /// The coupled viscoelastic integrator, driven through the framework, must
+    /// match a direct ViscoelasticFlow loop **bit-for-bit** — the definitive proof
+    /// that it wraps the validated operator faithfully (velocity *and* conformation,
+    /// in the correct split order). Bit-for-bit equality holds at every step, so a
+    /// short run suffices; the steady-state η₀ parabola is the validated operator's
+    /// own result (dg::viscoelastic::coupled_channel_recovers_total_viscosity),
+    /// inherited here by exact equality rather than re-run (which would be a slow
+    /// 600-step double solve).
+    #[test]
+    fn viscoelastic_dual_splitting_matches_flow_bit_for_bit() {
+        use crate::dg::viscoelastic::ViscoelasticFlow;
+
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+        let (eta_s, eta_p, lambda, g) = (0.5, 0.5, 0.5, 1.0);
+        let eta0 = eta_s + eta_p;
+        let dt = 0.02;
+        let nn = mesh.refq.n_nodes();
+        let u_exact = move |y: f64| (g / (2.0 * eta0)) * y * (1.0 - y);
+        let bc_u = move |_x: f64, y: f64, _t: f64| u_exact(y);
+        let bc_v = |_: f64, _: f64, _: f64| 0.0;
+        let drive_x = move |_: f64, _: f64, _: f64| g;
+        let zero_f = |_: f64, _: f64, _: f64| 0.0;
+
+        // Framework run.
+        let mut st = State::new(mesh.clone());
+        let vid = st.add_field("velocity", 2);
+        let cid = st.add_field("conformation", 3);
+        let integ = ViscoelasticDualSplitting::new(
+            vid,
+            cid,
+            dt,
+            eta_s,
+            eta_p,
+            lambda,
+            5.0,
+            ViscoModel::OldroydB,
+        )
+        .boundary(bc_u, bc_v)
+        .drive(drive_x, zero_f);
+        // Initialize conformation to equilibrium (identity for Oldroyd-B).
+        let eq = integ.equilibrium(&st);
+        {
+            let cf = st.fields.by_id_mut(cid);
+            for j in 0..3 {
+                cf.component_mut(j).copy_from_slice(&eq[j]);
+            }
+        }
+        let nsteps = 40;
+        for _ in 0..nsteps {
+            integ.step(&mut st, &NoStateHook);
+        }
+
+        // Reference: the validated direct ViscoelasticFlow loop, identical setup.
+        let ve = ViscoelasticFlow::new(&mesh, eta_s, eta_p, lambda, dt, 5.0);
+        let mut rux = vec![0.0; mesh.n_elements() * nn];
+        let mut ruy = rux.clone();
+        let mut rc = ve.model.equilibrium();
+        let mut t = 0.0;
+        for _ in 0..nsteps {
+            t += dt;
+            let (nx, ny, nc) = ve.step(&rux, &ruy, &rc, t, bc_u, bc_v, drive_x, zero_f);
+            rux = nx;
+            ruy = ny;
+            rc = nc;
+        }
+
+        // Bit-for-bit faithful wrapping: velocity and all conformation components.
+        assert_eq!(st.field("velocity").component(0), rux.as_slice());
+        assert_eq!(st.field("velocity").component(1), ruy.as_slice());
+        for j in 0..3 {
+            assert_eq!(st.field("conformation").component(j), rc[j].as_slice());
+        }
+        // Sanity: the channel is developing (nonzero, finite velocity).
+        let umax = st.field("velocity").component(0).iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(umax.is_finite() && umax > 1e-3, "channel did not develop: umax={umax}");
     }
 }
