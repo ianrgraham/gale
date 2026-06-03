@@ -175,3 +175,37 @@ pub fn advection_rhs(
     )?;
     Ok(out_dev.to_host_vec(&stream)?)
 }
+
+/// A GPU-backed semidiscretization of scalar linear advection, usable directly by
+/// gale's framework: it implements [`gale::sim::StateSemi`], so a
+/// [`gale::sim::Mol`] + [`gale::sim::SspRk3State`] integrator drives it through
+/// [`gale::sim::Simulation::run`] with **each rhs evaluation on the GPU**.
+///
+/// This is the cross-crate framework integration: `gale` defines the
+/// `StateSemi`/`Mol`/`Simulation` seam (and does not depend on this crate);
+/// `gale-gpu` plugs a GPU operator into it. A user crate depending on both
+/// assembles a GPU-run simulation with the same API as the CPU one.
+pub struct GpuAdvection {
+    field: gale::sim::FieldId,
+    ax: f64,
+    ay: f64,
+}
+
+impl GpuAdvection {
+    /// Advect the scalar `field` (1 component) with velocity `(ax, ay)`.
+    pub fn new(field: gale::sim::FieldId, ax: f64, ay: f64) -> Self {
+        Self { field, ax, ay }
+    }
+}
+
+impl gale::sim::StateSemi<Mesh2d> for GpuAdvection {
+    fn evolving(&self) -> Vec<gale::sim::FieldId> {
+        vec![self.field]
+    }
+    fn rhs(&self, state: &gale::sim::State<Mesh2d>, _t: f64, dot: &mut gale::sim::FieldVec) {
+        let u = state.fields.by_id(self.field).component(0).to_vec();
+        let r = advection_rhs(&state.mesh, &u, self.ax, self.ay)
+            .expect("gale-gpu: advection_rhs launch failed");
+        dot.set(self.field, vec![r]);
+    }
+}

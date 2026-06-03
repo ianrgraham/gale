@@ -25,3 +25,10 @@ cuda-core = { workspace = true }
 [[bin]]
 name = "advection-check"
 path = "src/bin/advection_check.rs"
+
+# Cross-crate framework GPU execution: a Simulation driven by a GPU-backed
+# semidiscretization (gale_gpu::GpuAdvection impl of gale's StateSemi), checked
+# against an identical CPU-backed run. Run: cargo oxide run --bin sim-gpu-check
+[[bin]]
+name = "sim-gpu-check"
+path = "src/bin/sim_gpu_check.rs"
