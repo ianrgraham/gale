@@ -394,6 +394,52 @@ mod tests {
         assert!((e1 - e0).abs() / e0 < 1e-2, "3D advection energy drift {}", (e1 - e0) / e0);
     }
 
+    /// The headline 3D setup — flow past an immersed sphere — assembled and run
+    /// through the HOOMD API: Simulation<Mesh3d> + DualSplitting3d (structured NS) +
+    /// Penalization3dHook (IBM) + a drag Compute. The interior of the sphere is
+    /// damped relative to the free stream, and the drag is finite — proving the 3D
+    /// structured integrator and the IBM stage hook compose through the framework.
+    #[test]
+    fn flow_past_sphere_3d_through_the_api() {
+        use crate::dg::immersed3d::{Sphere, VolumePenalization3d};
+        use crate::dg::mesh3d::Mesh3d;
+        use crate::sim::dynamics::DualSplitting3d;
+        use crate::sim::ibm::{Penalization3dDrag, Penalization3dHook};
+
+        let mesh = Mesh3d::rectangular(3, 3, 3, 3, [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]);
+        let sphere = Sphere::new(0.5, 0.5, 0.5, 0.22);
+        let (eta_b, dt, nu) = (1e-3, 5e-3, 0.1);
+        let penal = VolumePenalization3d::new(&mesh, &sphere, eta_b);
+
+        let mut st: State<Mesh3d> = State::new(mesh);
+        let vid = st.add_field("velocity", 3);
+        for u in st.field_mut("velocity").component_mut(0).iter_mut() {
+            *u = 1.0; // uniform inflow u = (1,0,0)
+        }
+        let integ = DualSplitting3d::new(vid, dt, nu, 5.0)
+            .boundary(|_x, _y, _z, _t| 1.0, |_x, _y, _z, _t| 0.0, |_x, _y, _z, _t| 0.0);
+
+        let mut sim = Simulation::new(st);
+        sim.set_integrator(integ);
+        sim.set_stage_hook(Penalization3dHook::new(vid, penal.clone(), dt));
+        sim.add_compute(Penalization3dDrag::new("drag_x", vid, penal.clone(), 0));
+        sim.run(4);
+
+        // Interior of the sphere is damped well below the free-stream speed.
+        let v = sim.state.field("velocity");
+        let (mut s, mut n) = (0.0, 0.0);
+        for i in 0..penal.mask.len() {
+            if penal.mask[i] > 0.5 {
+                s += v.component(0)[i].abs();
+                n += 1.0;
+            }
+        }
+        let interior_mean = s / n;
+        assert!(interior_mean < 0.6, "sphere interior not damped: {interior_mean}");
+        let drag = sim.compute("drag_x").unwrap();
+        assert!(drag.is_finite() && drag > 0.0, "drag {drag}");
+    }
+
     /// A registered compute can be pulled on demand and returns a sensible value.
     #[test]
     fn compute_reports_diagnostic() {

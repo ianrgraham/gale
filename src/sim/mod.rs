@@ -25,9 +25,9 @@ pub mod term;
 pub use amr::AmrUpdater;
 pub use device::{Device, DomainDecomposition, Partition};
 pub use dynamics::{
-    BaseRhs, BodyForce, DualSplitting, FieldVec, FnStateTerm, Mol, NoStateHook, SspRk3State,
-    StateIntegrator, StateSemi, StateSemidiscretization, StateStageHook, StateTerm, ViscoModel,
-    ViscoelasticDualSplitting,
+    BaseRhs, BodyForce, BodyForce3d, DualSplitting, DualSplitting3d, FieldVec, FnStateTerm, Mol,
+    NoStateHook, SspRk3State, StateIntegrator, StateSemi, StateSemidiscretization, StateStageHook,
+    StateTerm, ViscoModel, ViscoelasticDualSplitting,
 };
 pub use field::{Field, FieldId, FieldSet};
 pub use ibm::{Penalization3dDrag, Penalization3dHook, PenalizationDrag, PenalizationHook};

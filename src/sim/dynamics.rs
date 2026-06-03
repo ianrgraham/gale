@@ -16,7 +16,9 @@ use super::field::FieldId;
 use super::state::State;
 use crate::dg::dgmesh::DgMesh;
 use crate::dg::mesh::Mesh2d;
+use crate::dg::mesh3d::Mesh3d;
 use crate::dg::stokes::Stokes;
+use crate::dg::stokes3d::Stokes3d;
 use crate::dg::viscoelastic::{ConstitutiveModel, LogConfOldroydB, OldroydB, ViscoelasticFlow};
 use std::collections::BTreeMap;
 
@@ -533,6 +535,95 @@ impl StateIntegrator for ViscoelasticDualSplitting {
             for j in 0..3 {
                 cf.component_mut(j).copy_from_slice(&npsi[j]);
             }
+        }
+        hook.after_stage(state, 0);
+        state.time.t = t_new;
+        state.time.step += 1;
+    }
+}
+
+/// A nodal 3D body force `(fx, fy, fz)` computed from the state and time.
+pub type BodyForce3d = Box<dyn Fn(&State<Mesh3d>, f64) -> (Vec<f64>, Vec<f64>, Vec<f64>)>;
+
+/// **Structured** 3D incompressible Navier–Stokes integrator: BDF1 dual-splitting,
+/// the `StateIntegrator<Mesh3d>` wrapping the validated [`Stokes3d`] operator
+/// (built transiently from `state.mesh`). The 3D analogue of [`DualSplitting`];
+/// with [`Penalization3dHook`](super::ibm::Penalization3dHook) as its post-step
+/// stage hook it makes flow-past-a-sphere assemblable through the HOOMD API.
+pub struct DualSplitting3d {
+    pub dt: f64,
+    pub nu: f64,
+    pub alpha: f64,
+    velocity: FieldId,
+    bc_u: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    bc_v: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    bc_w: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    body_force: BodyForce3d,
+}
+
+impl DualSplitting3d {
+    /// New 3D NS integrator advancing the 3-component `velocity` field, zero walls
+    /// and no body force by default.
+    pub fn new(velocity: FieldId, dt: f64, nu: f64, alpha: f64) -> Self {
+        Self {
+            dt,
+            nu,
+            alpha,
+            velocity,
+            bc_u: Box::new(|_, _, _, _| 0.0),
+            bc_v: Box::new(|_, _, _, _| 0.0),
+            bc_w: Box::new(|_, _, _, _| 0.0),
+            body_force: Box::new(|s: &State<Mesh3d>, _t: f64| {
+                let n = s.ndof();
+                (vec![0.0; n], vec![0.0; n], vec![0.0; n])
+            }),
+        }
+    }
+
+    /// Set the Dirichlet velocity boundary conditions `(bc_u, bc_v, bc_w)`.
+    pub fn boundary(
+        mut self,
+        bc_u: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+        bc_v: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+        bc_w: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+    ) -> Self {
+        self.bc_u = Box::new(bc_u);
+        self.bc_v = Box::new(bc_v);
+        self.bc_w = Box::new(bc_w);
+        self
+    }
+
+    /// Set the nodal body force `(fx, fy, fz)` computed from the state and new time.
+    pub fn body_force(
+        mut self,
+        f: impl Fn(&State<Mesh3d>, f64) -> (Vec<f64>, Vec<f64>, Vec<f64>) + 'static,
+    ) -> Self {
+        self.body_force = Box::new(f);
+        self
+    }
+}
+
+impl StateIntegrator<Mesh3d> for DualSplitting3d {
+    fn dt(&self) -> f64 {
+        self.dt
+    }
+
+    fn step(&self, state: &mut State<Mesh3d>, hook: &dyn StateStageHook<Mesh3d>) {
+        let t_new = state.time.t + self.dt;
+        let stokes = Stokes3d::new(&state.mesh, self.alpha, self.nu, self.dt);
+        let (ux, uy, uz) = {
+            let v = state.fields.by_id(self.velocity);
+            (v.component(0).to_vec(), v.component(1).to_vec(), v.component(2).to_vec())
+        };
+        let (bx, by, bz) = (self.body_force)(state, t_new);
+        let (nux, nuy, nuz) = stokes.step_ns_forced(
+            &ux, &uy, &uz, t_new, &self.bc_u, &self.bc_v, &self.bc_w, &bx, &by, &bz,
+        );
+        {
+            let v = state.fields.by_id_mut(self.velocity);
+            v.component_mut(0).copy_from_slice(&nux);
+            v.component_mut(1).copy_from_slice(&nuy);
+            v.component_mut(2).copy_from_slice(&nuz);
         }
         hook.after_stage(state, 0);
         state.time.t = t_new;
