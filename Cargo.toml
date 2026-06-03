@@ -138,3 +138,9 @@ path = "src/bin/gpu_logconf.rs"
 [[bin]]
 name = "gpu-multigpu"
 path = "src/bin/gpu_multigpu.rs"
+
+# Live multi-GPU 3D hex advection across 2 devices with P2P halo exchange.
+# Run: cargo oxide run --bin gpu-multigpu3d
+[[bin]]
+name = "gpu-multigpu3d"
+path = "src/bin/gpu_multigpu3d.rs"
