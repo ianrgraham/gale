@@ -12,6 +12,7 @@ pub mod geometry;
 pub mod geometry3d;
 pub mod hex;
 pub mod hyperbolic;
+pub mod hyperbolic3d;
 pub mod immersed;
 pub mod membrane;
 pub mod mesh;
@@ -35,6 +36,7 @@ pub use face3d::{hex_faces, Face, HexFaceData};
 pub use geometry::QuadGeometry;
 pub use geometry3d::HexGeometry;
 pub use hex::Reference3dHex;
+pub use hyperbolic3d::{ConservationLaw3d, Hyperbolic3d, LinearAdvection3d};
 pub use mesh3d::{HexElement, Mesh3d, Neighbor3};
 pub use immersed::{Disk, ImmersedSolid, RigidBody, Shape, VolumePenalization};
 pub use hyperbolic::{
