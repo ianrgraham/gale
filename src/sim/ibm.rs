@@ -15,6 +15,8 @@ use super::field::FieldId;
 use super::simulation::Compute;
 use super::state::State;
 use crate::dg::immersed::VolumePenalization;
+use crate::dg::immersed3d::VolumePenalization3d;
+use crate::dg::mesh3d::Mesh3d;
 
 /// Applies implicit volume penalization to the velocity field after a stage,
 /// driving the fluid toward the solid velocity inside the immersed body. This is
@@ -73,12 +75,96 @@ impl Compute for PenalizationDrag {
     }
 }
 
+/// 3D volume-penalization stage hook (`StateStageHook<Mesh3d>`): the 3D analogue of
+/// [`PenalizationHook`], damping the 3-component velocity field toward the solid.
+pub struct Penalization3dHook {
+    velocity: FieldId,
+    penal: VolumePenalization3d,
+    dt: f64,
+}
+
+impl Penalization3dHook {
+    pub fn new(velocity: FieldId, penal: VolumePenalization3d, dt: f64) -> Self {
+        Self { velocity, penal, dt }
+    }
+}
+
+impl StateStageHook<Mesh3d> for Penalization3dHook {
+    fn after_stage(&self, state: &mut State<Mesh3d>, _stage: usize) {
+        let comps = state.fields.by_id_mut(self.velocity).components_mut();
+        let (ux, rest) = comps.split_at_mut(1);
+        let (uy, uz) = rest.split_at_mut(1);
+        self.penal.apply(&mut ux[0], &mut uy[0], &mut uz[0], self.dt);
+    }
+}
+
+/// 3D hydrodynamic-drag compute (`Compute<Mesh3d>`): one component of
+/// `F = ∫(χ/η_b)(u − u_s)`.
+pub struct Penalization3dDrag {
+    name: String,
+    velocity: FieldId,
+    penal: VolumePenalization3d,
+    /// 0 = Fx, 1 = Fy, 2 = Fz.
+    axis: usize,
+}
+
+impl Penalization3dDrag {
+    pub fn new(name: impl Into<String>, velocity: FieldId, penal: VolumePenalization3d, axis: usize) -> Self {
+        Self { name: name.into(), velocity, penal, axis }
+    }
+}
+
+impl Compute<Mesh3d> for Penalization3dDrag {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn compute(&self, state: &State<Mesh3d>) -> f64 {
+        let v = state.fields.by_id(self.velocity);
+        let (fx, fy, fz) = self.penal.force(v.component(0), v.component(1), v.component(2), &state.mesh);
+        [fx, fy, fz][self.axis]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dg::immersed::{Disk, VolumePenalization};
+    use crate::dg::immersed3d::Sphere;
     use crate::dg::mesh::Mesh2d;
     use crate::sim::simulation::Compute;
+
+    /// The 3D penalization hook damps the velocity field inside an immersed sphere
+    /// through the `StateStageHook<Mesh3d>` seam, and the drag compute reports a
+    /// finite positive Fx.
+    #[test]
+    fn penalization_3d_hook_damps_and_drag_reports() {
+        let mesh = Mesh3d::rectangular(3, 4, 4, 4, [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]);
+        let sphere = Sphere::new(0.5, 0.5, 0.5, 0.2);
+        let (eta_b, dt) = (1e-4, 0.01);
+        let penal = VolumePenalization3d::new(&mesh, &sphere, eta_b);
+
+        let mut st: State<Mesh3d> = State::new(mesh);
+        let vid = st.add_field("velocity", 3);
+        for u in st.field_mut("velocity").component_mut(0).iter_mut() {
+            *u = 1.0;
+        }
+        let hook = Penalization3dHook::new(vid, penal.clone(), dt);
+        hook.after_stage(&mut st, 0);
+
+        let v = st.field("velocity");
+        for i in 0..penal.mask.len() {
+            if penal.mask[i] > 0.5 {
+                assert!(v.component(0)[i].abs() < 0.05, "solid node not damped: {}", v.component(0)[i]);
+            } else {
+                assert!((v.component(0)[i] - 1.0).abs() < 1e-12, "exterior perturbed");
+            }
+        }
+
+        let drag = Penalization3dDrag::new("drag_x", vid, penal, 0);
+        let fx = drag.compute(&st);
+        assert_eq!(drag.name(), "drag_x");
+        assert!(fx.is_finite() && fx > 0.0, "drag {fx}");
+    }
 
     /// The hook must reproduce a direct `VolumePenalization::apply` bit-for-bit
     /// (faithful wiring), strongly damp the velocity inside the solid, and leave

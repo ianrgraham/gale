@@ -30,7 +30,7 @@ pub use dynamics::{
     ViscoelasticDualSplitting,
 };
 pub use field::{Field, FieldId, FieldSet};
-pub use ibm::{PenalizationDrag, PenalizationHook};
+pub use ibm::{Penalization3dDrag, Penalization3dHook, PenalizationDrag, PenalizationHook};
 pub use integrate::{ClosureSemi, Integrator, NoHook, Semi, SspRk3, StageHook};
 pub use simulation::{
     Always, Compute, OnStep, Operations, Periodic, Simulation, Trigger, Triggered, Updater, Writer,

@@ -15,6 +15,7 @@ pub mod hex;
 pub mod hyperbolic;
 pub mod hyperbolic3d;
 pub mod immersed;
+pub mod immersed3d;
 pub mod membrane;
 pub mod mesh;
 pub mod mesh3d;
@@ -44,6 +45,7 @@ pub use hex::Reference3dHex;
 pub use hyperbolic3d::{ConservationLaw3d, Hyperbolic3d, LinearAdvection3d};
 pub use mesh3d::{HexElement, Mesh3d, Neighbor3};
 pub use immersed::{Disk, ImmersedSolid, RigidBody, Shape, VolumePenalization};
+pub use immersed3d::{Ellipsoid, ImmersedSolid3d, Sphere, VolumePenalization3d};
 pub use hyperbolic::{
     Burgers, ConservationLaw, Euler, Hyperbolic, IncompressibleConvection, LinearAdvection,
     VolumeForm,
