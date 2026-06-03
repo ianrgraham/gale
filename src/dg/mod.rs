@@ -4,6 +4,7 @@
 //! reference element → mesh (face-based) → operators → scalar elliptic solve → flow.
 
 pub mod amr;
+pub mod distributed;
 pub mod face;
 pub mod filter;
 pub mod geometry;
@@ -20,6 +21,7 @@ pub mod stokes;
 pub mod viscoelastic;
 
 pub use amr::{adapt_scalar, remap_scalar, RefineQuad, SmoothnessIndicator};
+pub use distributed::{distributed_advection_rhs, halo_exchange, partition_blocks};
 pub use face::{quad_faces, Edge, FaceData};
 pub use filter::ModalFilter;
 pub use geometry::QuadGeometry;
