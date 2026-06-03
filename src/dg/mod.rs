@@ -6,6 +6,7 @@
 pub mod amr;
 pub mod distributed;
 pub mod face;
+pub mod face3d;
 pub mod filter;
 pub mod geometry;
 pub mod geometry3d;
@@ -14,6 +15,7 @@ pub mod hyperbolic;
 pub mod immersed;
 pub mod membrane;
 pub mod mesh;
+pub mod mesh3d;
 pub mod multigrid;
 pub mod nonconforming;
 pub mod poisson;
@@ -29,9 +31,11 @@ pub use amr::{
 pub use distributed::{distributed_advection_rhs, halo_exchange, partition_blocks};
 pub use face::{quad_faces, Edge, FaceData};
 pub use filter::ModalFilter;
+pub use face3d::{hex_faces, Face, HexFaceData};
 pub use geometry::QuadGeometry;
 pub use geometry3d::HexGeometry;
 pub use hex::Reference3dHex;
+pub use mesh3d::{HexElement, Mesh3d, Neighbor3};
 pub use immersed::{Disk, ImmersedSolid, RigidBody, Shape, VolumePenalization};
 pub use hyperbolic::{
     Burgers, ConservationLaw, Euler, Hyperbolic, IncompressibleConvection, LinearAdvection,
