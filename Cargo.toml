@@ -65,9 +65,13 @@ path = "src/bin/gpu_poisson_faces.rs"
 # must be built from this commit and exposed via CUDA_OXIDE_BACKEND — see
 # .cargo/config.toml. Revert to `{ git = "https://github.com/NVlabs/cuda-oxide.git" }`
 # once #101 (and our fixes) merge upstream.
-cuda-device = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "a315b72f7603c984a29ea82d04221162288df8ba" }
-cuda-host   = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "a315b72f7603c984a29ea82d04221162288df8ba" }
-cuda-core   = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "a315b72f7603c984a29ea82d04221162288df8ba" }
+# Pinned to our fork branch fix/typed-pointer-insertvalue-bitcast, which carries the
+# typed-pointer bitcast fix (codegen backend) and cuda-core::memory::memcpy_peer_async
+# (multi-GPU P2P halo). The matching backend .so must be built from this commit and
+# exposed via CUDA_OXIDE_BACKEND (.cargo/config.toml). Revert to NVlabs once merged.
+cuda-device = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "965c4366d892dbbdacd72c87f08f429b9ea2b666" }
+cuda-host   = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "965c4366d892dbbdacd72c87f08f429b9ea2b666" }
+cuda-core   = { git = "https://github.com/ianrgraham/cuda-oxide.git", rev = "965c4366d892dbbdacd72c87f08f429b9ea2b666" }
 
 # GPU port step 7c: full SIPG operator (volume + faces, 2-kernel pipeline).
 # Run: cargo oxide run --bin gpu-poisson-operator
@@ -122,3 +126,9 @@ path = "src/bin/gpu_euler.rs"
 [[bin]]
 name = "gpu-logconf"
 path = "src/bin/gpu_logconf.rs"
+
+# Live multi-GPU advection across 2 devices with P2P halo exchange.
+# Run: cargo oxide run --bin gpu-multigpu
+[[bin]]
+name = "gpu-multigpu"
+path = "src/bin/gpu_multigpu.rs"
