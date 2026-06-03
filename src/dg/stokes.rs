@@ -392,4 +392,38 @@ mod tests {
         assert!(rate > 0.7, "temporal rate {rate} too low (errs {errs:?})");
         assert!(errs[2] < 5e-3, "final error {} too large", errs[2]);
     }
+
+    #[test]
+    fn stokes_on_refined_mesh() {
+        // The full dual-splitting Stokes solver on a NON-CONFORMING mesh (two refined
+        // cells): the pressure-Poisson and viscous-Helmholtz solves go through the
+        // mortar SIPG operator. The decaying vortex must be recovered, stably.
+        let nu = 1.0;
+        let p = 4;
+        let mesh = Mesh2d::cartesian_refined(p, 4, 4, [0.0, 1.0], [0.0, 1.0], &[(1, 1), (2, 2)]);
+        let decay = |t: f64| (-2.0 * PI * PI * nu * t).exp();
+        let eu = |x: f64, y: f64, t: f64| -(PI * x).cos() * (PI * y).sin() * decay(t);
+        let ev = |x: f64, y: f64, t: f64| (PI * x).sin() * (PI * y).cos() * decay(t);
+        let zero = |_: f64, _: f64, _: f64| 0.0;
+        let t_end = 0.1;
+        let nsteps = 10;
+        let dt = t_end / nsteps as f64;
+        let stokes = Stokes::new(&mesh, 5.0, nu, dt);
+        let mut ux = nodal(&mesh, |x, y| eu(x, y, 0.0));
+        let mut uy = nodal(&mesh, |x, y| ev(x, y, 0.0));
+        let mut t = 0.0;
+        for _ in 0..nsteps {
+            t += dt;
+            let (nx, ny) = stokes.step(&ux, &uy, t, eu, ev, zero, zero);
+            ux = nx;
+            uy = ny;
+        }
+        let exu = nodal(&mesh, |x, y| eu(x, y, t_end));
+        let exv = nodal(&mesh, |x, y| ev(x, y, t_end));
+        let ex: Vec<f64> = ux.iter().zip(&exu).map(|(a, b)| a - b).collect();
+        let ey: Vec<f64> = uy.iter().zip(&exv).map(|(a, b)| a - b).collect();
+        let err = (stokes.l2_norm(&ex).powi(2) + stokes.l2_norm(&ey).powi(2)).sqrt();
+        eprintln!("Stokes on refined mesh: velocity L2 error = {err:.3e}");
+        assert!(err.is_finite() && err < 2e-2, "Stokes on refined mesh inaccurate/unstable: {err}");
+    }
 }

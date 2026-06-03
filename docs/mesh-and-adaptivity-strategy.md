@@ -448,3 +448,22 @@ Remaining for full integration: lift this into the shared `Mesh2d`/`Neighbor` en
 the multi-law `Hyperbolic` (Euler/Burgers), `Stokes`, and SIPG `Poisson` run on
 adaptive meshes (a cross-cutting refactor of their face loops), and dynamic
 refine/coarsen driven by the `SmoothnessIndicator`.
+
+### Non-conforming elliptic + incompressible (2026-06-03)
+
+The **SIPG Poisson** operator now handles 2:1 interfaces via a symmetry-preserving
+mortar: coarse traces/gradients projected to the fine mortar with `P` (prolong),
+coarse test contributions scattered back with `Pᵀ` (`RefineQuad::mortar_gather`).
+Because `P`/`Pᵀ` and grad/gradᵀ are adjoint pairs, the operator stays symmetric.
+Validated: `⟨Au,v⟩=⟨Av,u⟩` to 1e−9 on a refined mesh, and a manufactured solve
+(`−Δu=2π²sin·sin`) converges to **5e−7**. The conforming path is byte-identical
+(no regression; mortar built per-apply at negligible cost).
+
+**Stokes** (dual-splitting) runs on refined meshes for free — its convection and
+divergence are nodal/element-local and the pressure-Poisson + viscous-Helmholtz
+solves go through the now-mortar-capable Poisson. Validated: the decaying vortex is
+recovered to **1.6e−3** on a two-patch refined mesh.
+
+So the elliptic, incompressible, and (weak-form) hyperbolic solvers all run on
+non-conforming adaptive meshes. Remaining: split-form Hyperbolic non-conforming
+(currently `panic`), and dynamic refine/coarsen during a running simulation.

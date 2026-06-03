@@ -179,6 +179,17 @@ impl RefineQuad {
         c
     }
 
+    /// Raw transpose of the 1D mortar prolongation `Pᵀ` for one half:
+    /// `out[j] = Σ_i P_half[i,j] · v[i]`. Unlike [`mortar_to_coarse`] there is no mass
+    /// normalization or Jacobian — used to scatter already-quadrature-weighted face
+    /// contributions from the fine mortar back to coarse test functions, keeping the
+    /// SIPG operator symmetric (`P`/`Pᵀ` an adjoint pair).
+    pub fn mortar_gather(&self, v: &[f64], half: usize) -> Vec<f64> {
+        let n = self.order + 1;
+        let p = self.axis(half);
+        (0..n).map(|j| (0..n).map(|i| p[i * n + j] * v[i]).sum()).collect()
+    }
+
     /// Restrict the 4 children (ordered `c = cx + 2cy`) to the parent via the
     /// conservative, mass-weighted L2 projection:
     /// `u_p[i,j] = (¼ / (w_i w_j)) Σ_c Σ_{a,b} P_cx[a,i] P_cy[b,j] w_a w_b u_c[a,b]`.

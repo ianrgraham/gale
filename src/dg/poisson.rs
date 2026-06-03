@@ -12,6 +12,7 @@
 //! Global DOF layout: element `e`, local node `k` → index `e·nn + k` (DG: no shared
 //! nodes between elements).
 
+use super::amr::RefineQuad;
 use super::face::Edge;
 use super::mesh::{Mesh2d, Neighbor};
 
@@ -94,6 +95,21 @@ impl<'m> Poisson<'m> {
         // so that `apply − apply_volume` is exactly the face contribution.
         let mut r = self.apply_volume(u);
 
+        // Mortar projections (only used at non-conforming faces).
+        let mortar = RefineQuad::new(m.order);
+        let sorted = |e: usize, edge: Edge| -> Vec<usize> {
+            let f = &m.elements[e].faces[edge as usize];
+            let g = &m.elements[e].geom;
+            let vert = matches!(edge, Edge::East | Edge::West);
+            let mut idx: Vec<usize> = (0..f.nodes.len()).collect();
+            idx.sort_by(|&a, &b| {
+                let ca = if vert { g.y[f.nodes[a]] } else { g.x[f.nodes[a]] };
+                let cb = if vert { g.y[f.nodes[b]] } else { g.x[f.nodes[b]] };
+                ca.partial_cmp(&cb).unwrap()
+            });
+            idx
+        };
+
         // Face terms.
         for (e, el) in m.elements.iter().enumerate() {
             for edge in Edge::ALL {
@@ -162,8 +178,70 @@ impl<'m> Poisson<'m> {
                             r[e * nn + k] -= l[k];
                         }
                     }
-                    Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => {
-                        panic!("non-conforming meshes are not yet supported by the SIPG Poisson operator")
+                    Neighbor::FineToCoarse { .. } => { /* handled from the coarse side */ }
+                    Neighbor::CoarseToFine { fine } => {
+                        // SIPG across a 2:1 interface, integrated on the fine mortar.
+                        // Coarse traces (sorted) and their coarse-normal gradient.
+                        let ce = sorted(e, edge);
+                        let (ncx, ncy) = (f.nx[ce[0]], f.ny[ce[0]]);
+                        let uc: Vec<f64> = ce.iter().map(|&i| u[e * nn + f.nodes[i]]).collect();
+                        let dnc: Vec<f64> = ce
+                            .iter()
+                            .map(|&i| {
+                                let v = f.nodes[i];
+                                ncx * gx[e][v] + ncy * gy[e][v]
+                            })
+                            .collect();
+                        let mut hxe = vec![0.0; nn];
+                        let mut hye = vec![0.0; nn];
+                        for h in 0..2 {
+                            let (re, redge) = fine[h];
+                            let tau = self.penalty(e, Some(re));
+                            let rel = &m.elements[re];
+                            let frw = &rel.faces[redge as usize];
+                            let rw = sorted(re, redge);
+                            let uc_m = mortar.mortar_to_fine(&uc, h);
+                            let dnc_m = mortar.mortar_to_fine(&dnc, h);
+                            let mut hxr = vec![0.0; nn];
+                            let mut hyr = vec![0.0; nn];
+                            let mut gc = vec![0.0; rw.len()]; // coarse-test consistency+penalty
+                            let mut gl = vec![0.0; rw.len()]; // coarse-test symmetry-lift source
+                            for (mi, &i) in rw.iter().enumerate() {
+                                let vf = frw.nodes[i];
+                                let sw = frw.sw[i];
+                                let dnf = ncx * gx[re][vf] + ncy * gy[re][vf];
+                                let jump = uc_m[mi] - u[re * nn + vf];
+                                let avg = 0.5 * (dnc_m[mi] + dnf);
+                                // Fine test (direct): consistency +∮{∇u·n}v_f, penalty −∮τ[u]v_f.
+                                r[re * nn + vf] += sw * avg - tau * sw * jump;
+                                // Coarse test (Pᵀ-scattered): −∮{∇u·n}v_c, +∮τ[u]v_c.
+                                gc[mi] = sw * (-avg + tau * jump);
+                                // Symmetry lift g = ½ sw [u] (same coarse normal both sides).
+                                let g = 0.5 * sw * jump;
+                                hxr[vf] += g * ncx;
+                                hyr[vf] += g * ncy;
+                                gl[mi] = g;
+                            }
+                            // Scatter coarse-test contributions back via Pᵀ.
+                            let cc = mortar.mortar_gather(&gc, h);
+                            let cl = mortar.mortar_gather(&gl, h);
+                            for (mc, &cv) in ce.iter().enumerate() {
+                                let node = f.nodes[cv];
+                                r[e * nn + node] += cc[mc];
+                                hxe[node] += cl[mc] * ncx;
+                                hye[node] += cl[mc] * ncy;
+                            }
+                            // Fine symmetry-lift → r[re].
+                            let lr = add(rel.geom.gradx_t(refq, &hxr), rel.geom.grady_t(refq, &hyr));
+                            for k in 0..nn {
+                                r[re * nn + k] -= lr[k];
+                            }
+                        }
+                        // Coarse symmetry-lift → r[e].
+                        let le = add(el.geom.gradx_t(refq, &hxe), el.geom.grady_t(refq, &hye));
+                        for k in 0..nn {
+                            r[e * nn + k] -= le[k];
+                        }
                     }
                 }
             }
@@ -533,5 +611,41 @@ mod tests {
         let rate = (errs[1] / errs[2]).log2();
         assert!(rate >= p as f64, "observed order {rate} (errs {errs:?})");
         assert!(errs[2] < 1e-5, "final error {} too large", errs[2]);
+    }
+
+    #[test]
+    fn nonconforming_poisson_is_symmetric() {
+        // The decisive guard for the mortar SIPG: A must stay symmetric on a refined
+        // mesh (else CG fails). Check ⟨Au,v⟩ = ⟨Av,u⟩ for pseudo-random u,v.
+        let p = 4;
+        let mesh = Mesh2d::cartesian_refined(p, 3, 3, [0.0, 1.0], [0.0, 1.0], &[(1, 1), (2, 0)]);
+        let a = Poisson::new(&mesh, 5.0);
+        let ndof = a.ndof();
+        let u: Vec<f64> = (0..ndof).map(|i| (((i * 7 + 3) % 13) as f64) * 0.1 - 0.6).collect();
+        let v: Vec<f64> = (0..ndof).map(|i| (((i * 5 + 2) % 11) as f64) * 0.1 - 0.5).collect();
+        let (au, av) = (a.apply(&u), a.apply(&v));
+        let uav: f64 = u.iter().zip(&av).map(|(x, y)| x * y).sum();
+        let vau: f64 = v.iter().zip(&au).map(|(x, y)| x * y).sum();
+        assert!((uav - vau).abs() < 1e-9 * (uav.abs() + 1.0), "SIPG not symmetric on refined mesh: {uav} vs {vau}");
+    }
+
+    #[test]
+    fn nonconforming_poisson_mms() {
+        // Manufactured solve on a mesh with refined patches: the non-conforming SIPG
+        // recovers u = sin(πx)sin(πy) accurately (consistent across hanging nodes).
+        use std::f64::consts::PI;
+        let p = 4;
+        let exact = |x: f64, y: f64| (PI * x).sin() * (PI * y).sin();
+        let rhs_f = |x: f64, y: f64| 2.0 * PI * PI * (PI * x).sin() * (PI * y).sin();
+        let mesh = Mesh2d::cartesian_refined(p, 4, 4, [0.0, 1.0], [0.0, 1.0], &[(1, 1), (2, 2)]);
+        let a = Poisson::new(&mesh, 5.0);
+        let f = nodal(&mesh, rhs_f);
+        let b = a.rhs(&f, |_, _| 0.0);
+        let (uh, _it, _res) = a.cg(&b, 1e-12, 20000);
+        let ue = nodal(&mesh, exact);
+        let err: Vec<f64> = uh.iter().zip(&ue).map(|(a, b)| a - b).collect();
+        let e = a.l2_norm(&err);
+        eprintln!("non-conforming Poisson MMS L2 error = {e:.3e}");
+        assert!(e < 1e-4, "non-conforming MMS error too large: {e}");
     }
 }
