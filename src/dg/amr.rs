@@ -15,7 +15,73 @@
 use super::filter::mat_inverse;
 use super::mesh::Mesh2d;
 use super::reference::{legendre_all, Reference1d};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// Element indices per cell for a `cartesian_refined(nx, ny, set)` mesh, replaying
+/// its element ordering (cy outer, cx inner; refined cell → 4 children in
+/// `c = sx + 2sy` order). Lets us map a solution between refinement states.
+fn cell_element_map(nx: usize, ny: usize, set: &HashSet<(usize, usize)>) -> HashMap<(usize, usize), Vec<usize>> {
+    let mut map = HashMap::new();
+    let mut idx = 0;
+    for cy in 0..ny {
+        for cx in 0..nx {
+            if set.contains(&(cx, cy)) {
+                map.insert((cx, cy), (0..4).map(|c| idx + c).collect());
+                idx += 4;
+            } else {
+                map.insert((cx, cy), vec![idx]);
+                idx += 1;
+            }
+        }
+    }
+    map
+}
+
+/// Remap a *scalar* solution from one refinement state to another (dynamic
+/// re-adaptation): newly-refined cells are [`prolong`](RefineQuad::prolong)ed,
+/// newly-coarsened cells [`restrict`](RefineQuad::restrict)ed (conservatively),
+/// unchanged cells copied. Returns the new mesh and the transferred solution.
+/// `u_old` is element-ordered for the `old_set` mesh.
+pub fn remap_scalar(
+    order: usize,
+    nx: usize,
+    ny: usize,
+    xr: [f64; 2],
+    yr: [f64; 2],
+    old_set: &[(usize, usize)],
+    u_old: &[Vec<f64>],
+    new_set: &[(usize, usize)],
+) -> (Mesh2d, Vec<Vec<f64>>) {
+    let rq = RefineQuad::new(order);
+    let old_h: HashSet<(usize, usize)> = old_set.iter().copied().collect();
+    let new_h: HashSet<(usize, usize)> = new_set.iter().copied().collect();
+    let old_map = cell_element_map(nx, ny, &old_h);
+    let new_mesh = Mesh2d::cartesian_refined(order, nx, ny, xr, yr, new_set);
+    let mut u_new = Vec::new();
+    for cy in 0..ny {
+        for cx in 0..nx {
+            let oe = &old_map[&(cx, cy)];
+            match (old_h.contains(&(cx, cy)), new_h.contains(&(cx, cy))) {
+                (false, false) => u_new.push(u_old[oe[0]].clone()),
+                (false, true) => {
+                    for c in 0..4 {
+                        u_new.push(rq.prolong(&u_old[oe[0]], c % 2, c / 2));
+                    }
+                }
+                (true, false) => {
+                    let children: [Vec<f64>; 4] = std::array::from_fn(|c| u_old[oe[c]].clone());
+                    u_new.push(rq.restrict(&children));
+                }
+                (true, true) => {
+                    for c in 0..4 {
+                        u_new.push(u_old[oe[c]].clone());
+                    }
+                }
+            }
+        }
+    }
+    (new_mesh, u_new)
+}
 
 /// One round of indicator-driven `h`-adaptation of a *scalar* field on a Cartesian
 /// base mesh: flag every cell whose [`SmoothnessIndicator`] exceeds `threshold`,
@@ -316,6 +382,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn remap_refine_then_coarsen_recovers_and_conserves() {
+        // Dynamic re-adaptation round trip: refine a cell then coarsen it back. A
+        // low-order field is recovered exactly (restrict∘prolong is exact for it), and
+        // the physical integral is conserved through both refine and coarsen.
+        let p = 4;
+        let (nx, ny) = (3, 3);
+        let (xr, yr) = ([0.0, 3.0], [0.0, 3.0]);
+        let base = Mesh2d::rectangular(p, nx, ny, xr, yr);
+        let nn = base.refq.n_nodes();
+        let f = |x: f64, y: f64| 0.4 + 0.6 * x - 0.3 * y;
+        let u0: Vec<Vec<f64>> = (0..nx * ny)
+            .map(|cell| {
+                let el = &base.elements[cell];
+                (0..nn).map(|k| f(el.geom.x[k], el.geom.y[k])).collect()
+            })
+            .collect();
+        let integral = |mesh: &Mesh2d, u: &[Vec<f64>]| -> f64 {
+            u.iter()
+                .enumerate()
+                .map(|(e, ue)| (0..nn).map(|k| mesh.elements[e].geom.jw[k] * ue[k]).sum::<f64>())
+                .sum()
+        };
+
+        let (mesh_a, u_a) = remap_scalar(p, nx, ny, xr, yr, &[], &u0, &[(1, 1)]);
+        assert_eq!(mesh_a.n_elements(), nx * ny + 3);
+        let (mesh_b, u_b) = remap_scalar(p, nx, ny, xr, yr, &[(1, 1)], &u_a, &[]);
+        assert_eq!(mesh_b.n_elements(), nx * ny);
+
+        let err = u_b
+            .iter()
+            .zip(&u0)
+            .flat_map(|(a, b)| a.iter().zip(b))
+            .fold(0.0f64, |m, (x, y)| m.max((x - y).abs()));
+        assert!(err < 1e-10, "refine→coarsen roundtrip error: {err}");
+
+        let (i0, ia, ib) = (integral(&base, &u0), integral(&mesh_a, &u_a), integral(&mesh_b, &u_b));
+        assert!((i0 - ia).abs() < 1e-12 && (i0 - ib).abs() < 1e-12, "not conserved: {i0} {ia} {ib}");
+    }
+
+    #[test]
+    fn dynamic_adaptation_preserves_free_stream() {
+        // Dynamic-AMR capstone: a uniform field stepped through the non-conforming
+        // advection operator while the mesh is re-adapted (refine, then coarsen) via
+        // remap. Constant ⇒ free-stream (rhs 0) and remap is exact, so the field must
+        // stay constant to round-off through the whole indicate-free adapt+solve loop.
+        use crate::dg::{Hyperbolic, LinearAdvection};
+        let p = 4;
+        let (nx, ny) = (3, 3);
+        let (xr, yr) = ([0.0, 3.0], [0.0, 3.0]);
+        let c = 2.3;
+        let (ax, ay) = (0.7, -0.4);
+        let dt = 0.01;
+        let bc = move |_: f64, _: f64, _: f64, out: &mut [f64]| out[0] = c;
+
+        let nn = Reference1d::new(p).n() * Reference1d::new(p).n();
+        let mut set: Vec<(usize, usize)> = vec![];
+        let mut per: Vec<Vec<f64>> = vec![vec![c; nn]; nx * ny];
+        for round in 0..3 {
+            let new_set = if round == 1 { vec![(1, 1), (0, 2)] } else { vec![] };
+            let (mesh, per_new) = remap_scalar(p, nx, ny, xr, yr, &set, &per, &new_set);
+            set = new_set;
+            let op = Hyperbolic::new(&mesh, LinearAdvection { ax, ay });
+            let mut state = per_new.concat();
+            let mut t = 0.0;
+            for _ in 0..5 {
+                t += dt;
+                state = op.step_ssp_rk3(&[state.clone()], t, dt, &bc).into_iter().next().unwrap();
+            }
+            let nnm = mesh.refq.n_nodes();
+            per = (0..mesh.n_elements()).map(|e| state[e * nnm..(e + 1) * nnm].to_vec()).collect();
+        }
+        let err = per.iter().flat_map(|v| v.iter()).fold(0.0f64, |m, &x| m.max((x - c).abs()));
+        eprintln!("dynamic AMR free-stream drift = {err:.3e}");
+        assert!(err < 1e-9, "dynamic adaptation broke free-stream: {err}");
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub mod reference;
 pub mod stokes;
 pub mod viscoelastic;
 
-pub use amr::{adapt_scalar, RefineQuad, SmoothnessIndicator};
+pub use amr::{adapt_scalar, remap_scalar, RefineQuad, SmoothnessIndicator};
 pub use face::{quad_faces, Edge, FaceData};
 pub use filter::ModalFilter;
 pub use geometry::QuadGeometry;

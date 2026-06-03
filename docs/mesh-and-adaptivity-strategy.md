@@ -467,3 +467,16 @@ recovered to **1.6e−3** on a two-patch refined mesh.
 So the elliptic, incompressible, and (weak-form) hyperbolic solvers all run on
 non-conforming adaptive meshes. Remaining: split-form Hyperbolic non-conforming
 (currently `panic`), and dynamic refine/coarsen during a running simulation.
+
+### Dynamic AMR (refine + coarsen in time) (2026-06-03)
+
+`amr::remap_scalar` transfers a solution between refinement states — newly-refined
+cells `prolong`ed, newly-coarsened cells `restrict`ed (conservative), unchanged
+copied — so the mesh can adapt mid-simulation. Validated: refine→coarsen round trip
+recovers a low-order field exactly and conserves the integral; and a **dynamic
+capstone** (`dynamic_adaptation_preserves_free_stream`) steps a uniform field through
+the non-conforming advection operator while re-adapting (refine then coarsen) and
+keeps free-stream to **1.3e−14**.
+
+AMR is now complete end-to-end: indicate (`SmoothnessIndicator`) → refine/coarsen
+(`adapt_scalar`/`remap_scalar`) → solve (mortar-coupled Poisson/Stokes/Hyperbolic).
