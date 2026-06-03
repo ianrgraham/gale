@@ -245,6 +245,26 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
         }
     }
 
+    /// Rusanov (LLF) numerical flux `F*·n` per variable into `out`, with outward
+    /// normal `(nx, ny)`. Factored so the conforming and mortar paths are identical.
+    fn rusanov(&self, um: &[f64], up: &[f64], nx: f64, ny: f64, out: &mut [f64]) {
+        let nv = self.n_vars();
+        let (mut fxm, mut fym) = (vec![0.0; nv], vec![0.0; nv]);
+        let (mut fxp, mut fyp) = (vec![0.0; nv], vec![0.0; nv]);
+        self.law.flux(um, &mut fxm, &mut fym);
+        self.law.flux(up, &mut fxp, &mut fyp);
+        let lam = self
+            .law
+            .max_wave_speed(um, nx, ny)
+            .max(self.law.max_wave_speed(up, nx, ny));
+        let diss = if self.dissipation { lam } else { 0.0 };
+        for v in 0..nv {
+            let fnm = fxm[v] * nx + fym[v] * ny;
+            let fnp = fxp[v] * nx + fyp[v] * ny;
+            out[v] = 0.5 * (fnm + fnp) - 0.5 * diss * (up[v] - um[v]);
+        }
+    }
+
     fn rhs_weak(
         &self,
         state: &[Vec<f64>],
@@ -288,45 +308,106 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
             }
         }
 
-        // Interface term: − ∮ F*·n, Rusanov (LLF). Element-centric gather.
+        // Interface term: − ∮ F*·n, Rusanov (LLF), with 2:1 mortar coupling at
+        // non-conforming faces. Element-centric; non-conforming faces are processed
+        // once from the coarse side (scattering to coarse + both fine neighbours).
         {
-            let (mut um, mut up) = (vec![0.0; nv], vec![0.0; nv]);
-            let (mut fxm, mut fym) = (vec![0.0; nv], vec![0.0; nv]);
-            let (mut fxp, mut fyp) = (vec![0.0; nv], vec![0.0; nv]);
-            for (e, el) in mesh.elements.iter().enumerate() {
+            let (mut um, mut up, mut fstar) = (vec![0.0; nv], vec![0.0; nv], vec![0.0; nv]);
+            let mortar = super::amr::RefineQuad::new(mesh.order);
+            let sorted = |e: usize, edge: Edge| -> Vec<usize> {
+                let f = &mesh.elements[e].faces[edge as usize];
+                let g = &mesh.elements[e].geom;
+                let vert = matches!(edge, Edge::East | Edge::West);
+                let mut idx: Vec<usize> = (0..f.nodes.len()).collect();
+                idx.sort_by(|&a, &b| {
+                    let ca = if vert { g.y[f.nodes[a]] } else { g.x[f.nodes[a]] };
+                    let cb = if vert { g.y[f.nodes[b]] } else { g.x[f.nodes[b]] };
+                    ca.partial_cmp(&cb).unwrap()
+                });
+                idx
+            };
+            for e in 0..mesh.elements.len() {
                 for edge in Edge::ALL {
-                    let face = &el.faces[edge as usize];
-                    let nb = &el.neighbors[edge as usize];
-                    for ai in 0..face.nodes.len() {
-                        let vl = face.nodes[ai];
-                        let (nx, ny, sw) = (face.nx[ai], face.ny[ai], face.sw[ai]);
-                        for v in 0..nv {
-                            um[v] = state[v][e * nn + vl];
-                        }
-                        match nb {
-                            Neighbor::Interior { elem: re, edge: redge, perm } => {
-                                let rf = &mesh.elements[*re].faces[*redge as usize];
+                    let face = &mesh.elements[e].faces[edge as usize];
+                    match mesh.elements[e].neighbors[edge as usize].clone() {
+                        Neighbor::FineToCoarse { .. } => {} // handled from the coarse side
+                        Neighbor::Interior { elem: re, edge: redge, perm } => {
+                            let rf = &mesh.elements[re].faces[redge as usize];
+                            for ai in 0..face.nodes.len() {
+                                let vl = face.nodes[ai];
+                                let (nx, ny, sw) = (face.nx[ai], face.ny[ai], face.sw[ai]);
                                 let rnode = rf.nodes[perm[ai]];
                                 for v in 0..nv {
-                                    up[v] = state[v][*re * nn + rnode];
+                                    um[v] = state[v][e * nn + vl];
+                                    up[v] = state[v][re * nn + rnode];
+                                }
+                                self.rusanov(&um, &up, nx, ny, &mut fstar);
+                                for v in 0..nv {
+                                    res[v][e * nn + vl] -= sw * fstar[v];
                                 }
                             }
-                            Neighbor::Boundary { .. } => {
-                                bc(el.geom.x[vl], el.geom.y[vl], t, &mut up);
+                        }
+                        Neighbor::Boundary { .. } => {
+                            let g = &mesh.elements[e].geom;
+                            for ai in 0..face.nodes.len() {
+                                let vl = face.nodes[ai];
+                                let (nx, ny, sw) = (face.nx[ai], face.ny[ai], face.sw[ai]);
+                                for v in 0..nv {
+                                    um[v] = state[v][e * nn + vl];
+                                }
+                                bc(g.x[vl], g.y[vl], t, &mut up);
+                                self.rusanov(&um, &up, nx, ny, &mut fstar);
+                                for v in 0..nv {
+                                    res[v][e * nn + vl] -= sw * fstar[v];
+                                }
                             }
                         }
-                        self.law.flux(&um, &mut fxm, &mut fym);
-                        self.law.flux(&up, &mut fxp, &mut fyp);
-                        let lam = self
-                            .law
-                            .max_wave_speed(&um, nx, ny)
-                            .max(self.law.max_wave_speed(&up, nx, ny));
-                        let diss = if self.dissipation { lam } else { 0.0 };
-                        for v in 0..nv {
-                            let fnm = fxm[v] * nx + fym[v] * ny;
-                            let fnp = fxp[v] * nx + fyp[v] * ny;
-                            let fstar = 0.5 * (fnm + fnp) - 0.5 * diss * (up[v] - um[v]);
-                            res[v][e * nn + vl] -= sw * fstar;
+                        Neighbor::CoarseToFine { fine } => {
+                            let ce = sorted(e, edge);
+                            let (ncx, ncy) = (face.nx[ce[0]], face.ny[ce[0]]); // axis-aligned
+                            let uc: Vec<Vec<f64>> = (0..nv)
+                                .map(|v| ce.iter().map(|&i| state[v][e * nn + face.nodes[i]]).collect())
+                                .collect();
+                            let mut fstar_half: [Vec<Vec<f64>>; 2] = [Vec::new(), Vec::new()];
+                            for h in 0..2 {
+                                let (re, redge) = fine[h];
+                                let rw = sorted(re, redge);
+                                let frw = &mesh.elements[re].faces[redge as usize];
+                                let uc_h: Vec<Vec<f64>> =
+                                    (0..nv).map(|v| mortar.mortar_to_fine(&uc[v], h)).collect();
+                                let uf: Vec<Vec<f64>> = (0..nv)
+                                    .map(|v| rw.iter().map(|&i| state[v][re * nn + frw.nodes[i]]).collect())
+                                    .collect();
+                                let mut fh: Vec<Vec<f64>> = (0..nv).map(|_| vec![0.0; rw.len()]).collect();
+                                for m in 0..rw.len() {
+                                    for v in 0..nv {
+                                        um[v] = uc_h[v][m];
+                                        up[v] = uf[v][m];
+                                    }
+                                    // Flux with the coarse-outward normal (for back-projection).
+                                    self.rusanov(&um, &up, ncx, ncy, &mut fstar);
+                                    for v in 0..nv {
+                                        fh[v][m] = fstar[v];
+                                    }
+                                    // Fine element receives the flux with its own normal.
+                                    let i = rw[m];
+                                    let k = frw.nodes[i];
+                                    self.rusanov(&up, &um, frw.nx[i], frw.ny[i], &mut fstar);
+                                    for v in 0..nv {
+                                        res[v][re * nn + k] -= frw.sw[i] * fstar[v];
+                                    }
+                                }
+                                fstar_half[h] = fh;
+                            }
+                            // Coarse edge receives the back-projected mortar flux.
+                            for v in 0..nv {
+                                let fc = mortar
+                                    .mortar_to_coarse(&[fstar_half[0][v].clone(), fstar_half[1][v].clone()]);
+                                for m in 0..ce.len() {
+                                    let i = ce[m];
+                                    res[v][e * nn + face.nodes[i]] -= face.sw[i] * fc[m];
+                                }
+                            }
                         }
                     }
                 }
@@ -434,6 +515,9 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
                             }
                         }
                         Neighbor::Boundary { .. } => bc(g.x[vl], g.y[vl], t, &mut sp),
+                        Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => {
+                            panic!("split-form does not support non-conforming meshes; use VolumeForm::Weak")
+                        }
                     }
                     self.law.flux(&sm, &mut fxm, &mut fym);
                     self.law.flux(&sp, &mut fxp, &mut fyp);
@@ -518,6 +602,43 @@ mod tests {
             .flat_map(|v| r[v].iter().cloned())
             .fold(0.0f64, |a, x| a.max(x.abs()));
         assert!(md < 1e-9, "free-stream not preserved: {md}");
+    }
+
+    #[test]
+    fn euler_free_stream_on_refined_mesh() {
+        // Full integration: the shared weak-form Euler operator on a NON-CONFORMING
+        // mesh (centre cell of a 3×3 refined → four 2:1 interfaces). A uniform state
+        // must give zero residual everywhere across the hanging nodes.
+        let mesh = Mesh2d::cartesian_refined(4, 3, 3, [0.0, 3.0], [0.0, 3.0], &[(1, 1)]);
+        let op = Hyperbolic::new(&mesh, Euler { gamma: 1.4 });
+        let c = euler_cons(1.4, 1.2, 0.3, -0.1, 1.0);
+        let ndof = mesh.n_elements() * mesh.refq.n_nodes();
+        let state: Vec<Vec<f64>> = (0..4).map(|v| vec![c[v]; ndof]).collect();
+        let r = op.rhs(&state, 0.0, &move |_, _, _, out: &mut [f64]| out.copy_from_slice(&c));
+        let md = (0..4).flat_map(|v| r[v].iter().cloned()).fold(0.0f64, |a, x| a.max(x.abs()));
+        assert!(md < 1e-9, "Euler free-stream not preserved on refined mesh: {md}");
+    }
+
+    #[test]
+    fn advection_linear_exact_on_refined_mesh() {
+        // Linear advection of a globally-linear field on a refined mesh reproduces
+        // ∂ₜu = −(aₓα + a_yβ) exactly — high order retained through every hanging node.
+        let (ax, ay) = (0.8, -0.5);
+        let mesh = Mesh2d::cartesian_refined(4, 3, 3, [0.0, 3.0], [0.0, 3.0], &[(1, 1)]);
+        let op = Hyperbolic::new(&mesh, LinearAdvection { ax, ay });
+        let (al, be, ga) = (0.7, -0.4, 0.2);
+        let f = move |x: f64, y: f64| al * x + be * y + ga;
+        let nn = mesh.refq.n_nodes();
+        let mut u = vec![0.0; mesh.n_elements() * nn];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                u[e * nn + k] = f(el.geom.x[k], el.geom.y[k]);
+            }
+        }
+        let r = op.rhs(&[u], 0.0, &move |x, y, _, out: &mut [f64]| out[0] = f(x, y));
+        let expected = -(ax * al + ay * be);
+        let md = r[0].iter().fold(0.0f64, |a, &x| a.max((x - expected).abs()));
+        assert!(md < 1e-9, "linear advection not exact on refined Mesh2d: {md}");
     }
 
     #[test]

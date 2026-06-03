@@ -369,6 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tau[e * 4 + t] = match nb {
                     Neighbor::Interior { elem: re, .. } => mg.alpha * p1 * p1 / h[e].min(h[*re]),
                     Neighbor::Boundary { .. } => mg.alpha * p1 * p1 / h[e],
+                Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => unreachable!(),
                 };
                 for a in 0..n1u {
                     let idx = (e * 4 + t) * n1u + a;

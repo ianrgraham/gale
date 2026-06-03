@@ -13,7 +13,58 @@
 //! piece; these transfer operators are its prerequisite.
 
 use super::filter::mat_inverse;
+use super::mesh::Mesh2d;
 use super::reference::{legendre_all, Reference1d};
+use std::collections::HashSet;
+
+/// One round of indicator-driven `h`-adaptation of a *scalar* field on a Cartesian
+/// base mesh: flag every cell whose [`SmoothnessIndicator`] exceeds `threshold`,
+/// build the refined [`Mesh2d`] ([`Mesh2d::cartesian_refined`]), and transfer the
+/// solution to it (refined cells [`prolong`](RefineQuad::prolong)ed to their four
+/// children — exact; unrefined cells copied). Returns the new mesh, the transferred
+/// solution (element-ordered to match the mesh), and the set of refined cells.
+///
+/// `u_base[cx + cy*nx]` is the nodal field on the base `nx × ny` mesh (the
+/// [`Mesh2d::rectangular`] ordering). This is the closed adaptive loop:
+/// indicate → refine → transfer.
+pub fn adapt_scalar(
+    order: usize,
+    nx: usize,
+    ny: usize,
+    xr: [f64; 2],
+    yr: [f64; 2],
+    u_base: &[Vec<f64>],
+    threshold: f64,
+) -> (Mesh2d, Vec<Vec<f64>>, Vec<(usize, usize)>) {
+    let si = SmoothnessIndicator::new(order);
+    let rq = RefineQuad::new(order);
+    let mut refine = Vec::new();
+    for cy in 0..ny {
+        for cx in 0..nx {
+            if si.indicator(&u_base[cx + cy * nx]) > threshold {
+                refine.push((cx, cy));
+            }
+        }
+    }
+    let mesh = Mesh2d::cartesian_refined(order, nx, ny, xr, yr, &refine);
+    let refined: HashSet<(usize, usize)> = refine.iter().copied().collect();
+    let mut u_new = Vec::new();
+    for cy in 0..ny {
+        for cx in 0..nx {
+            let cell = &u_base[cx + cy * nx];
+            if refined.contains(&(cx, cy)) {
+                for sy in 0..2 {
+                    for sx in 0..2 {
+                        u_new.push(rq.prolong(cell, sx, sy));
+                    }
+                }
+            } else {
+                u_new.push(cell.clone());
+            }
+        }
+    }
+    (mesh, u_new, refine)
+}
 
 /// 1D Lagrange basis `ℓ_j(x)` at the reference nodes, evaluated at `x`.
 fn lagrange_basis(nodes: &[f64], x: f64) -> Vec<f64> {
@@ -254,6 +305,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn adapt_refines_only_underresolved_cells() {
+        // Closed loop: a smooth field triggers no refinement; a field with high-mode
+        // content in one cell refines exactly that cell (4 children ⇒ +3 elements).
+        let p = 4;
+        let (nx, ny) = (3, 3);
+        let (xr, yr) = ([0.0, 3.0], [0.0, 3.0]);
+        let n1 = Reference1d::new(p).n();
+        let rn = Reference1d::new(p).nodes;
+        let nn = n1 * n1;
+
+        // (a) globally smooth (degree-1) field ⇒ nothing flagged, mesh unchanged.
+        let smooth: Vec<Vec<f64>> = (0..nx * ny)
+            .map(|_| (0..nn).map(|k| 1.0 + 0.5 * rn[k % n1] - 0.3 * rn[k / n1]).collect())
+            .collect();
+        let (m0, u0, set0) = adapt_scalar(p, nx, ny, xr, yr, &smooth, 1e-8);
+        assert!(set0.is_empty(), "smooth field flagged: {set0:?}");
+        assert_eq!(m0.n_elements(), nx * ny);
+        assert_eq!(u0.len(), nx * ny);
+
+        // (b) top Legendre mode in the centre cell (cx=1,cy=1) only ⇒ that cell refines.
+        let center = 1 + 1 * nx;
+        let bumpy: Vec<Vec<f64>> = (0..nx * ny)
+            .map(|cell| {
+                (0..nn)
+                    .map(|k| {
+                        let (i, j) = (k % n1, k / n1);
+                        if cell == center {
+                            legendre_all(p, rn[i])[p] * legendre_all(p, rn[j])[p]
+                        } else {
+                            1.0 + 0.5 * rn[i] - 0.3 * rn[j]
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let (m1, u1, set1) = adapt_scalar(p, nx, ny, xr, yr, &bumpy, 0.5);
+        assert_eq!(set1, vec![(1, 1)], "wrong cell flagged");
+        assert_eq!(m1.n_elements(), nx * ny + 3, "refined element count");
+        assert_eq!(u1.len(), nx * ny + 3);
     }
 
     #[test]

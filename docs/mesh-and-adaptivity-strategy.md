@@ -415,3 +415,36 @@ explicit-RK emphasis of the early milestones shifts accordingly for this target.
 2:1 non-conforming neighbors (a `Neighbor::NonConforming` variant + 2:1 balance) and
 wiring the mortar flux into the `Poisson`/`Hyperbolic`/`Stokes` face loops so the
 adaptive solver actually runs. The operators above are its validated prerequisites.
+
+## As-built: non-conforming (2:1) solver core (2026-06-03)
+
+`src/dg/nonconforming.rs` — `NcAdvection`: a working linear-advection DG operator on
+a 2:1 hanging-node mesh (one coarse element whose East edge faces two fine
+neighbors). The mortar flux (compute on the fine resolution, project back to the
+coarse edge with `RefineQuad::mortar_*`) is wired into the weak-form face loop.
+Validated:
+- **free-stream preserved** across the hanging node (uniform state ⇒ ‖∂ₜu‖ < 1e−10);
+- **linear advection exact** across the hanging node (high order retained, < 1e−9);
+- **conservation exact**: Σ Jw ∂ₜu equals the analytic outer-boundary flux to 1e−9
+  (the discrete volume telescopes; the 2:1 interface cancels because coarse-Jacobian
+  ½ × mortar-restrict ½ = fine-Jacobian ¼).
+
+This proves the non-conforming coupling works in an actual solver. The remaining step
+to a *general* adaptive solver is a `Mesh2d` constructor that refines arbitrary
+elements (2:1 balance + a `Neighbor::NonConforming` variant) and the same mortar
+wiring in the `Hyperbolic`/`Stokes`/`Poisson` face loops.
+
+### Generalized (2026-06-03): `NcMesh` arbitrary Cartesian refinement
+
+`NcMesh::cartesian_refined(order, nx, ny, .., refine)` builds a Cartesian mesh with
+any set of cells single-level-refined, producing correct 2:1-balanced connectivity
+(`NcNeighbor`: Boundary / Conforming / CoarseToFine / FineToCoarse). `advection_rhs`
+solves linear advection over the whole mesh, mortar-coupling every 2:1 interface.
+Validated on a 3×3 mesh with the centre cell refined (12 elements, 4 hanging-node
+interfaces + 4 child-child conforming faces): free-stream preserved (<1e-9) and
+linear advection exact (1.9e-13) everywhere.
+
+Remaining for full integration: lift this into the shared `Mesh2d`/`Neighbor` enum so
+the multi-law `Hyperbolic` (Euler/Burgers), `Stokes`, and SIPG `Poisson` run on
+adaptive meshes (a cross-cutting refactor of their face loops), and dynamic
+refine/coarsen driven by the `SmoothnessIndicator`.

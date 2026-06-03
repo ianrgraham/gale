@@ -28,6 +28,12 @@ pub enum Neighbor {
     },
     /// A domain boundary, with a tag (rectangular builder: 0=bottom,1=right,2=top,3=left).
     Boundary { tag: u32 },
+    /// Coarse side of a 2:1 non-conforming interface: two finer neighbours, each
+    /// `(elem, edge)`, ordered by the edge's tangential coordinate (half 0 then 1).
+    CoarseToFine { fine: [(usize, Edge); 2] },
+    /// Fine side of a 2:1 interface: covers `half ∈ {0,1}` of a coarser neighbour's
+    /// edge. The flux is computed from the coarse side, so solvers skip this entry.
+    FineToCoarse { coarse: usize, edge: Edge, half: usize },
 }
 
 /// One physical element: its corners, geometry, 4 face traces, and 4 neighbors
@@ -236,6 +242,161 @@ impl Mesh2d {
             .collect();
         Self { order, refq, elements }
     }
+
+    /// Cartesian `nx × ny` mesh with the listed cells single-level `h`-refined into
+    /// four children each (2:1-balanced). Unrefined neighbours of a refined cell get a
+    /// [`Neighbor::CoarseToFine`]; the children get [`Neighbor::FineToCoarse`]; all
+    /// same-level shared faces (incl. child–child) are conforming. Solvers that
+    /// understand the non-conforming variants (the `Hyperbolic` weak operator) run
+    /// adaptively on the result.
+    pub fn cartesian_refined(
+        order: usize,
+        nx: usize,
+        ny: usize,
+        xr: [f64; 2],
+        yr: [f64; 2],
+        refine: &[(usize, usize)],
+    ) -> Self {
+        use std::collections::{HashMap, HashSet};
+        use Edge::{East, North, South, West};
+        let refq = Reference2dQuad::new(order);
+        let (x0, y0) = (xr[0], yr[0]);
+        let dx = (xr[1] - xr[0]) / nx as f64;
+        let dy = (yr[1] - yr[0]) / ny as f64;
+        let refined: HashSet<(usize, usize)> = refine.iter().copied().collect();
+        let mk = |gx0: f64, gy0: f64, w: f64, h: f64| {
+            [[gx0, gy0], [gx0 + w, gy0], [gx0 + w, gy0 + h], [gx0, gy0 + h]]
+        };
+
+        #[derive(Clone, Copy)]
+        enum Cell {
+            Single(usize),
+            Quad([usize; 4]),
+        }
+        let mut corners_all: Vec<[[f64; 2]; 4]> = Vec::new();
+        let mut geoms: Vec<QuadGeometry> = Vec::new();
+        let mut cells: HashMap<(usize, usize), Cell> = HashMap::new();
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let (px, py) = (x0 + cx as f64 * dx, y0 + cy as f64 * dy);
+                if refined.contains(&(cx, cy)) {
+                    let mut ids = [0usize; 4];
+                    for sy in 0..2 {
+                        for sx in 0..2 {
+                            let c = mk(px + sx as f64 * 0.5 * dx, py + sy as f64 * 0.5 * dy, 0.5 * dx, 0.5 * dy);
+                            ids[sx + 2 * sy] = geoms.len();
+                            geoms.push(QuadGeometry::from_corners(&refq, c));
+                            corners_all.push(c);
+                        }
+                    }
+                    cells.insert((cx, cy), Cell::Quad(ids));
+                } else {
+                    let c = mk(px, py, dx, dy);
+                    cells.insert((cx, cy), Cell::Single(geoms.len()));
+                    geoms.push(QuadGeometry::from_corners(&refq, c));
+                    corners_all.push(c);
+                }
+            }
+        }
+        let faces_all: Vec<[FaceData; 4]> = geoms.iter().map(|g| quad_faces(&refq, g)).collect();
+
+        let off = |e: Edge| match e {
+            South => (0i64, -1i64),
+            East => (1, 0),
+            North => (0, 1),
+            West => (-1, 0),
+        };
+        let opp = |e: Edge| match e {
+            South => North,
+            East => West,
+            North => South,
+            West => East,
+        };
+        let cell_at = |cx: i64, cy: i64| -> Option<Cell> {
+            if cx < 0 || cy < 0 || cx as usize >= nx || cy as usize >= ny {
+                None
+            } else {
+                cells.get(&(cx as usize, cy as usize)).copied()
+            }
+        };
+        // Two children of a neighbour on its `side` (the edge facing us), tangential order.
+        let side_children = |ch: [usize; 4], side: Edge| -> [(usize, Edge); 2] {
+            let c = |sx: usize, sy: usize| ch[sx + 2 * sy];
+            match side {
+                North => [(c(0, 1), North), (c(1, 1), North)],
+                South => [(c(0, 0), South), (c(1, 0), South)],
+                West => [(c(0, 0), West), (c(0, 1), West)],
+                East => [(c(1, 0), East), (c(1, 1), East)],
+            }
+        };
+
+        let mut neighbors_all: Vec<[Neighbor; 4]> =
+            (0..geoms.len()).map(|_| std::array::from_fn(|_| Neighbor::Boundary { tag: 0 })).collect();
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let cell = cells[&(cx, cy)];
+                for e in [South, East, North, West] {
+                    let (ox, oy) = off(e);
+                    let nb = cell_at(cx as i64 + ox, cy as i64 + oy);
+                    let o = opp(e);
+                    match cell {
+                        Cell::Single(id) => {
+                            neighbors_all[id][e as usize] = match nb {
+                                None => Neighbor::Boundary { tag: e as u32 },
+                                Some(Cell::Single(n)) => interior(id, e, n, o, &faces_all, &geoms),
+                                Some(Cell::Quad(ch)) => Neighbor::CoarseToFine { fine: side_children(ch, o) },
+                            };
+                        }
+                        Cell::Quad(ch) => {
+                            for sy in 0..2usize {
+                                for sx in 0..2usize {
+                                    let id = ch[sx + 2 * sy];
+                                    let (internal, sib) = match e {
+                                        South => (sy == 1, (sx, 0usize)),
+                                        North => (sy == 0, (sx, 1usize)),
+                                        West => (sx == 1, (0usize, sy)),
+                                        East => (sx == 0, (1usize, sy)),
+                                    };
+                                    neighbors_all[id][e as usize] = if internal {
+                                        interior(id, e, ch[sib.0 + 2 * sib.1], o, &faces_all, &geoms)
+                                    } else {
+                                        match nb {
+                                            None => Neighbor::Boundary { tag: e as u32 },
+                                            Some(Cell::Quad(nch)) => {
+                                                let (nsx, nsy) = match e {
+                                                    South => (sx, 1),
+                                                    North => (sx, 0),
+                                                    West => (1, sy),
+                                                    East => (0, sy),
+                                                };
+                                                interior(id, e, nch[nsx + 2 * nsy], o, &faces_all, &geoms)
+                                            }
+                                            Some(Cell::Single(n)) => {
+                                                let half = match e {
+                                                    South | North => sx,
+                                                    East | West => sy,
+                                                };
+                                                Neighbor::FineToCoarse { coarse: n, edge: o, half }
+                                            }
+                                        }
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let elements = corners_all
+            .into_iter()
+            .zip(geoms)
+            .zip(faces_all)
+            .zip(neighbors_all)
+            .map(|(((corners, geom), faces), neighbors)| Element { corners, geom, faces, neighbors })
+            .collect();
+        Self { order, refq, elements }
+    }
 }
 
 /// Interior neighbor matched by a single tangential coordinate `axis` (for periodic
@@ -326,6 +487,7 @@ mod tests {
                 match nb {
                     Neighbor::Boundary { .. } => n_bnd += 1,
                     Neighbor::Interior { .. } => n_int += 1,
+                    _ => {}
                 }
             }
         }

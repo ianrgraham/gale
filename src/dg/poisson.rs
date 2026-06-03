@@ -162,6 +162,9 @@ impl<'m> Poisson<'m> {
                             r[e * nn + k] -= l[k];
                         }
                     }
+                    Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => {
+                        panic!("non-conforming meshes are not yet supported by the SIPG Poisson operator")
+                    }
                 }
             }
         }
