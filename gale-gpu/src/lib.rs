@@ -38,5 +38,5 @@ pub use operators::euler::euler_rhs;
 pub use operators::logconf::logconf_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
 pub use operators::poisson::{
-    helmholtz_cg_solve, poisson_apply, poisson_cg_solve, poisson_pcg_solve,
+    helmholtz_cg_solve, poisson_apply, poisson_cg_solve, poisson_pcg_solve, pressure_cg_solve,
 };

@@ -23,7 +23,8 @@ use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid};
 
 const NN_MAX: usize = 81; // (order 8 + 1)²
 const RED: usize = 256; // reduction block size
-const BND: u32 = u32::MAX; // sentinel: face neighbor is a boundary
+const BND: u32 = u32::MAX; // sentinel: Dirichlet boundary face (SIPG consistency+penalty)
+const NEU: u32 = u32::MAX - 1; // sentinel: Neumann boundary face (natural BC ⇒ no contribution)
 
 #[cuda_module]
 mod kernels {
@@ -110,6 +111,12 @@ mod kernels {
                     let ny = face_ny[idx];
                     let sw = face_sw[idx];
                     let nbr = face_nbr[idx];
+                    if nbr == NEU {
+                        // Neumann boundary: natural BC ⇒ the face contributes nothing
+                        // (no consistency, penalty, or lift). Homogeneous ∂u/∂n = 0.
+                        a += 1;
+                        continue;
+                    }
                     let dun_e = nx * gx[e * nn + vl] + ny * gy[e * nn + vl];
                     let ug = u[e * nn + vl];
                     let (avg, jump, gfac) = if nbr == BND {
@@ -329,8 +336,11 @@ struct MeshArrays {
 }
 
 /// Flatten a mesh's metrics and SIPG face metadata (penalty `tau` from `alpha`),
-/// matching the host-side assembly in the original `gpu_poisson_*` bins.
-fn flatten_mesh(mesh: &Mesh2d, alpha: f64) -> MeshArrays {
+/// matching the host-side assembly in the original `gpu_poisson_*` bins. When
+/// `neumann_all` is set, every boundary face is marked Neumann (`NEU`, natural BC ⇒
+/// no operator contribution) instead of the default Dirichlet SIPG (`BND`) — this is
+/// the pure-Neumann pressure-Poisson of the dual-splitting scheme.
+fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_all: bool) -> MeshArrays {
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
@@ -365,6 +375,7 @@ fn flatten_mesh(mesh: &Mesh2d, alpha: f64) -> MeshArrays {
                 Neighbor::Boundary { .. } => alpha * p1 * p1 / h[e],
                 Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => unreachable!(),
             };
+            let is_boundary = matches!(nb, Neighbor::Boundary { .. });
             for a in 0..n1u {
                 let idx = (e * 4 + t) * n1u + a;
                 fvl[idx] = face.nodes[a] as u32;
@@ -374,6 +385,8 @@ fn flatten_mesh(mesh: &Mesh2d, alpha: f64) -> MeshArrays {
                 if let Neighbor::Interior { elem: re, edge: redge, perm } = nb {
                     let rf = &mesh.elements[*re].faces[*redge as usize];
                     fnbr[idx] = (*re * nn + rf.nodes[perm[a]]) as u32;
+                } else if is_boundary && neumann_all {
+                    fnbr[idx] = NEU; // natural BC: kernel skips this face
                 }
             }
         }
@@ -411,7 +424,7 @@ pub fn poisson_apply(
     u: &[f64],
     alpha: f64,
 ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    let ma = flatten_mesh(mesh, alpha);
+    let ma = flatten_mesh(mesh, alpha, false);
     assert_eq!(u.len(), ma.ndof, "state length must be n_elements·n_nodes");
 
     let ctx = CudaContext::new(0)?;
@@ -496,7 +509,7 @@ fn cg_solve_impl(
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    let ma = flatten_mesh(mesh, alpha);
+    let ma = flatten_mesh(mesh, alpha, false);
     let ndof = ma.ndof;
     assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
 
@@ -576,6 +589,112 @@ fn cg_solve_impl(
     Ok((x.to_host_vec(&stream)?, iters))
 }
 
+/// Solve the **singular pure-Neumann** SIPG pressure-Poisson system `A·u = b` by
+/// **deflated conjugate gradient on the GPU**, returning the solution (determined up
+/// to an additive constant) and the iteration count. The constant nullspace `A·1 = 0`
+/// is deflated by removing the arithmetic mean from the residual each iteration.
+/// Boundary faces use the natural (Neumann) BC. Mirrors
+/// `gale::dg::Poisson::with_bc(mesh, alpha, 0, all-tags).cg_deflated` exactly — this
+/// is the pressure-projection solve of the dual-splitting Stokes/NS scheme.
+pub fn pressure_cg_solve(
+    mesh: &Mesh2d,
+    b: &[f64],
+    alpha: f64,
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    let ma = flatten_mesh(mesh, alpha, true); // pure-Neumann boundaries
+    let ndof = ma.ndof;
+    assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+    let d_dev = up(&ma.diff)?;
+    let rx_dev = up(&ma.rx)?;
+    let ry_dev = up(&ma.ry)?;
+    let sx_dev = up(&ma.sx)?;
+    let sy_dev = up(&ma.sy)?;
+    let jw_dev = up(&ma.jw)?;
+    let fvl_dev = upu(&ma.fvl)?;
+    let fnx_dev = up(&ma.fnx)?;
+    let fny_dev = up(&ma.fny)?;
+    let fsw_dev = up(&ma.fsw)?;
+    let fnbr_dev = upu(&ma.fnbr)?;
+    let ftau_dev = up(&ma.ftau)?;
+
+    let mut x = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut r = up(b)?;
+    let mut p = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut ap = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let ones = up(&vec![1.0f64; ndof])?;
+
+    let module = kernels::load(&ctx)?;
+    let cfg = LaunchConfig {
+        grid_dim: (ma.ne as u32, 1, 1),
+        block_dim: (ma.nn as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
+    let n1 = ma.n1;
+    let n64 = ndof as u64;
+    let ninv = 1.0 / ndof as f64;
+
+    macro_rules! dot {
+        ($a:expr, $b:expr) => {{
+            module.dot_partial(&stream, red, $a, $b, n64, &mut partial)?;
+            partial.to_host_vec(&stream)?[0]
+        }};
+    }
+    // Remove the constant nullspace component: v ← v − mean(v) (arithmetic mean,
+    // matching the CPU `deflate`). mean = (1ᵀv)/n via dot with the ones vector.
+    macro_rules! deflate {
+        ($v:expr) => {{
+            let mean = dot!($v, &ones) * ninv;
+            module.axpy(&stream, vec_cfg, $v, &ones, -mean)?;
+        }};
+    }
+    macro_rules! apply {
+        ($field:expr, $dst:expr) => {{
+            module.gradient(&stream, cfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
+            module.operator(
+                &stream, cfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
+                &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, $dst,
+            )?;
+        }};
+    }
+
+    deflate!(&mut r); // r = deflate(b)
+    // p = r (copy via xpby with β=0: p ← r + 0·p).
+    module.xpby(&stream, vec_cfg, &mut p, &r, 0.0)?;
+    let bn = dot!(&r, &r).sqrt().max(1e-300);
+    let mut rs = dot!(&r, &r);
+    let mut iters = 0;
+    for it in 0..maxit {
+        apply!(&p, &mut ap);
+        let pap = dot!(&p, &ap);
+        let alpha_cg = rs / pap;
+        module.axpy(&stream, vec_cfg, &mut x, &p, alpha_cg)?; // x += α p
+        module.axpy(&stream, vec_cfg, &mut r, &ap, -alpha_cg)?; // r −= α ap
+        deflate!(&mut r);
+        let rs_new = dot!(&r, &r);
+        iters = it + 1;
+        if rs_new.sqrt() / bn < tol {
+            break;
+        }
+        let beta = rs_new / rs;
+        module.xpby(&stream, vec_cfg, &mut p, &r, beta)?; // p = r + β p
+        rs = rs_new;
+    }
+    Ok((x.to_host_vec(&stream)?, iters))
+}
+
 /// Solve the SIPG Poisson system `A·u = rhs` by **p-multigrid-preconditioned CG,
 /// fully on-device**, returning the finest-level solution and the outer PCG
 /// iteration count. The preconditioner is one p-multigrid V-cycle (down-sweep
@@ -619,7 +738,7 @@ pub fn poisson_pcg_solve(
 
     for l in 0..nlev {
         let m = mg.mesh(l);
-        let ma = flatten_mesh(m, mg.alpha);
+        let ma = flatten_mesh(m, mg.alpha, false);
         n1v.push(ma.n1);
         nev.push(ma.ne as u32);
         ndofv.push(ma.ndof);
