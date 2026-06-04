@@ -31,7 +31,7 @@ pub mod operators;
 
 // Backwards-compatible flat re-exports of the most-used host API.
 pub use distributed::{multigpu_advection_2d, multigpu_advection_3d};
-pub use flow::GpuStokes;
+pub use flow::{GpuStokes, GpuStokesIntegrator};
 pub use immersed::penalize_apply;
 pub use operators::advection::{advection_rhs, GpuAdvection};
 pub use operators::advection3d::advection3d_rhs;

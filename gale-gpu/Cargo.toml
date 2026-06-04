@@ -104,6 +104,11 @@ path = "src/bin/pressure_check.rs"
 name = "stokes-check"
 path = "src/bin/stokes_check.rs"
 
+# Validates gale_gpu::GpuStokesIntegrator driving Simulation (framework GPU flow).
+[[bin]]
+name = "sim-stokes-check"
+path = "src/bin/sim_stokes_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"

@@ -143,3 +143,71 @@ impl<'m> GpuStokes<'m> {
         self.velocity.l2_norm(v)
     }
 }
+
+/// A GPU unsteady-Stokes [`gale::sim::StateIntegrator`]: drives a 2-component velocity
+/// field through the HOOMD-style [`gale::sim::Simulation`] with **the pressure and
+/// viscous solves on the GPU each step** (via [`GpuStokes`]). The GPU analogue of
+/// `gale::dg::Stokes` wrapped as `gale::sim::DualSplitting` — but Stokes-only for now
+/// (no explicit convection; NS convection is a follow-up). Like `DualSplitting`, it
+/// builds the transient operator from `state.mesh` each step, so it stores no borrow.
+pub struct GpuStokesIntegrator {
+    dt: f64,
+    nu: f64,
+    alpha: f64,
+    velocity: gale::sim::FieldId,
+    bc_u: Box<dyn Fn(f64, f64, f64) -> f64>,
+    bc_v: Box<dyn Fn(f64, f64, f64) -> f64>,
+}
+
+impl GpuStokesIntegrator {
+    /// New GPU Stokes integrator advancing the 2-component `velocity` field, with
+    /// zero-velocity walls by default.
+    pub fn new(velocity: gale::sim::FieldId, dt: f64, nu: f64, alpha: f64) -> Self {
+        Self {
+            dt,
+            nu,
+            alpha,
+            velocity,
+            bc_u: Box::new(|_, _, _| 0.0),
+            bc_v: Box::new(|_, _, _| 0.0),
+        }
+    }
+
+    /// Set the Dirichlet velocity boundary conditions `(bc_u, bc_v)` of `(x, y, t)`.
+    pub fn boundary(
+        mut self,
+        bc_u: impl Fn(f64, f64, f64) -> f64 + 'static,
+        bc_v: impl Fn(f64, f64, f64) -> f64 + 'static,
+    ) -> Self {
+        self.bc_u = Box::new(bc_u);
+        self.bc_v = Box::new(bc_v);
+        self
+    }
+}
+
+impl gale::sim::StateIntegrator for GpuStokesIntegrator {
+    fn dt(&self) -> f64 {
+        self.dt
+    }
+
+    fn step(&self, state: &mut gale::sim::State, hook: &dyn gale::sim::StateStageHook) {
+        let t_new = state.time.t + self.dt;
+        let stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt);
+        let (ux, uy) = {
+            let v = state.fields.by_id(self.velocity);
+            (v.component(0).to_vec(), v.component(1).to_vec())
+        };
+        let (nux, nuy) = stokes
+            .step(&ux, &uy, t_new, &self.bc_u, &self.bc_v, |_, _, _| 0.0, |_, _, _| 0.0)
+            .expect("gale-gpu: GpuStokes step failed");
+        {
+            let v = state.fields.by_id_mut(self.velocity);
+            v.component_mut(0).copy_from_slice(&nux);
+            v.component_mut(1).copy_from_slice(&nuy);
+        }
+        // Per-stage hook: home for the implicit volume-penalization (IBM) projection.
+        hook.after_stage(state, 0);
+        state.time.t = t_new;
+        state.time.step += 1;
+    }
+}
