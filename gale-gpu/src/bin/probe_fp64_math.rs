@@ -23,7 +23,8 @@
 //!   cargo oxide run --bin probe-fp64-math
 //!   cargo oxide run --bin probe-fp64-math --arch sm_70
 //!
-//! Note: `f64::atan`/`atan2` are NOT tested — not yet mapped (cuda-oxide #77/#78).
+//! Note: `f64::atan`/`atan2` (and the rest of the libm inverse-trig / hyperbolic
+//! family) are now mapped to libdevice — see `probe-libm` (fork fix, was #77/#78).
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{DisjointSlice, kernel, thread};

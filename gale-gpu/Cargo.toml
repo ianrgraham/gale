@@ -60,6 +60,11 @@ path = "src/bin/probe_fp64_math.rs"
 name = "probe-nested-write"
 path = "src/bin/probe_nested_write.rs"
 
+# Probe / regression gate for cuda-oxide libm device math (atan2/atan/asin/... → __nv_*).
+[[bin]]
+name = "probe-libm"
+path = "src/bin/probe_libm.rs"
+
 [[bin]]
 name = "exper-kernel"
 path = "src/bin/exper_kernel.rs"
@@ -208,3 +213,8 @@ path = "src/bin/multigpu_check.rs"
 [[bin]]
 name = "multigpu3d-check"
 path = "src/bin/multigpu3d_check.rs"
+
+# Minimal f64::signum NVVM-IR codegen-bug reproducer.
+[[bin]]
+name = "probe-signum"
+path = "src/bin/probe_signum.rs"
