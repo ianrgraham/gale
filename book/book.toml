@@ -1,0 +1,16 @@
+[book]
+title = "The Theory of gale — DG, Immersed Boundaries & Viscoelastic Flow on the GPU"
+authors = ["Ian Graham", "Claude (Anthropic)"]
+description = "A from-the-ground-up guide to the numerical methods behind gale: discontinuous Galerkin spectral elements, incompressible and viscoelastic flow, immersed boundaries, adaptivity, and their GPU implementation — with the reasoning (especially numerical stability) behind each design choice."
+language = "en"
+src = "src"
+
+[output.html]
+mathjax-support = true
+default-theme = "rust"
+git-repository-url = "https://github.com/ianrgraham/gale"
+additional-css = []
+
+[output.html.fold]
+enable = true
+level = 1

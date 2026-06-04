@@ -9,3 +9,6 @@
 target
 rustc-ice-*.txt
 *.pdf
+
+# mdBook build output
+/book/book/
