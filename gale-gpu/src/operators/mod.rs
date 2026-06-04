@@ -10,3 +10,4 @@ pub mod burgers;
 pub mod euler;
 pub mod logconf;
 pub mod oldroyd;
+pub mod poisson;

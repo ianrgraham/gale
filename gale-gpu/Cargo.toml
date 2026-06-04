@@ -74,20 +74,20 @@ path = "src/bin/gpu_poisson_volume.rs"
 name = "gpu-poisson-faces"
 path = "src/bin/gpu_poisson_faces.rs"
 
-# GPU port step 7c: full SIPG operator (volume + faces, 2-kernel pipeline).
+# Validates gale_gpu::poisson_apply (operators::poisson SIPG operator A·u).
 [[bin]]
-name = "gpu-poisson-operator"
-path = "src/bin/gpu_poisson_operator.rs"
+name = "poisson-operator-check"
+path = "src/bin/poisson_operator_check.rs"
 
-# GPU port step 7d: conjugate gradient entirely on the GPU.
+# Validates gale_gpu::poisson_cg_solve (operators::poisson on-device CG).
 [[bin]]
-name = "gpu-poisson-cg"
-path = "src/bin/gpu_poisson_cg.rs"
+name = "poisson-cg-check"
+path = "src/bin/poisson_cg_check.rs"
 
-# GPU port step 7f: p-multigrid V-cycle preconditioner + PCG, fully on-device.
+# Validates gale_gpu::poisson_pcg_solve (operators::poisson p-multigrid PCG).
 [[bin]]
-name = "gpu-poisson-pcg"
-path = "src/bin/gpu_poisson_pcg.rs"
+name = "poisson-pcg-check"
+path = "src/bin/poisson_pcg_check.rs"
 
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
@@ -119,12 +119,12 @@ path = "src/bin/euler_check.rs"
 name = "logconf-check"
 path = "src/bin/logconf_check.rs"
 
-# Live multi-GPU advection across 2 devices with P2P halo exchange.
+# Validates gale_gpu::multigpu_advection_2d (distributed, 2-device P2P) vs CPU.
 [[bin]]
-name = "gpu-multigpu"
-path = "src/bin/gpu_multigpu.rs"
+name = "multigpu-check"
+path = "src/bin/multigpu_check.rs"
 
-# Live multi-GPU 3D hex advection across 2 devices with P2P halo exchange.
+# Validates gale_gpu::multigpu_advection_3d (distributed, 2-device P2P) vs CPU.
 [[bin]]
-name = "gpu-multigpu3d"
-path = "src/bin/gpu_multigpu3d.rs"
+name = "multigpu3d-check"
+path = "src/bin/multigpu3d_check.rs"

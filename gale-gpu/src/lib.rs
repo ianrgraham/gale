@@ -24,10 +24,12 @@
 //! the rlib boundary (see `docs/cuda-oxide-codegen-notes.md` §3 / fork commit
 //! `02129b8`).
 
+pub mod distributed;
 pub mod immersed;
 pub mod operators;
 
 // Backwards-compatible flat re-exports of the most-used host API.
+pub use distributed::{multigpu_advection_2d, multigpu_advection_3d};
 pub use immersed::penalize_apply;
 pub use operators::advection::{advection_rhs, GpuAdvection};
 pub use operators::advection3d::advection3d_rhs;
@@ -35,3 +37,4 @@ pub use operators::burgers::burgers_rhs;
 pub use operators::euler::euler_rhs;
 pub use operators::logconf::logconf_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
+pub use operators::poisson::{poisson_apply, poisson_cg_solve, poisson_pcg_solve};

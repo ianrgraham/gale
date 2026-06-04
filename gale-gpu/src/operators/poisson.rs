@@ -1,23 +1,29 @@
-//! GPU port (step 7f): the **p-multigrid V-cycle preconditioner + PCG, fully
-//! on-device**, validated against the CPU oracle `PMultigrid::pcg`.
+//! GPU SIPG-Poisson solver kernels — reusable library component.
+//!
+//! Consolidates the three one-off Poisson GPU ports (operator action, CG, and
+//! p-multigrid-preconditioned CG) behind a single `#[cuda_module]` and three host
+//! launch wrappers. All kernels are **order-agnostic** (runtime `n1`, shared sized
+//! to [`NN_MAX`]), so one set serves every p-multigrid level. The device math is
+//! the matrix-free SIPG operator `A·u` = volume stiffness + symmetry-lift + face
+//! consistency/penalty, evaluated as a 2-kernel pipeline (`gradient` → `operator`).
+//!
+//! - [`poisson_apply`] — one application of `A·u` (validated vs `Poisson::apply`).
+//! - [`poisson_cg_solve`] — full device-resident CG (validated vs `Poisson::cg`).
+//! - [`poisson_pcg_solve`] — full device-resident p-multigrid PCG, V-cycle and all
+//!   smoother/transfer steps on the GPU (validated vs `PMultigrid::pcg`).
 //!
 //! Setup (meshes, transfer matrices, diagonals, smoother weights) is reused from
-//! the validated CPU `PMultigrid`; only the iteration runs on the GPU. Kernels are
-//! **order-agnostic** (runtime `n1`, shared sized to `NN_MAX`), so one set serves
-//! every level. The V-cycle is written iteratively (down → coarse CG → up) and the
-//! orchestration uses macros so each kernel launch is its own statement
-//! (borrow-clean). Libdevice-free ⇒ embedded path works on sm_70.
-//!
-//! Run: cargo oxide run --bin gpu-poisson-pcg
+//! the validated CPU `Poisson` / `PMultigrid`; only the iterations run on-device.
+//! Libdevice-free ⇒ the embedded path works on sm_70.
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
-use gale::dg::{Edge, Neighbor, PMultigrid, Poisson};
+use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid};
 
 const NN_MAX: usize = 81; // (order 8 + 1)²
-const RED: usize = 256;
-const BND: u32 = u32::MAX;
+const RED: usize = 256; // reduction block size
+const BND: u32 = u32::MAX; // sentinel: face neighbor is a boundary
 
 #[cuda_module]
 mod kernels {
@@ -231,7 +237,6 @@ mod kernels {
         static mut IM: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         let n1f = n1f as usize;
         let n1c = n1c as usize;
-        let nf = n1f * n1f;
         let nc = n1c * n1c;
         let e = thread::blockIdx_x() as usize;
         let m = thread::threadIdx_x() as usize;
@@ -299,34 +304,277 @@ mod kernels {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::f64::consts::PI;
-    let order = 4;
-    println!("=== GPU p-multigrid PCG vs CPU oracle (p={order}) ===\n");
+/// Per-element metrics + flattened face metadata for one mesh, ready to upload.
+/// Built host-side exactly as the original Poisson bins did, then shared by the
+/// `gradient`/`operator` launches.
+struct MeshArrays {
+    nn: usize,
+    ne: usize,
+    ndof: usize,
+    n1: u32,
+    diff: Vec<f64>,
+    rx: Vec<f64>,
+    ry: Vec<f64>,
+    sx: Vec<f64>,
+    sy: Vec<f64>,
+    jw: Vec<f64>,
+    fvl: Vec<u32>,
+    fnx: Vec<f64>,
+    fny: Vec<f64>,
+    fsw: Vec<f64>,
+    fnbr: Vec<u32>,
+    ftau: Vec<f64>,
+}
 
-    // CPU setup (validated) + reference solve.
-    let mg = PMultigrid::new(order, 3, 3, [0.0, 1.0], [0.0, 1.0], 5.0);
-    let nlev = mg.n_levels();
-    let (n_pre, n_post) = mg.smoothing();
-    let fine = mg.mesh(0);
-    let nn0 = fine.refq.n_nodes();
-    let n0 = fine.n_elements() * nn0;
-    let exact = |x: f64, y: f64| (PI * x).sin() * (PI * y).sin();
-    let mut frc = vec![0.0; n0];
-    for (e, el) in fine.elements.iter().enumerate() {
-        for k in 0..nn0 {
-            frc[e * nn0 + k] = 2.0 * PI * PI * exact(el.geom.x[k], el.geom.y[k]);
+/// Flatten a mesh's metrics and SIPG face metadata (penalty `tau` from `alpha`),
+/// matching the host-side assembly in the original `gpu_poisson_*` bins.
+fn flatten_mesh(mesh: &Mesh2d, alpha: f64) -> MeshArrays {
+    let nn = mesh.refq.n_nodes();
+    let ne = mesh.n_elements();
+    let ndof = ne * nn;
+    let order = mesh.order;
+    let n1 = (order + 1) as u32;
+    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
+
+    let (mut rx, mut ry, mut sx, mut sy, mut jw) =
+        (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
+    for (e, el) in mesh.elements.iter().enumerate() {
+        for k in 0..nn {
+            rx[e * nn + k] = el.geom.rx[k];
+            ry[e * nn + k] = el.geom.ry[k];
+            sx[e * nn + k] = el.geom.sx[k];
+            sy[e * nn + k] = el.geom.sy[k];
+            jw[e * nn + k] = el.geom.jw[k];
         }
     }
-    let rhs = Poisson::new(fine, mg.alpha).rhs(&frc, |_, _| 0.0);
-    let (u_cpu, it_cpu) = mg.pcg(&rhs, 1e-10, 2000);
 
-    // ---- device buffers (struct-of-arrays per level) ----
+    let p1 = (order + 1) as f64;
+    let h: Vec<f64> = mesh.elements.iter().map(|el| el.geom.jw.iter().sum::<f64>().sqrt()).collect();
+    let n1u = n1 as usize;
+    let nfc = ne * 4 * n1u;
+    let (mut fvl, mut fnx, mut fny, mut fsw, mut fnbr, mut ftau) =
+        (vec![0u32; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![BND; nfc], vec![0.0; ne * 4]);
+    for (e, el) in mesh.elements.iter().enumerate() {
+        for (t, edge) in Edge::ALL.iter().enumerate() {
+            let face = &el.faces[*edge as usize];
+            let nb = &el.neighbors[*edge as usize];
+            ftau[e * 4 + t] = match nb {
+                Neighbor::Interior { elem: re, .. } => alpha * p1 * p1 / h[e].min(h[*re]),
+                Neighbor::Boundary { .. } => alpha * p1 * p1 / h[e],
+                Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => unreachable!(),
+            };
+            for a in 0..n1u {
+                let idx = (e * 4 + t) * n1u + a;
+                fvl[idx] = face.nodes[a] as u32;
+                fnx[idx] = face.nx[a];
+                fny[idx] = face.ny[a];
+                fsw[idx] = face.sw[a];
+                if let Neighbor::Interior { elem: re, edge: redge, perm } = nb {
+                    let rf = &mesh.elements[*re].faces[*redge as usize];
+                    fnbr[idx] = (*re * nn + rf.nodes[perm[a]]) as u32;
+                }
+            }
+        }
+    }
+
+    MeshArrays {
+        nn,
+        ne,
+        ndof,
+        n1,
+        diff: mesh.refq.line.diff.clone(),
+        rx,
+        ry,
+        sx,
+        sy,
+        jw,
+        fvl,
+        fnx,
+        fny,
+        fsw,
+        fnbr,
+        ftau,
+    }
+}
+
+/// Apply the matrix-free SIPG Poisson operator `A·u` once on the GPU, returning the
+/// nodal result. Reusable host wrapper around the [`kernels::gradient`] →
+/// [`kernels::operator`] 2-kernel pipeline: flattens the mesh metrics + SIPG face
+/// metadata (penalty from `alpha`), uploads, launches one block per element, and
+/// gathers the result. Bit-for-bit equal to `gale::dg::Poisson::apply`.
+///
+/// `u` must have length `n_elements · n_nodes`.
+pub fn poisson_apply(
+    mesh: &Mesh2d,
+    u: &[f64],
+    alpha: f64,
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    let ma = flatten_mesh(mesh, alpha);
+    assert_eq!(u.len(), ma.ndof, "state length must be n_elements·n_nodes");
+
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
     let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
 
+    let d_dev = up(&ma.diff)?;
+    let u_dev = up(u)?;
+    let rx_dev = up(&ma.rx)?;
+    let ry_dev = up(&ma.ry)?;
+    let sx_dev = up(&ma.sx)?;
+    let sy_dev = up(&ma.sy)?;
+    let jw_dev = up(&ma.jw)?;
+    let fvl_dev = upu(&ma.fvl)?;
+    let fnx_dev = up(&ma.fnx)?;
+    let fny_dev = up(&ma.fny)?;
+    let fsw_dev = up(&ma.fsw)?;
+    let fnbr_dev = upu(&ma.fnbr)?;
+    let ftau_dev = up(&ma.ftau)?;
+    let mut gx_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
+    let mut gy_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
+    let mut out_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
+
+    let module = kernels::load(&ctx)?;
+    let cfg = LaunchConfig {
+        grid_dim: (ma.ne as u32, 1, 1),
+        block_dim: (ma.nn as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    module.gradient(
+        &stream, cfg, &d_dev, &u_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev, ma.n1,
+        &mut gx_dev, &mut gy_dev,
+    )?;
+    module.operator(
+        &stream, cfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev,
+        &jw_dev, ma.n1, &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev,
+        &mut out_dev,
+    )?;
+    Ok(out_dev.to_host_vec(&stream)?)
+}
+
+/// Solve the SIPG Poisson system `A·u = b` by **conjugate gradient entirely on the
+/// GPU**, returning the solution and the iteration count. Vectors stay resident on
+/// the device; only the CG scalars (`α`, `β`, residual) transfer host-side. The
+/// convergence criterion (`‖r‖ / ‖b‖ < tol`) and reductions mirror
+/// `gale::dg::Poisson::cg` exactly. `b` is the already-assembled right-hand side
+/// (e.g. from `Poisson::rhs`), length `n_elements · n_nodes`.
+pub fn poisson_cg_solve(
+    mesh: &Mesh2d,
+    b: &[f64],
+    alpha: f64,
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    let ma = flatten_mesh(mesh, alpha);
+    let ndof = ma.ndof;
+    assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+    let d_dev = up(&ma.diff)?;
+    let rx_dev = up(&ma.rx)?;
+    let ry_dev = up(&ma.ry)?;
+    let sx_dev = up(&ma.sx)?;
+    let sy_dev = up(&ma.sy)?;
+    let jw_dev = up(&ma.jw)?;
+    let fvl_dev = upu(&ma.fvl)?;
+    let fnx_dev = up(&ma.fnx)?;
+    let fny_dev = up(&ma.fny)?;
+    let fsw_dev = up(&ma.fsw)?;
+    let fnbr_dev = upu(&ma.fnbr)?;
+    let ftau_dev = up(&ma.ftau)?;
+
+    // CG vectors (resident on device). r = b − A·0 = b, p = r.
+    let mut x = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut r = up(b)?;
+    let mut p = up(b)?;
+    let mut ap = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+
+    let module = kernels::load(&ctx)?;
+    let cfg = LaunchConfig {
+        grid_dim: (ma.ne as u32, 1, 1),
+        block_dim: (ma.nn as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
+    let n1 = ma.n1;
+    let n64 = ndof as u64;
+
+    macro_rules! dot {
+        ($a:expr, $b:expr) => {{
+            module.dot_partial(&stream, red, $a, $b, n64, &mut partial)?;
+            partial.to_host_vec(&stream)?[0]
+        }};
+    }
+    macro_rules! apply {
+        ($field:expr, $dst:expr) => {{
+            module.gradient(&stream, cfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
+            module.operator(
+                &stream, cfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
+                &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, $dst,
+            )?;
+        }};
+    }
+
+    let bnorm = dot!(&r, &r).sqrt().max(1e-300);
+    let mut rs = dot!(&r, &r);
+    let mut iters = 0;
+    for it in 0..maxit {
+        apply!(&p, &mut ap);
+        let pap = dot!(&p, &ap);
+        let alpha_cg = rs / pap;
+        module.axpy(&stream, vec_cfg, &mut x, &p, alpha_cg)?; // x += α p
+        module.axpy(&stream, vec_cfg, &mut r, &ap, -alpha_cg)?; // r −= α ap
+        let rs_new = dot!(&r, &r);
+        iters = it + 1;
+        if rs_new.sqrt() / bnorm < tol {
+            break;
+        }
+        let beta = rs_new / rs;
+        module.xpby(&stream, vec_cfg, &mut p, &r, beta)?; // p = r + β p
+        rs = rs_new;
+    }
+
+    Ok((x.to_host_vec(&stream)?, iters))
+}
+
+/// Solve the SIPG Poisson system `A·u = rhs` by **p-multigrid-preconditioned CG,
+/// fully on-device**, returning the finest-level solution and the outer PCG
+/// iteration count. The preconditioner is one p-multigrid V-cycle (down-sweep
+/// damped-Jacobi smoothing → coarsest-level CG → up-sweep prolong + smoothing),
+/// with every smoother/transfer/operator step launched on the GPU. Setup (per-level
+/// meshes, inter-level interpolation matrices, inverse diagonals, Jacobi `omega`,
+/// pre/post smoothing counts) comes from the validated CPU `mg`. Convergence
+/// (`‖r‖ / ‖rhs‖ < tol`), the inner coarse-CG tolerance/cap, and the V-cycle
+/// structure mirror `gale::dg::PMultigrid::pcg` exactly.
+///
+/// `rhs` is the already-assembled finest-level right-hand side (e.g. from
+/// `Poisson::new(mg.mesh(0), mg.alpha).rhs(...)`).
+pub fn poisson_pcg_solve(
+    mg: &PMultigrid,
+    rhs: &[f64],
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    let nlev = mg.n_levels();
+    let (n_pre, n_post) = mg.smoothing();
+    let nn0 = mg.mesh(0).refq.n_nodes();
+    let n0 = mg.mesh(0).n_elements() * nn0;
+    assert_eq!(rhs.len(), n0, "rhs length must match the finest level");
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+    // device buffers (struct-of-arrays per level)
     let mut n1v = Vec::new();
     let mut nev = Vec::new();
     let mut ndofv = Vec::new();
@@ -340,74 +588,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for l in 0..nlev {
         let m = mg.mesh(l);
-        let nn = m.refq.n_nodes();
-        let ne = m.n_elements();
-        let ndof = ne * nn;
-        let n1 = (mg.level_order(l) + 1) as u32;
-        // metrics + face metadata
-        let (mut rx, mut ry, mut sx, mut sy, mut jw) =
-            (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
-        for (e, el) in m.elements.iter().enumerate() {
-            for k in 0..nn {
-                rx[e * nn + k] = el.geom.rx[k];
-                ry[e * nn + k] = el.geom.ry[k];
-                sx[e * nn + k] = el.geom.sx[k];
-                sy[e * nn + k] = el.geom.sy[k];
-                jw[e * nn + k] = el.geom.jw[k];
-            }
-        }
-        let p1 = (mg.level_order(l) + 1) as f64;
-        let h: Vec<f64> = m.elements.iter().map(|el| el.geom.jw.iter().sum::<f64>().sqrt()).collect();
-        let n1u = n1 as usize;
-        let nfc = ne * 4 * n1u;
-        let (mut vl, mut nx, mut ny, mut sw, mut nbr, mut tau) =
-            (vec![0u32; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![BND; nfc], vec![0.0; ne * 4]);
-        for (e, el) in m.elements.iter().enumerate() {
-            for (t, edge) in Edge::ALL.iter().enumerate() {
-                let face = &el.faces[*edge as usize];
-                let nb = &el.neighbors[*edge as usize];
-                tau[e * 4 + t] = match nb {
-                    Neighbor::Interior { elem: re, .. } => mg.alpha * p1 * p1 / h[e].min(h[*re]),
-                    Neighbor::Boundary { .. } => mg.alpha * p1 * p1 / h[e],
-                Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => unreachable!(),
-                };
-                for a in 0..n1u {
-                    let idx = (e * 4 + t) * n1u + a;
-                    vl[idx] = face.nodes[a] as u32;
-                    nx[idx] = face.nx[a];
-                    ny[idx] = face.ny[a];
-                    sw[idx] = face.sw[a];
-                    if let Neighbor::Interior { elem: re, edge: redge, perm } = nb {
-                        let rf = &m.elements[*re].faces[*redge as usize];
-                        nbr[idx] = (*re * nn + rf.nodes[perm[a]]) as u32;
-                    }
-                }
-            }
-        }
-        n1v.push(n1);
-        nev.push(ne as u32);
-        ndofv.push(ndof);
-        dl.push(up(&m.refq.line.diff)?);
-        rxl.push(up(&rx)?);
-        ryl.push(up(&ry)?);
-        sxl.push(up(&sx)?);
-        syl.push(up(&sy)?);
-        jwl.push(up(&jw)?);
+        let ma = flatten_mesh(m, mg.alpha);
+        n1v.push(ma.n1);
+        nev.push(ma.ne as u32);
+        ndofv.push(ma.ndof);
+        dl.push(up(&ma.diff)?);
+        rxl.push(up(&ma.rx)?);
+        ryl.push(up(&ma.ry)?);
+        sxl.push(up(&ma.sx)?);
+        syl.push(up(&ma.sy)?);
+        jwl.push(up(&ma.jw)?);
         invd.push(up(mg.inv_diagonal(l))?);
-        fvl.push(upu(&vl)?);
-        fnbr.push(upu(&nbr)?);
-        fnx.push(up(&nx)?);
-        fny.push(up(&ny)?);
-        fsw.push(up(&sw)?);
-        ftau.push(up(&tau)?);
+        fvl.push(upu(&ma.fvl)?);
+        fnbr.push(upu(&ma.fnbr)?);
+        fnx.push(up(&ma.fnx)?);
+        fny.push(up(&ma.fny)?);
+        fsw.push(up(&ma.fsw)?);
+        ftau.push(up(&ma.ftau)?);
         omega.push(mg.jacobi_omega(l));
-        xb.push(DeviceBuffer::<f64>::zeroed(&stream, ndof)?);
-        bb.push(DeviceBuffer::<f64>::zeroed(&stream, ndof)?);
-        rb.push(DeviceBuffer::<f64>::zeroed(&stream, ndof)?);
-        apb.push(DeviceBuffer::<f64>::zeroed(&stream, ndof)?);
-        gxb.push(DeviceBuffer::<f64>::zeroed(&stream, ndof)?);
-        gyb.push(DeviceBuffer::<f64>::zeroed(&stream, ndof)?);
-        tmpb.push(DeviceBuffer::<f64>::zeroed(&stream, ndof)?);
+        xb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
+        bb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
+        rb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
+        apb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
+        gxb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
+        gyb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
+        tmpb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
     }
     // transfer matrices (coarse l+1 → fine l)
     let mut interp = Vec::new();
@@ -424,11 +629,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // PCG vectors (finest level, separate from V-cycle scratch).
     let mut psol = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
-    let mut pres = up(&rhs)?;
+    let mut pres = up(rhs)?;
     let mut pp = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
-    let mut pz = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
+    let pz = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
     let mut pap = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
-    let rhs_dev = up(&rhs)?;
+    let rhs_dev = up(rhs)?;
     let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
 
     let module = kernels::load(&ctx)?;
@@ -508,7 +713,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }};
     }
 
-    // ---- preconditioned CG on the device ----
+    // preconditioned CG on the device
     module.scal(&stream, vcfg[0], &mut psol, 0.0)?;
     dcopy!(&bb[0], &pres, n0);
     vcycle!();
@@ -517,14 +722,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bn = dot!(&rhs_dev, &rhs_dev, n0).sqrt().max(1e-300);
     let mut rz = dot!(&pres, &pz, n0);
     let mut iters = 0;
-    for it in 0..2000 {
+    for it in 0..maxit {
         matvec!(0, &pp, &mut pap);
         let pap_d = dot!(&pp, &pap, n0);
         let alpha = rz / pap_d;
         module.axpy(&stream, vcfg[0], &mut psol, &pp, alpha)?;
         module.axpy(&stream, vcfg[0], &mut pres, &pap, -alpha)?;
         iters = it + 1;
-        if dot!(&pres, &pres, n0).sqrt() / bn < 1e-10 {
+        if dot!(&pres, &pres, n0).sqrt() / bn < tol {
             break;
         }
         dcopy!(&bb[0], &pres, n0);
@@ -535,23 +740,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         module.xpby(&stream, vcfg[0], &mut pp, &pz, beta)?;
         rz = rz_new;
     }
-    let u_gpu = psol.to_host_vec(&stream)?;
 
-    // compare
-    let mut diff = 0.0f64;
-    let mut nrm = 0.0f64;
-    for i in 0..n0 {
-        diff += (u_gpu[i] - u_cpu[i]).powi(2);
-        nrm += u_cpu[i].powi(2);
-    }
-    let rel = (diff / nrm.max(1e-300)).sqrt();
-    println!("dofs={n0}  levels={nlev}  PCG iters: cpu={it_cpu}  gpu={iters}");
-    println!("‖u_gpu − u_cpu‖ / ‖u_cpu‖ = {rel:.3e}");
-    if rel < 1e-7 {
-        println!("\nPASS: GPU p-multigrid PCG matches the CPU oracle.");
-        Ok(())
-    } else {
-        eprintln!("\nFAIL: GPU/CPU mismatch.");
-        std::process::exit(1);
-    }
+    Ok((psol.to_host_vec(&stream)?, iters))
 }
