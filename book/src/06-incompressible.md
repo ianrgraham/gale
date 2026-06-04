@@ -1,5 +1,7 @@
 # Incompressible Navier–Stokes
 
+> 🎓 **Reviewer — chapter verdict:** The best chapter I've reviewed so far. The saddle-point → SPD-elliptic story is framed exactly as the genuine payoff, the bead-on-a-wire analogy is the right one, and the stability throughline lands. Two real correctness issues to fix (the explicit-diffusion node-spacing scaling is overstated, and the LBB sidestep is stated a touch too cleanly for DG), plus a couple of places to deepen. Fix those and it's excellent.
+
 By this point in the book we can discretize the two halves of a fluid equation
 separately: Chapter 4 built the *hyperbolic* operators (advection, the transport of
 stuff by the flow) and Chapter 5 built the *elliptic* operators (diffusion, the
@@ -61,6 +63,8 @@ choice of using the same polynomial space for both. The constraint is the villai
 chapter, and everything that follows is about defeating it without ever assembling that
 indefinite matrix.
 
+> 🎓 **Reviewer:** This section is genuinely good — the Lagrange-multiplier framing and the bead-on-a-wire analogy are exactly how I'd open a lecture on this. The one thing I'd add is *why* the zero block hurts a solver, since you lean on "indefinite" as if it's self-evidently bad. The payoff for the reader: an indefinite matrix has eigenvalues of both signs, so CG (which assumes a positive-definite energy to descend) simply doesn't apply, and the whole zoo of saddle-point solvers — Uzawa, MINRES, block preconditioners, Schur complements — exists precisely because of that zero block. That's the contrast that makes Stage-2/Stage-3 feel like an escape rather than just a rearrangement. One sentence here would set up the §"Why split" payoff perfectly.
+
 ## The projection idea: split the timestep
 
 The escape route is **operator splitting in time**, in the family of *projection* or
@@ -108,6 +112,10 @@ This is exactly the "subtract off the part that compresses" step. Geometrically 
 orthogonal projection onto the space of divergence-free fields; pressure is the potential
 whose gradient is the discarded piece.
 
+> 🎓 **Reviewer (deepen):** Worth one sentence on what makes this projection *orthogonal* and why that matters, because it's the cleanest justification in the whole scheme. The Helmholtz–Hodge split \\( \hat{\mathbf{u}} = \hat{\hat{\mathbf{u}}} + \Delta t\,\nabla p \\) is orthogonal in the \\( L^2 \\) inner product: a divergence-free field and a gradient are \\( L^2 \\)-orthogonal (integrate by parts, the divergence-free part kills the boundary/volume coupling). So the projection is the *closest* divergence-free field to the predictor — it removes the constraint violation and nothing else. That's the formal reason the scheme doesn't contaminate the velocity you cared about, and it's the same orthogonality that makes the operator SPD downstream. Cheap to add, high payoff.
+
+> 🎓 **Reviewer (flag):** Sign/SPD consistency check for the careful reader. You write \\( \nabla^2 p = \frac{1}{\Delta t}\nabla\cdot\hat{\mathbf{u}} \\), i.e. the operator is \\( +\nabla^2 \\), which is negative-(semi)definite. But §"Why split" and Chapter 7 insist the pressure system is SPD, and Chapter 6's "how gale does it" says \\( A \\) is "the SIPG stiffness, sign-flipped so it is positive." Those are consistent only because the code actually solves \\( -\nabla^2 p = -\frac{1}{\Delta t}\nabla\cdot\hat{\mathbf{u}} \\) (both sides negated → SPD operator). The continuous equation as written is fine, but since you make a point of the SPD property being the payoff, I'd add half a sentence noting the implemented operator is the positive-definite \\( -\nabla^2 \\). Otherwise a sharp reader notices \\( +\nabla^2 \\) is the wrong sign for CG and wonders if there's a bug.
+
 **Stage 3 — implicit viscous solve.** Finally apply the viscous diffusion, *implicitly*
 (we will see why in a moment). Discretizing \\( \partial_t\mathbf{u} = \nu\nabla^2\mathbf{u} \\)
 with backward Euler (BDF1) and using \\( \hat{\hat{\mathbf{u}}} \\) as the data gives, for
@@ -151,6 +159,10 @@ This is exactly the route the verified viscoelastic-DG literature takes (the SRC
 solver builds on the same Karniadakis–Israeli–Orszag splitting), and it is the
 "recommended spine" of gale's solver-strategy document.
 
+> 🎓 **Reviewer (flag):** This is the claim I'd push back on hardest, because "sidesteps the LBB/inf-sup constraint entirely" is too clean and a practitioner will wince. Splitting doesn't make the inf-sup condition *disappear* — it changes the form in which it bites. The honest version: the *fully-coupled* discrete saddle-point system needs a discrete inf-sup condition for the velocity/pressure pair, and equal-order spaces famously fail it (the checkerboard/spurious-pressure-mode pathology). A pressure-projection scheme replaces that with a *discrete pressure-Poisson* operator, and you've traded a coupled compatibility condition for the requirement that this Laplacian be non-singular (modulo the constant nullspace you handle by deflation) and free of spurious pressure modes. For DG specifically that's *not* automatic: the pressure-Poisson must be discretized so the discrete gradient/divergence pair is compatible, or you can still see pressure checkerboarding even after splitting. The reason gale is safe is that it builds the pressure operator as a genuine SIPG Laplacian (Ch. 5), not as \\( B M^{-1} B^\top \\) from the equal-order operators — and *that* is the design choice that earns the equal-order convenience. So: "sidesteps the coupled inf-sup *by replacing it with a well-posed SIPG Poisson solve*" is true and defensible; "sidesteps it entirely" invites a referee to ask about pressure modes. Recommend softening to the former.
+
+> 🎓 **Reviewer:** And do say a word on *why* equal-order is worth fighting for, since you assert it "makes a clean nodal DG-SEM implementation possible" without the punchline: same nodes, same operators, same kernels for \\( u \\), \\( v \\), \\( w \\), *and* \\( p \\) — one apply, one mass matrix, one p-multigrid setup reused across all four solves. That code-level economy is the real prize and it's a nice tie to Chapter 7.
+
 ## Why the viscous step must be implicit
 
 Stage 3 solves a linear system every step, which is more expensive than an explicit
@@ -173,6 +185,10 @@ length scales, high-order means large \\( p \\), and low Reynolds number means \
 *large* relative to the velocities. Every one of those pushes the explicit viscous
 timestep toward zero. You would spend thousands of steps resolving viscous decay you do
 not care about.
+
+> 🎓 **Reviewer (flag):** The scaling here is overstated and a spectral-element person will catch it. The minimum GLL node spacing scales like \\( h/p^2 \\) — that part is right. But the explicit *diffusion* eigenvalue bound for a high-order SEM operator does **not** scale as the square of the min node spacing, i.e. it is not \\( (h/p^2)^2 \\) → "quartic in \\( p \\)". The standard, well-documented result is that the spectral radius of the second-derivative (Laplacian) operator on a GLL grid grows like \\( p^4/h^2 \\) — so the explicit diffusive limit is \\( \Delta t \lesssim h^2/(\nu\,p^4) \\). Note \\( p^4/h^2 \\) is the *fourth* power of \\( p \\) but only the *square* of \\( h \\): the "quartic in \\( p \\)" is correct, but writing the bound as \\( (h/p^2)^2/\nu \\) implies the \\( h \\)-dependence is also \\( (h/p^2)^2 = h^2/p^4 \\) — which happens to give the same expression, so the final formula is actually fine! The problem is the *reasoning*: you get \\( h^2/p^4 \\) from \\( (\Delta x_{\min})^2 \\), and that's a coincidence, not a derivation. The eigenvalue does not equal one-over-min-spacing-squared; the \\( p^4 \\) comes from the *operator norm*, which is steeper than naive nodal CFL. I'd cut the "(spacing)² → therefore" chain and just state the operator-eigenvalue result: \\( \rho(\text{SEM Laplacian}) \sim p^4/h^2 \\), hence \\( \Delta t \lesssim h^2/(\nu p^4) \\). Same punchline (quartic in \\( p \\)), defensible derivation.
+
+> 🎓 **Reviewer (flag):** Smaller, but real: "low Reynolds number means \\( \nu \\) is *large* relative to the velocities." Low Re means \\( \nu \\) is large relative to \\( UL \\) — it's a ratio, \\( \mathrm{Re} = UL/\nu \\). In nondimensional units you typically *set* \\( \nu = 1/\mathrm{Re} \\) so low Re does mean a large \\( \nu \\); fine. But in dimensional microfluidics \\( \nu \\) is often just water's \\( 10^{-6}\,\mathrm{m^2/s} \\) and low-Re comes from tiny \\( U \\) and \\( L \\), not large \\( \nu \\). The stiffness argument still holds (small \\( h \\) dominates the \\( h^2/\nu \\) limit regardless), so I'd drop "low Reynolds number means \\( \nu \\) is large" as a load-bearing clause — it's only true in the nondimensionalization and reads as a physics claim.
 
 Treating the viscous term implicitly removes the limit completely: backward Euler is
 *unconditionally* stable for diffusion, so \\( \Delta t \\) is set by accuracy and by the
@@ -217,6 +233,8 @@ variant (BDF2/BDF3 with matching extrapolation order), which is a coefficient ch
 the predictor and the Helmholtz reaction, not a redesign. The build keeps BDF1; the higher
 orders are a documented, planned upgrade.
 
+> 🎓 **Reviewer (deepen):** Good instinct to separate "splitting error" from "temporal order," but they're slightly conflated here. There are *two* first-order errors stacked on top of each other: (1) the BDF1 time-integration error, \\( O(\Delta t) \\), which you'd have even with no splitting; and (2) the *splitting* (commutator) error from solving the constraint and the viscous step in sequence rather than together — also \\( O(\Delta t) \\) for this scheme, and it's the one that interacts with the pressure boundary condition below. Going to BDF2/BDF3 fixes (1) cleanly, but the splitting error is what historically caps these schemes near the wall (the famous \\( O(\sqrt{\nu\Delta t}) \\) numerical boundary layer in pressure, which the KIO "high-order pressure BC" was invented to suppress). So "a coefficient change to the predictor and Helmholtz reaction" upgrades the *time integrator*; getting the *splitting* to high order is the bit that needs the consistent high-order pressure Neumann BC. Worth one sentence so the planned BDF2/BDF3 upgrade isn't oversold as purely a coefficient swap — the next section (boundary conditions) is exactly where that subtlety lives.
+
 ## The boundary-condition subtlety
 
 Split schemes have a notorious wrinkle at the boundaries, and it is worth flagging because
@@ -226,6 +244,8 @@ equation for *pressure*, which had no boundary condition of its own. The splitti
 one on it: consistency with the projection requires a **Neumann** condition on pressure
 (its normal derivative is tied to the momentum balance at the wall). gale's pressure solve
 therefore uses natural (homogeneous-Neumann) boundary faces throughout.
+
+> 🎓 **Reviewer (flag):** Be careful: the *consistent* pressure Neumann BC is **not** homogeneous. Projecting the momentum equation onto the wall normal gives \\( \partial_n p = \mathbf{n}\cdot(\nu\nabla^2\mathbf{u} - (\mathbf{u}\cdot\nabla)\mathbf{u} + \mathbf{f} - \partial_t\mathbf{u}) \\) at the boundary — generally nonzero, and the *whole point* of KIO's "stiffly stable" scheme is that getting this term right (especially the rotational \\( \nu\nabla\times\nabla\times\mathbf{u} \\) form) is what restores high-order accuracy near walls. So saying gale "uses homogeneous-Neumann throughout" is honest about the *current* BDF1 build but should be flagged as the very approximation that (together with BDF1) caps the scheme at first order. As written it reads as if homogeneous-Neumann were the correct consistent condition, which it isn't — it's the cheap first-order stand-in. Recommend: "gale's BDF1 build uses the homogeneous-Neumann simplification; the consistent (inhomogeneous) high-order pressure BC is part of the same planned BDF2/BDF3 upgrade." That also makes the two §"temporal order" first-order errors land in one place.
 
 That creates a second, subtler problem. With velocity Dirichlet everywhere and pressure
 Neumann everywhere, the pressure is only determined **up to an additive constant** — add

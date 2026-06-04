@@ -1,5 +1,7 @@
 # Hyperbolic Operators and Stability
 
+> 🎓 **Reviewer — chapter verdict:** This is the strongest chapter of the three and the central-flux-vs-Rusanov story is *correct* and crisply told — the "dissipation buys stability" framing is exactly right. The split-form section is mostly right and genuinely well-explained, but it's the longest stretch in the book and leans on a couple of claims that need tightening (the "provably robust, no tuning" line, and a notation slip in the flux-difference formula). Trim the entropy section by ~20% and fix those and it's a model chapter.
+
 [Chapter 3](03-dgsem.md) built the machinery: nodal spectral elements on quads, a
 diagonal mass matrix from GLL collocation, and the discontinuous Galerkin weak form
 that couples elements only through their shared faces. This chapter puts that machinery
@@ -88,6 +90,8 @@ remove energy from the under-resolved modes at the interface, so any small rippl
 grid scale is free to amplify. On a linear problem this may merely sit at the edge of
 stability; on a nonlinear one it is a slow-motion explosion.
 
+> 🎓 **Reviewer (flag):** Sharpen this — the "no definite sign" claim is right in spirit but slightly too pessimistic for the *linear* case, and a stickler will catch it. For **linear advection with a central flux**, the semi-discrete energy is actually *exactly conserved* (the surface residual telescopes to a boundary-only term with zero interior contribution) — the scheme isn't energy-growing, it's energy-*neutral*. That's the real danger: neutral means there's zero dissipation to kill grid-scale ripples, so they persist and, under time-stepping or any nonlinearity, the absence of a damping sink is what lets them grow. Your own next sentence ("nothing to remove energy") is the correct mechanism; the "can grow" claim oversells it for the linear case. The honest statement is: central flux is energy-conservative (no dissipation), and *that lack of dissipation* — not a sign-indefinite energy — is the problem. Get this right and the contrast with Rusanov ("non-increasing") is razor-sharp.
+
 ### Upwinding and the Rusanov flux: dissipation buys stability
 
 The cure is to *respect the direction information travels*. Transport is directional: if
@@ -110,6 +114,8 @@ continuous, \\( [u]\to 0 \\) and the extra term vanishes — so we keep full hig
 accuracy on resolved features. Where there is a jump — a shock, or an under-resolved
 ripple — the term switches on and drains energy out of it, exactly enough to make the
 discrete energy/entropy balance *non-increasing*. The dissipation is what buys stability.
+
+> 🎓 **Reviewer (flag):** Two small but real caveats so this doesn't overclaim. (1) "Exactly enough" — the Rusanov \\( \lambda \\) is a *generous* bound (the max wave speed), so it adds *more* than the minimal dissipation; "enough, and a bit to spare" is the honest phrasing. You actually concede this in the next paragraph (HLL/Roe add *less*), so tighten it here. (2) The scalar jump term \\( \lambda[u] \\) gives a clean sign-definite energy contribution for a scalar law; for the **Euler system** \\( \lambda(u^+-u^-) \\) damps *every* characteristic field by the *fastest* wave speed, which is exactly why Rusanov is the most diffusive Riemann solver — worth one clause, since Euler is in your zoo.
 
 Two things are worth pausing on. First, \\( \lambda \\) is genuinely *local*: it is the
 local maximum wave speed, not a global constant, which is why this is the "local"
@@ -156,7 +162,9 @@ true product (the part above degree \\( p \\)) does not just disappear — it ge
 misrepresented as, *aliased onto*, the low modes the grid *can* carry. Energy that should
 have lived at unresolved scales is folded back into the resolved ones. On a marginally
 resolved, high-Reynolds-number flow this aliased energy has nowhere to dissipate; it piles
-up at the grid scale and the simulation blows up. This is **aliasing instability**, and it
+up at the grid scale and the simulation blows up.
+
+> 🎓 **Reviewer:** This is a genuinely good plain-English explanation of aliasing — "the degree-\\(2p\\) product can't live in a degree-\\(p\\) space, so it folds back onto the low modes" is the right mental picture and most textbooks bury it. Keep it. One optional sharpening: the name "aliasing" comes from the exact signal-processing phenomenon (under-sampling a high frequency makes it masquerade as a low one) — a one-line nod to that origin would make the term click for a reader who's seen it in audio/imaging. This is **aliasing instability**, and it
 is the reason naive high-order schemes for turbulent or high-Re flow are notoriously
 fragile. It is not a bug in the flux or the boundary handling — it is intrinsic to taking
 nonlinear products in a finite polynomial space.
@@ -186,6 +194,8 @@ evaluated between every pair of nodes on a line:
 \tilde{\mathbf{F}}^{\#}(u_i,u_j).
 \\]
 
+> 🎓 **Reviewer (flag):** Check the prefactor and the operator in this formula against the code before it ships. The Fisher–Carpenter flux-differencing volume term is conventionally written \\( 2\sum_j D_{ij}\,\tilde{\mathbf F}^{\#}(u_i,u_j) \\) using the *SBP/collocation* derivative \\( D \\) on the **reference** element, with the metric/Jacobian folded in separately — not \\( \frac{2}{J} D_{ij} \\) as a lumped scalar, which only works for an affine 1D map and will mislead a reader who tries to generalize to a curved or multi-D element. Also, for the diagonal-norm GLL-SBP operator the relevant identity is on \\( Q = MD \\) (the SBP property \\( Q + Q^\top = B \\)); the factor of 2 and the \\( M^{-1} \\) need to be placed consistently. I'd state the 1D reference form exactly and say "metric terms enter as in the standard map" rather than smuggling \\( 1/J \\) into the sum. As written it's *almost* right, which is worse than schematic.
+
 If the two-point flux is **symmetric** and **consistent** (it reduces to the physical
 flux when \\( u_i=u_j \\)), the SBP property of the differentiation matrix makes the volume
 term telescope *in the entropy variables too*. The result: the semi-discrete scheme
@@ -194,6 +204,8 @@ the Rusanov interface dissipation on top turns "conserving" into "non-increasing
 **entropy-stable** scheme. Entropy can only go down, never up, so there is no mechanism
 for aliased energy to accumulate. The scheme is *provably* robust at high Reynolds number,
 with no tuning.
+
+> 🎓 **Reviewer (flag):** "Provably robust at high Reynolds number, with no tuning" is too strong and a referee will pounce. What's actually *proven* is a **semi-discrete entropy/energy bound** — the spatial operator can't manufacture entropy. That is a real and valuable guarantee, but it is *not* the same as "robust at high Re," and three gaps remain: (1) it's semi-discrete — your SSP-RK3 time integrator can still violate the bound at a finite \\( \Delta t \\) (fully-discrete entropy stability needs relaxation RK or similar); (2) entropy stability does not prevent the solution from becoming *garbage* on an under-resolved mesh — it stays bounded, not accurate, and can still produce nonphysical oscillations; (3) for systems you additionally need the discrete solution to stay in the set where the entropy is convex (positivity of density/pressure), which split-form alone doesn't guarantee. The honest claim is "provably entropy-stable in space, which is what makes it survivable at high Re without blowing up" — keep the win, drop the word "robust" doing unearned work.
 
 The choice of two-point flux is where the law's identity lives, and gale's
 `ConservationLaw` trait makes this explicit via a `two_point_flux` method:
@@ -218,10 +230,14 @@ non-increasing through the shock: the high-Re robustness guarantee, demonstrated
 sanity check sits alongside them — for *linear* advection there is no aliasing, so the
 split form and the weak form are algebraically identical (`split_form_matches_weak_for_linear_advection`).
 
+> 🎓 **Reviewer:** The `split_form_matches_weak_for_linear_advection` test is a lovely touch and exactly the kind of "the abstraction collapses to the trivial case when it should" check that builds trust — call it out as such. (It's also the cleanest possible demonstration of *why* aliasing is a purely nonlinear disease, reinforcing the section's whole premise.)
+
 There is a dissipation toggle worth naming. gale exposes `dissipation: bool` on the
 operator: `true` adds the Rusanov jump term (entropy-*stable*); `false` uses a pure
 central interface flux (entropy-*conserving*, the configuration the round-off test above
 relies on). Entropy-conserving is the diagnostic; entropy-stable is what you run.
+
+> 🎓 **Reviewer (cut):** The split-form section is the longest single stretch in these three chapters, and the three bullet-pointed two-point fluxes (Burgers \\( (u_L^2+u_Lu_R+u_R^2)/6 \\), KEP, Chandrashekar+log-mean) are textbook reference material a blog reader does not need spelled out. The *idea* — "pick a symmetric, consistent two-point flux and SBP makes the secondary quantity telescope too" — is the keeper; the specific flux formulas are an appendix or a code-comment, not body text. I'd cut the three bullets to one sentence ("each law supplies its own entropy-conserving two-point flux; the `ln_mean` trick for Euler avoids cancellation near \\(a=b\\)") and reclaim the momentum. The two validation tests are worth keeping; the flux catalog is not.
 
 ### Cure 2: modal filtering, the gentle last resort
 

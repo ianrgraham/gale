@@ -1,5 +1,7 @@
 # Architecture: Rust, the GPU, and Multi-GPU
 
+> 🎓 **Reviewer — chapter verdict:** The strongest of the four assigned chapters. The "GPU-native vs GPU-accelerated" framing is genuinely well-sold (the FFI-type-mismatch example is the kind of concrete pain a newcomer immediately believes), and "one block per element, one thread per node" is the cleanest possible statement of why DG and GPUs are made for each other. The gather-formulation → determinism → bit-for-bit-checkability chain is the best paragraph in the chapter and earns its length. Two things to fix: the cuda-oxide bug list is one bullet too long and tips from "honest posture" into "look how many bugs I fixed" (trim to two), and the device-bundle section is borderline in-the-weeds — keep it, but cut it to the punchline (see mark). Otherwise: ship it.
+
 The previous chapters were about *what* gale computes — fluxes, penalty terms,
 projection steps, mortars. This one is about *where* and *how* that computation
 runs: in Rust, on NVIDIA GPUs, written in Rust **all the way down to the device
@@ -59,6 +61,8 @@ examples gale hit and resolved while porting its operators:
   — worked around in gale (and flagged upstream) by computing the symmetric-2×2
   eigenvector directly instead of via `atan2`.
 
+> 🎓 **Reviewer (cut):** Three bullets here, each a real codegen bug, and by the third the reader has stopped learning anything new — the rhetorical work ("a young toolchain bites, and gale bit back") is done by bullet two. The third (`atan2` / libdevice gaps) is the most in-the-weeds and the least illustrative; cut it, or fold it into the prose as a parenthetical. The danger of a list like this is that it reads as a trophy case rather than the "honest cost" you frame it as one paragraph up. Two vivid examples sell the posture; three start to protest it.
+
 The point is not the detail (that lives in `docs/cuda-oxide-codegen-notes.md`); it
 is the posture. gale carries a fork of cuda-oxide with these fixes, validates them
 on the exact hardware, and treats each one as a candidate upstream contribution.
@@ -85,6 +89,8 @@ touches. DG-SEM is all three:
   block. Inside the block, each collocation node is a thread. For a degree-4 element
   in 2D that is \\\( (p+1)^2 = 25 \\\) threads; in 3D, \\\( (p+1)^3 = 125 \\\). The mesh
   has thousands of elements, so the GPU is saturated.
+
+> 🎓 **Reviewer (deepen):** "one block per element, one thread per node" is the right hook, and the thread-count arithmetic is exactly the concrete detail a newcomer needs. Worth one extra sentence of practitioner honesty, though: 25 threads (2D, p=4) is *less than one warp* (32), so a naive one-thread-per-node mapping leaves a 2D block underutilizing its warp — which is precisely why the high-arithmetic-intensity, shared-memory-reuse argument in the next bullets is doing the real work, and why the 3D case (125 threads ≈ 4 warps) sits more comfortably. You don't have to dwell on it, but acknowledging that the mapping is "obvious but not automatically efficient" makes the shared-memory paragraph land as the *fix* rather than just a third nice property. A reader who has touched CUDA will trust you more for naming the warp-size wrinkle out loud.
 - **The per-element work is dense small tensor contractions.** The volume term of a
   DG operator is the sum-factorized differentiation from Chapter 3 — a handful of
   small matrix–vector products against the reference differentiation matrix. These
@@ -110,6 +116,8 @@ output slot. Determinism here is not a nicety; it is what makes the bit-for-bit 
 comparison of Chapter 12 even *possible* — a racy kernel would give slightly
 different answers run to run and could never be checked against an oracle to
 \\\( 10^{-14} \\\).
+
+> 🎓 **Reviewer:** This is the best paragraph in the chapter. The gather-vs-scatter choice → no cross-block write races → no atomics → run-to-run determinism → *that is what makes the bit-for-bit oracle test possible* is a genuine, non-obvious insight, and you've chained it cleanly. Most GPU-CFD writeups mention "gather formulation" and move on; tying it forward to the validation story is the thing that will make a careful reader sit up. Leave it exactly as is. (One micro-note: the floating-point reason it's deterministic is that gather fixes the *order of summation* per output node — scatter-with-atomics does not. You're implying this; a four-word aside "(the summation order is fixed)" would nail it for the FP-pedantic reader, but it's optional.)
 
 Data layout follows from this. Nodal values are stored element-major
 (`element * n_nodes + node`), so the threads of a block read a contiguous run of
@@ -139,6 +147,8 @@ This is why `gale-gpu` is organized as one crate with many operator modules unde
 single bundle, with a disciplined export-naming convention, rather than as a swarm of
 tiny per-operator crates. The constraint is a cuda-oxide fact, and the module layout
 is gale's response to it.
+
+> 🎓 **Reviewer:** Verdict on the question I was asked to rule on — *keep it, but trim it.* This is in-the-weeds, but it's the *good* kind of weeds: it's a real-world consequence of building on a young toolchain that a blog reader hasn't seen elsewhere, and "why are these kernels named `advect2d_rhs` instead of `advect_rhs`?" is exactly the sort of small mystery that makes a curious reader feel let into the machine room. What it doesn't need is three paragraphs. The payload is two sentences: (1) cuda-oxide puts every `#[kernel]` in one crate-wide bundle, so export names must be globally unique; (2) hence the `2d`/`3d`/`mg` suffixes and the single crate with many modules. The middle paragraph re-explains the collision twice. Cut it to roughly half its length and it goes from "in the weeds" to "delightful footnote you chose to read."
 
 ## The hybrid host/GPU pattern
 
@@ -188,6 +198,8 @@ advection kernel runs unmodified on each device. The decomposition is exactly th
 validated CPU-side against the monolithic operator (Chapter 12), so the multi-GPU
 result is provably the single-GPU result, split. gale runs **real two-device
 advection in both 2D and 3D** on its 2× Titan V box today.
+
+> 🎓 **Reviewer (flag):** "provably the single-GPU result, split" is *almost* true and I'd tighten it to be exactly true, because a sharp reader will poke it. It's bit-for-bit identical only if the partitioned operator does its per-node summations in the same order as the monolithic one — for a pure gather of face traces it does, so the claim holds *here*. But the word "provably" is carrying a floating-point assumption you haven't stated, and the moment a reduction (a CG dot-product, a global residual norm) crosses the partition boundary, partial sums reassociate and bit-for-bit becomes "agrees to round-off." Since this section is specifically about *advection* (a gather, no global reduction) you're fine — but I'd swap "provably the single-GPU result" for "bit-for-bit the single-GPU advection result" so the claim is scoped to the case where it's actually exact, and you don't write a check the multi-GPU *Krylov* solver can't cash later.
 
 ## How gale does it
 

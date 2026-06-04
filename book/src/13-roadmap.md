@@ -1,5 +1,7 @@
 # Roadmap and Open Problems
 
+> 🎓 **Reviewer — chapter verdict:** The honesty here is well-judged — it neither over-apologizes nor puffs. The framing "this is the map of where the interesting work lives" is exactly the right register for a research code, and the closing "not a list of regrets; it is the payoff structure the architecture was designed to unlock" is a strong, non-defensive landing. The risk in a chapter like this is the opposite of over-apology: a flat list of nine "not done" bullets can read as a backlog dump and sap the book's momentum right at the finish. Two fixes (see marks): order the gaps by *interestingness*, not by build-order, and make sure the genuinely hard open *problems* (deformable particles, load balancing) are visibly distinguished from the merely-unstarted *ports* (FENE-P, BDF2, pyo3) — right now they sit at the same altitude.
+
 This book has described what gale *is*. This chapter is honest about what it is *not yet*
 — the capabilities that are designed, scoped, or partially built but not finished. For a
 research code this is not an embarrassment; it is the map of where the interesting work
@@ -67,6 +69,8 @@ Oldroyd-B allows *infinite* polymer extension, which is unphysical and a source 
 high-Wi pathology. **FENE-P** (finitely-extensible nonlinear elastic, Peterlin closure)
 bounds the stretch and is the natural next model. The log-conformation machinery of
 Chapter 8 carries over directly; this is a contained addition.
+
+> 🎓 **Reviewer:** Good instinct labeling FENE-P "a contained addition" — and it genuinely is, which is the point worth making *visible* across the whole chapter. The reader can't easily tell, scanning these sections, which gaps are an afternoon (FENE-P closure swaps the relaxation term, BDF2 swaps the time-stencil) versus which are a research project (deformable particles are an open FSI problem, SFC load balancing is a genuine distributed-systems design). A one-word tag at the head of each subsection — *(contained)* / *(substantial port)* / *(open problem)* — would turn this from a flat backlog into a difficulty-sorted map, and it's the single highest-value edit in the chapter. You're already saying it in prose for some ("the most direct extension," "contained addition," "the largest remaining physics extensions") — just make it systematic and scannable.
 
 ### Higher-order time integration
 The dual-splitting scheme is currently **BDF1** (first-order in time). Higher-order BDF /

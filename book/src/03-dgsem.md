@@ -1,5 +1,7 @@
 # Why Discontinuous Galerkin?
 
+> 🎓 **Reviewer — chapter verdict:** Strong, well-paced chapter — the "discontinuous = local = GPU" throughline is genuinely the right spine and it lands. The weak-form derivation is about one bookkeeping step too long for a blog, and a couple of spectral-element claims are stated with more confidence than they deserve (collocated mass is *not* the true mass matrix; "exponential" needs the analyticity caveat). Fix those and this is excellent.
+
 We have the equations (Chapter 2). Now we need a way to turn continuous fields and
 derivatives into finite arrays of numbers a computer — specifically a GPU — can march
 forward. This is *spatial discretization*, and the choice gale makes is the
@@ -97,6 +99,8 @@ appeared**: the flux \\( f \\) evaluated on the *surface* of the element, \\( \p
 \Omega_k \\). In 1D that surface is just the two endpoints; in 2D/3D it is the element's
 faces.
 
+> 🎓 **Reviewer (deepen):** The "lifted off the rough solution onto the smooth test function" line is the real prize of the weak form and you breeze past it. The deeper payoff is worth one more sentence: this is what lets a *discontinuous* polynomial be a legal solution at all — the strong form's pointwise second derivative would be meaningless across a jump, but the weak form only ever asks for an integral, which a piecewise polynomial happily supplies. That's why "weak" isn't a compromise; it's the thing that makes the whole discontinuous game legal. Say that and the reader gets *why* we bother, not just *what* we did.
+
 **Step 3 — confront the discontinuity.** Here is the crux. Because each element has its
 own independent polynomial, at a shared face the solution has *two* values — one from each
 side — and they generally disagree. So what is the flux \\( f \\) in that surface term?
@@ -128,6 +132,8 @@ operator, and \\( \mathbf{L} \\) the *lift* operator that maps face data back in
 element interior. The diffusive (viscous, elliptic) terms get the same treatment but need
 a more careful flux — the interior-penalty method of Chapter 5 — because second
 derivatives are involved.
+
+> 🎓 **Reviewer (cut):** Steps 1–2 are fine, but by the time we reach this operator equation the derivation has spent its blog budget. The genuinely DG-specific insight is *only* Step 3 (the face is double-valued, so we must invent \\( f^* \\)) — everything before it is standard Galerkin a reader can take on faith. Consider compressing Steps 1–2 into a single short paragraph ("multiply by a test function, integrate over one element, integrate by parts — out pops a volume term plus a surface flux term") and spending the saved space on Step 3, which is where DG actually begins. As written, the multiply-and-integrate-by-parts ritual reads like a textbook, which is exactly the thing the preface promised to avoid.
 
 ## "Discontinuous" means local, and local means GPU
 
@@ -184,6 +190,8 @@ linear solve — a major saving repeated every time step, and a recurring stabil
 because it keeps operators clean and symmetric. This is the first reason GLL specifically
 is chosen: it makes the mass matrix diagonal cheaply.
 
+> 🎓 **Reviewer (flag):** Be careful with "beautiful consequence" — the diagonal mass matrix is not free, it's an *approximation*. GLL quadrature is exact only to degree \\( 2p-1 \\), but \\( \phi_i\phi_j \\) is degree \\( 2p \\), so collocating the mass integral **under-integrates** it. The diagonal \\( M = \mathrm{diag}(Jw) \\) is the *lumped* mass matrix, not the true one; the true consistent GLL mass matrix is full. This is the same aliasing that Chapter 5 (correctly) calls "benign" — so it's fine, but stated here as if diagonality were exact it's misleading. One clause — "this is technically an under-integration (mass lumping), but a benign one we'll revisit in Ch. 5" — keeps you honest and sets up the later callback. A practitioner reading this will notice, and the book's credibility rides on getting the SEM folklore right.
+
 **Tensor-product structure on quads and hexes.** In 2D a quadrilateral element's nodes are
 just the Cartesian product of two 1D GLL point sets; in 3D a hexahedron is the product of
 three. gale builds these in `src/dg/reference/quad.rs` (`Reference2dQuad`) and
@@ -203,9 +211,13 @@ operation GPUs are fastest at. (Simplex elements — triangles, tetrahedra — l
 tensor structure and force dense per-element operators, which is exactly why gale's fast
 path is quads and hexes.)
 
+> 🎓 **Reviewer:** This is the best paragraph in the chapter — sum factorization is the real reason high-order SEM is affordable, and you nail the \\( O(p^{2d}) \to O(p^{d+1}) \\) punchline and tie it to GPU matmul. Keep it exactly as is. The simplex aside is a nice, honest "here's the cost of the choice" too.
+
 **Spectral convergence, and why we want few, large, high-degree elements.** For a *smooth*
 solution, increasing the polynomial degree \\( p \\) makes the error fall **exponentially**
-(spectral convergence), not just algebraically as in low-order methods. This changes the
+(spectral convergence), not just algebraically as in low-order methods.
+
+> 🎓 **Reviewer (flag):** "Exponentially" for a "smooth" solution is the textbook slogan but it's slightly too generous and the caveat is load-bearing for *this* application. Exponential (spectral) convergence requires the solution to be **analytic** (or at least \\( C^\infty \\) with controlled derivatives); a merely-smooth-but-finitely-differentiable solution converges algebraically at a rate set by how many derivatives it has. This matters enormously here: a viscoelastic stress layer or a boundary layer near an immersed particle is exactly where analyticity fails, and the exponential rate quietly degrades to algebraic. You half-acknowledge this two sentences later with the Gibbs caveat, but the word "smooth" is doing too much work. Either say "analytic" or add "the rate depends on how many derivatives the solution actually has." Otherwise a reader benchmarks a real flow, sees algebraic convergence, and thinks the code is broken. This changes the
 economics entirely: instead of many tiny low-order cells, we can use comparatively *few,
 large, high-degree* elements — gale typically runs \\( p \approx 4\!-\!8 \\) — and still
 resolve smooth flow to high accuracy. That matters enormously for the application: when
@@ -238,7 +250,9 @@ coordinate fields with the very same reference operators** (`diff_r`/`diff_s` ap
 the \\( x \\)- and \\( y \\)-coordinate values). For a straight-sided quad the coordinate
 fields are low-degree polynomials, so this is exact — and it generalizes unchanged to
 *curved* (higher-order) elements later, which gale will want for body-fitted viscoelastic
-benchmarks. Two stability-relevant facts ride along here: \\( \det J > 0 \\) everywhere is
+benchmarks.
+
+> 🎓 **Reviewer (deepen):** "Generalizes unchanged to curved elements" hides a famous trap worth one sentence. On curved (high-order) elements, differentiating the coordinate fields the *naive* way does **not** preserve free-stream — the metric terms fail the discrete metric identities unless you compute them in a specific *curl* form (Kopriva's conservative curl metrics). gale gets away with the naive approach today only because straight-sided quads make the coordinate fields affine. If you're going to promise curved-element generalization, flag that it will need the conservative metric formulation, or a reader who's been burned by this (all of us have) won't trust the claim. It connects directly to your own \\( \det J > 0 \\) free-stream remark in the same paragraph. Two stability-relevant facts ride along here: \\( \det J > 0 \\) everywhere is
 the condition that an element is not tangled or inverted (the failure mode of moving and
 curved meshes), and the metric terms are precisely the per-node data the GPU kernels carry
 alongside the field values.

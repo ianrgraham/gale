@@ -1,5 +1,7 @@
 # Viscoelastic Flow and the High-Weissenberg Problem
 
+> 🎓 **Reviewer — chapter verdict:** This is the strongest chapter in the book and it largely earns its length — the HWNP-as-numerical-failure argument and the SPD-by-construction payoff are framed exactly right, with real intuition rather than recited theorems. The physics is sound; I found no sign errors in the core equations. But the back third sprawls: the eigensolver section reads like an implementation log, and "Coupling order" + "How gale does it" overlap heavily. Trim ~600–800 words there (marks below) and this is a model chapter. The core equations all check out (UCD signs, the steady-shear result, the Fattal–Kupferman evolution, the \\( \boldsymbol{\Omega} \\) rate); the most valuable correctness fix is *precision*, not error-correction — chiefly the "higher order makes it worse" claim, which is true only in the under-resolved regime and must say so. Voice is excellent throughout; do not sand it down.
+
 This is the chapter the book has been pointing at. Everything so far — the
 discontinuous Galerkin discretization (Part II), the dual-splitting velocity solve
 (Chapter 6), the GPU elliptic solvers (Chapter 7) — was infrastructure. Now we add the
@@ -61,6 +63,8 @@ the second moment of that vector, averaged over all the polymers in a fluid elem
 is a coarse-grained microstructure variable: it throws away the detailed configuration
 and keeps just the mean stretch and orientation.
 
+> 🎓 **Reviewer (deepen):** This "shape of the coil cloud" picture is the single best intuition in the chapter — lean on it harder. Worth one more sentence to make it geometric: \\( \mathbf{C} \\) is literally an *ellipsoid*. Its eigenvectors are the principal axes of the average coil's orientation; its eigenvalues are the mean-square stretch along each axis. At rest the ellipsoid is a unit sphere (\\( \mathbf{C}=\mathbf{I} \\)); shear it and the sphere tilts and elongates into a cigar pointing roughly downstream. Then "SPD" stops being an abstract matrix property and becomes the obvious statement *an ellipsoid cannot have a negative or zero axis length* — which is exactly the invariant the whole chapter is about protecting. That reframing pays for itself three sections later.
+
 Three facts about \\( \mathbf{C} \\) carry the entire chapter, so we state them plainly:
 
 1. **\\( \mathbf{C} \\) is symmetric.** It is an outer product averaged, \\( \langle
@@ -113,6 +117,8 @@ back to equilibrium \\( \mathbf{I} \\) over time \\( \lambda \\) (gale validates
 \mathbf{I})e^{-t/\lambda} \\)). The left-hand side is where the physics — and the subtlety
 — lives.
 
+> 🎓 **Reviewer (flag):** Sign-convention consistency between this and the log-conf equation later — worth checking once and stating once. Here you write the *direct* relaxation as \\( -\tfrac{1}{\lambda}(\mathbf{C}-\mathbf{I}) \\); later the *log* relaxation is \\( +\tfrac{1}{\lambda}(e^{-\boldsymbol{\Psi}}-\mathbf{I}) \\). These are consistent (at \\( \boldsymbol{\Psi}\succ 0 \\), i.e. stretched, \\( e^{-\boldsymbol{\Psi}}\prec\mathbf{I} \\) so the source is negative — pulls \\( \boldsymbol{\Psi} \\) back down, exactly as relaxation should), and I verified that. But the reader can't, because the two signs *look* contradictory on the page. A half-sentence at the log equation — "note the relaxation source is negative whenever \\( \boldsymbol{\Psi}\succ 0 \\), the log analogue of pulling \\( \mathbf{C} \\) back toward \\( \mathbf{I} \\)" — closes the gap and shows the convention is deliberate, not a typo.
+
 ### Why a plain time derivative will not do
 
 The symbol \\( \overset{\triangledown}{(\cdot)} \\) is the **upper-convected derivative**,
@@ -136,6 +142,8 @@ The upper-convected derivative fixes this by adding the stretching/rotation term
 Here \\( (\nabla\mathbf{u})_{ij} = \partial u_i/\partial x_j \\) — gale calls this \\(
 \mathbf{L} = \nabla\mathbf{u} \\). The combination is the unique objective rate that
 correctly transports a contravariant tensor with the deforming, rotating fluid element.
+
+> 🎓 **Reviewer (deepen):** Good — UCD sign convention and the \\( L_{ij}=\partial u_i/\partial x_j \\) index ordering are both correct (this ordering is what makes the stretching term come out as \\( \mathbf{L}\mathbf{C}+\mathbf{C}\mathbf{L}^T \\) rather than its transpose; worth noting the answer is convention-dependent so a reader cross-checking another textbook isn't tripped up). But the word "objective" is doing a lot of unexplained work — give the student the one-line test. Objectivity = *put two observers in relatively rotating frames, hand them the same physical material, and they must compute the same stress.* The plain material derivative fails this: an observer spinning in his chair sees \\( \mathbf{C} \\) rotating and would conclude the polymer is being deformed when it is doing nothing of the sort. The UCD is constructed to subtract off exactly the part of \\( \dot{\mathbf{C}} \\) that is "just the frame turning," so what's left is real deformation both observers agree on. *That* is why it's forced by physics, not chosen for elegance — which is the point the passage is reaching for.
 Writing it out, the Oldroyd-B equation gale actually integrates is
 
 \\[
@@ -191,6 +199,8 @@ is a genuine stress singularity at the inlet/outlet–wall corners that an all-D
 box cannot represent — fixed in the interior, accurate there. A directional-periodic mesh
 is the clean cure, and is noted as planned.)
 
+> 🎓 **Reviewer (cut):** The parenthetical about the corner singularity and the directional-periodic mesh is a footnote masquerading as a sentence — it interrupts a clean punchline ("recovering \\( \eta_0 \\) and not \\( \eta_s \\) is the proof"). Trim to a clause: "(gale recovers \\( \eta_0 \\) to \\( \sim 10^{-3} \\), away from a known stress singularity at the inlet-wall corners.)" Saves a few lines and the reader loses nothing they need here. This kind of validation-caveat detail belongs in Ch. 13's scorekeeping, not mid-argument.
+
 ## The High-Weissenberg-Number Problem
 
 Now the centerpiece. Everything above is classical and, on paper, benign. Yet for two
@@ -216,6 +226,8 @@ The mechanism is a collision between three facts:
   stays positive, the polynomial *interpolant* dips below — and produces locally **smaller
   eigenvalues than the true field, including negative ones**.
 
+> 🎓 **Reviewer (flag):** This is correct and it's the crux of the chapter, so state it precisely — "higher order makes it worse" is true but for a reason worth pinning down, because a skeptical reader will (rightly) object that higher order *converges faster*. Both are true: the overshoot's *amplitude* near an under-resolved jump does not vanish with order — it's the Gibbs constant, roughly fixed — but it gets squeezed into a *narrower* layer and rings at higher frequency. So at fixed (insufficient) resolution, bumping \\( p \\) buys you a sharper, more oscillatory interpolant that punches *below zero* more readily, not less. The honest framing is: high order is a liability **only when the stress layer is under-resolved**; resolve it and the overshoot disappears. The HWNP bites because at high \\( Wi \\) the layer thins faster than you can afford to resolve it — so you're perpetually in the under-resolved regime. Add that qualifier; without it the claim reads as "high order is bad," which undersells your own Chapter 3.
+
 - **\\( \mathbf{C} \\) must stay SPD or the model is undefined.** The instant an
   eigenvalue of the *discrete* \\( \mathbf{C} \\) crosses zero, \\( \mathbf{C} \\) leaves the
   SPD cone. The polymer stress \\( \boldsymbol{\tau}_p = \frac{\eta_p}{\lambda}(\mathbf{C} -
@@ -227,6 +239,8 @@ The mechanism is a collision between three facts:
 Put together: at high \\( Wi \\), a high-order discretization of a steeply-varying,
 near-singular \\( \mathbf{C} \\) overshoots, drives \\( \mathbf{C} \\) out of the SPD cone,
 and the model's own feedback turns that small numerical excursion into a blow-up.
+
+> 🎓 **Reviewer (deepen):** This is the most important paragraph in the book — make the "numerical, not physical" claim airtight by naming *why* the continuum is safe and the discretization isn't. In the continuous equations \\( \mathbf{C} \\) is governed by a transport equation whose evolution operator maps the SPD cone into itself: the stretching term \\( \mathbf{L}\mathbf{C}+\mathbf{C}\mathbf{L}^T \\) is a congruence-like action that preserves positive-definiteness, and relaxation only pulls toward \\( \mathbf{I} \\), which is interior to the cone. So an SPD initial condition stays SPD — *exactly*, for all time. The discretization breaks this for a mundane reason: a degree-\\( p \\) polynomial interpolant is a *projection*, and projection onto a polynomial space is **not** a cone-preserving operation — nothing in the \\( L^2 \\) projection knows the target must have positive eigenvalues. That's the whole disease in one sentence: *the continuous flow respects the cone; the projection step does not.* Log-conformation works because it moves the projection to a space (\\( \boldsymbol{\Psi} \\), unconstrained symmetric matrices) where there is no cone to fall out of, and reconstructs \\( \mathbf{C}=\exp\boldsymbol{\Psi} \\) through a map that lands back in the cone by definition. Spell that out and the cure stops looking like a trick and starts looking inevitable.
 
 The single most important thing to understand about the HWNP is this: **it is a numerical
 failure, not a physical one.** The true conformation tensor stays SPD for all time — that
@@ -304,6 +318,8 @@ velocity gradient into that eigenframe, \\( \mathbf{M} = \mathbf{R}^{T}\mathbf{L
   with \\( \lambda_i = e^{\mu_i} \\) the eigenvalues of \\( \mathbf{C} \\); in 3D it is a full
   antisymmetric tensor with three such rates.
 
+> 🎓 **Reviewer (flag):** I checked this against Fattal–Kupferman and the formula is **correct** as written (their 2D rate is \\( (\lambda_2 M_{12}+\lambda_1 M_{21})/(\lambda_2-\lambda_1) \\) — same thing). Two precision points so a careful reader trusts it. (1) State that \\( \mathbf{M}=\mathbf{R}^T\mathbf{L}\mathbf{R} \\) is *not* symmetric — that's the whole point; you split it into its symmetric diagonal-in-eigenframe part (\\( \mathbf{B} \\), pure stretch) and the rest (which drives \\( \omega \\)). If a reader assumes \\( \mathbf{M} \\) symmetric, \\( M_{12}=M_{21} \\) and the formula looks like it could be simplified — it can't, and the asymmetry is physical (it's the local vorticity entering). (2) The weighting by the *\\( \mathbf{C} \\)-eigenvalues* \\( \lambda_i=e^{\mu_i} \\) (not the \\( \boldsymbol{\Psi} \\)-eigenvalues \\( \mu_i \\)) is the subtle bit and is easy to typo in a kernel — worth one clause noting it, since it's also where the isotropic-point singularity \\( \lambda_2\to\lambda_1 \\) comes from. My verdict line overstated this as "structurally off"; it is not — read it as "needs these two guard-clauses to be unimpeachable."
+
 - The relaxation becomes \\( \frac{1}{\lambda}(e^{-\boldsymbol{\Psi}} - \mathbf{I}) \\) — the
   matrix exponential of \\( -\boldsymbol{\Psi} \\), again applied in the eigenframe.
 
@@ -345,6 +361,8 @@ A per-node eigendecomposition of a symmetric matrix, at every node, every timest
 the computational heart of the log-conformation method. gale implements it differently in
 2D and 3D, and the differences are instructive about the constraints of writing device
 kernels.
+
+> 🎓 **Reviewer (cut):** This whole section is where the chapter loses momentum — it's the longest stretch of pure implementation detail in the book, and it arrives right after the conceptual climax, so the reader deflates. The *ideas* worth keeping are two, and they're each one paragraph: (a) 2D has a closed form, 3D does not, so 3D needs an iterative eigensolver run per-node on the GPU — and that this is the price of guaranteed positivity; (b) the choice of **fixed-sweep cyclic Jacobi** is deliberate because it's branch-light (warp-friendly) and robust at degenerate eigenvalues (the isotropic point). Everything else — the `atan2` workaround, `theta.signum()`, the flat-scalar `a00…a22` transcription, the libdevice `exp` precision floor — is Chapter 12 material (the GPU-vs-oracle story). Cut it here to a single sentence ("a handful of cuda-oxide intrinsic gaps force equivalent-but-different device formulas; Chapter 12 tells that story") and you reclaim ~250 words without losing a single idea a newcomer needs. The blog-post test: a reader should leave this section knowing *why an eigensolve, why Jacobi, why on-device* — not which scalar locals the kernel uses.
 
 ### 2D: a closed-form \\( 2\times2 \\) eigensolver
 
@@ -411,6 +429,8 @@ framework (Chapter 12), and it owns the coupling explicitly precisely because th
 order does not fit the generic `updaters → integrator → writers` schedule — a faithful
 mapping of the validated operator rather than a forced fit.
 
+> 🎓 **Reviewer (cut):** The `ViscoelasticDualSplitting` description here and the bullet for it in "How gale does it" say nearly the same thing twice (old stress → velocity → new conformation; wraps `ViscoelasticFlow::step`). Pick one home — I'd keep the *reasoning* here (why segregated, why explicit SSP-RK3 is fine at low Re) and let the closing section just name the symbol. Right now the reader gets the coupling story three times: the numbered steps, this paragraph, and the closing bullet. Collapse to once-with-reasoning + once-as-reference.
+
 This first-order segregated splitting is the right place to start, and it is what gale has
 built and validated. A more strongly-coupled or higher-order scheme (Picard/Newton
 iteration on the flow↔stress coupling) is the documented escalation path *if* the coupling
@@ -422,6 +442,8 @@ Oldroyd-B has one glaring unphysical feature: its dumbbells are **infinitely
 extensible** (Hookean springs with no limit). Real polymers have finite contour length —
 they cannot stretch forever. This is why Oldroyd-B's \\( C_{xx} = 1 + 2\,Wi^2 \\) grows
 without bound and why purely-extensional flows can drive its stress to infinity.
+
+> 🎓 **Reviewer:** This section is well-judged and earns its place — the "same log-conf machinery carries over, only the relaxation term changes" point is exactly the right note to end the chapter's argument on, and it's correct (FENE-P's Peterlin factor \\( f(\mathrm{tr}\,\mathbf{C}) = 1/(1-\mathrm{tr}\,\mathbf{C}/L^2) \\) modifies only the algebraic relaxation, leaving the objective-rate/eigensolver structure untouched). One precision tweak: in a *steady* extensional flow Oldroyd-B doesn't merely grow large, it has **no steady state at all** above a critical extension rate (\\( \lambda\dot\varepsilon = 1/2 \\)) — the coil-stretch resonance where stretching outruns relaxation outright. That's the sharpest statement of "infinitely extensible is unphysical," and it's the precise failure FENE-P's finite \\( L^2 \\) exists to cure. Worth the half-sentence; it makes the motivation bite.
 
 The natural next constitutive model is **FENE-P** (Finitely-Extensible Nonlinear
 Elastic, Peterlin closure). It replaces the Hookean spring with one that stiffens as the

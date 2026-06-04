@@ -1,5 +1,7 @@
 # The Physics: Flow, Viscoelasticity, and Suspensions
 
+> 🎓 **Reviewer — chapter verdict:** This is the strongest of the three files — the pressure-as-Lagrange-multiplier section and the solid-vs-fluid "litmus test" are genuinely vivid and correct, and the chapter mostly resists the textbook urge to derive everything. Biggest improvement: the Wi/De treatment is the one place the physics goes slightly soft and list-like; tighten the distinction so the reader leaves knowing *why we need two numbers*, not just that two exist.
+
 Before we discretize anything, we have to be clear about *what* we are discretizing.
 This chapter sets up the equations gale solves and — more importantly — the physical
 *regime* it lives in. That regime is the lens for every method choice in the rest of the
@@ -30,6 +32,8 @@ momentum equals the forces acting. The forces are the *surface stresses* the sur
 fluid exerts (gathered into a stress tensor \\( \boldsymbol{\sigma} \\)) plus any body
 force \\( \mathbf{f} \\) (gravity, an immersed-boundary penalty force, a polymer-stress
 divergence):
+
+> 🎓 **Reviewer (flag):** Small but real bookkeeping slip: you list "a polymer-stress divergence" as an example of the body force \\( \mathbf{f} \\) here, but later (correctly) the polymer enters as \\( \nabla\cdot\boldsymbol{\tau}_p \\) written as its *own* term in the viscoelastic momentum equation, distinct from \\( \mathbf{f} \\). Both framings are defensible (polymer stress can live in \\( \boldsymbol{\sigma} \\) or be moved to the RHS as a force), but pick one story. As written, a careful reader sees \\( \nabla\cdot\boldsymbol{\tau}_p \\) counted once inside \\( \mathbf{f} \\) and once beside it. Easiest fix: drop "a polymer-stress divergence" from this list and let it debut properly in the viscoelastic section.
 
 \\[
 \rho\left(\frac{\partial \mathbf{u}}{\partial t} + (\mathbf{u}\cdot\nabla)\mathbf{u}\right)
@@ -103,6 +107,8 @@ instantaneously adjusts itself to exactly whatever field is needed to project th
 momentum forward into the space of divergence-free velocities — no more, no less. It
 carries no dynamics; it is the bookkeeper that keeps the constraint satisfied.
 
+> 🎓 **Reviewer:** This is the highlight of the chapter. "Pressure is the Lagrange multiplier that enforces incompressibility... it carries no dynamics; it is the bookkeeper that keeps the constraint satisfied" is exactly the intuition a good advisor gives at the whiteboard, and the pendulum analogy lands. Do not touch a word of it. If anything, this is the model for how the softer spots in the chapter (Wi vs De) should read.
+
 This is *why* solving incompressible flow is hard and why so much of the machinery in
 Part III exists. We cannot just march pressure forward in time. We have to solve, every
 step, an elliptic equation (a Poisson problem) for the pressure that makes the velocity
@@ -160,6 +166,10 @@ numbers are closely related — \\( Wi \\) leans on a *rate*, \\( De \\) on a *t
 in steady shear they often coincide; the name to remember is that *both* measure how
 strongly the fluid's memory matters.
 
+> 🎓 **Reviewer (deepen):** This is the one place the physics goes soft, and it's a place practitioners actually argue about, so it's worth getting right rather than waving at "both measure memory." The cleaner distinction: **Wi measures how much the flow stretches/deforms the microstructure** (it's built from a deformation *rate* — strong flow vs. relaxation), while **De measures how unsteady the flow is on the polymer's clock** (relaxation time vs. the time over which a fluid element's *environment changes* — passing an obstacle, traversing a contraction, one oscillation period). The reason you need *both* is the case that breaks the "they coincide" intuition: **steady simple shear has \\( Wi \\) arbitrarily large but \\( De = 0 \\)** — each fluid element sees an unchanging shear rate forever, so nothing is transient even though the polymers are hugely stretched. Conversely small-amplitude oscillation can give large \\( De \\) at tiny \\( Wi \\). They collapse to the same thing only when the single timescale setting the deformation rate is *also* the timescale over which an element's environment changes (e.g. flow through a periodic array of posts at one speed). That's the whiteboard version, and it's worth it because gale's target instabilities are precisely where the flow is both strongly stretched (high Wi) *and* unsteady along a pathline (high De) — the two numbers stop being redundant exactly in the regime you care about.
+
+> 🎓 **Reviewer (flag):** "In steady shear they often coincide" is backwards from the textbook case and risks teaching the wrong reflex. Steady shear is the canonical case where they *diverge* (De → 0, Wi → large), not coincide. I'd cut that clause and replace it with the steady-shear counterexample above; as written it's the kind of half-true smoothing that a reviewer in this field will circle.
+
 ### Why this particular corner is where the interesting physics live
 
 Here is the crucial combination. Microfluidics gives us **low \\( Re \\)** (inertia is
@@ -169,7 +179,9 @@ laminar-looking flow that is nonetheless violently elastic.
 
 That regime — low \\( Re \\), high \\( Wi \\) — is exactly where the famous *purely elastic
 instabilities* and *elastic turbulence* appear: chaotic, mixing flows driven entirely by
-polymer stress, with no inertia in sight. It is genuinely useful (mixing at small scales
+polymer stress, with no inertia in sight.
+
+> 🎓 **Reviewer:** Great instinct to name elastic turbulence and "mixing at small scales is otherwise very hard" — that's the *motivation* payoff that makes a newcomer care, and it's correct. One optional sharpening: the mechanism worth a half-sentence is that curved streamlines + tensile "hoop" stress along them is the engine (the Pakdel–McKinley criterion), which is why these instabilities love microfluidic geometries with bends and posts. Not required, but it turns "spectacular, counterintuitive things" into a concrete picture, and it connects directly to why the suspension/obstacle geometry later in the chapter is where the action is. It is genuinely useful (mixing at small scales
 is otherwise very hard) and genuinely hard to simulate. The numerical difficulty even
 has a name, the **High-Weissenberg-Number Problem**, and defeating it is one of the
 recurring stability stories of this book (Chapter 8). gale aims squarely at this corner;
@@ -215,6 +227,8 @@ develop this fully in Chapter 8 — including *why* \\( \mathbf{C} \\) must stay
 symmetric-positive-definite, why the obvious discretization fails to keep it so at high
 \\( Wi \\), and the log-conformation cure. For now, the high-level idea is enough: **a
 fluid with memory, whose memory is carried by an extra evolving tensor field.**
+
+> 🎓 **Reviewer (deepen):** The "tiny springs" picture is good, but you can foreshadow the High-Weissenberg-Number Problem here in one sentence and make Ch. 8 land harder, because the seed of the whole numerical disaster is already visible in this paragraph. The springs are *entropic and nonlinear-in-stretch*: at high \\( Wi \\) the conformation eigenvalues (stretch-squared) blow up exponentially fast, and \\( \mathbf{C} \\) must stay symmetric-positive-definite to even *mean* anything (you can't have negative stretch-squared). A naive scheme advecting \\( \mathbf{C} \\) directly will, under a steep stress gradient, produce a negative eigenvalue — at which point the model is physically meaningless and the run dies. That one-line preview ("and keeping those exponentially growing eigenvalues positive is the entire fight of Chapter 8") converts an abstract forward-reference into a concrete hook. Worth adding; right now "the obvious discretization fails" is asserted but the *why* — loss of positive-definiteness under exponential stretch — is exactly the intuition a student needs and it's cheap to give here.
 
 ## Particle-laden suspensions: objects inside the fluid
 
@@ -279,6 +293,8 @@ method, and you should not track a flowing material as if it had a reference
 configuration. (Real soft matter — a capsule, which is an elastic *membrane* enclosing a
 distinct *interior fluid* — straddles both families, which is exactly what makes the full
 suspension problem hard.)
+
+> 🎓 **Reviewer:** This whole "litmus test: does it elastically return to a reference shape?" framing is excellent — it's the single cleanest way I've seen to draw the solid-vs-two-phase line for a newcomer, and the Lagrangian/Eulerian pairing is correct. The capsule parenthetical (membrane + interior fluid straddling both) is the perfect honest complication to end on. Keep all of it. The only thing I'd watch: this is so good it slightly out-shines the actual IBM the code uses; make sure a reader doesn't come away thinking gale does capsules. The "where gale stands today" paragraph handles that — good.
 
 **Where gale stands today, honestly.** gale targets the **immersed-solid (IBM) path**:
 rigid bodies via volume penalization, validated in 2D and 3D, including the capstone of a
