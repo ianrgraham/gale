@@ -12,7 +12,7 @@
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice};
 use cuda_host::cuda_module;
-use gale::dg::{Mesh2d, VolumePenalization};
+use gale::dg::{Mesh2d, Mesh3d, VolumePenalization, VolumePenalization3d};
 
 #[cuda_module]
 mod kernels {
@@ -112,5 +112,115 @@ impl gale::sim::StateStageHook for GpuPenalizationHook {
         let (ux, uy) = comps.split_at_mut(1);
         penalize_apply(&mesh, &mut ux[0], &mut uy[0], &self.penal, self.dt)
             .expect("gale-gpu: GpuPenalizationHook penalize_apply failed");
+    }
+}
+
+// ===== 3D volume penalization ====================================================
+
+#[cuda_module]
+mod kernels3d {
+    use super::*;
+
+    /// In-place implicit penalization of all three velocity components. One thread
+    /// per dof (`grid = ne`, `block = nn`).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn penalize3d(
+        mut ux: DisjointSlice<f64>,
+        mut uy: DisjointSlice<f64>,
+        mut uz: DisjointSlice<f64>,
+        mask: &[f64],
+        usx: &[f64],
+        usy: &[f64],
+        usz: &[f64],
+        r: f64,
+        nn: u32,
+    ) {
+        let e = thread::blockIdx_x() as usize;
+        let m = thread::threadIdx_x() as usize;
+        let g = e * (nn as usize) + m;
+        let beta = r * mask[g];
+        let denom = 1.0 + beta;
+        let (bx, by, bz) = (beta * usx[g], beta * usy[g], beta * usz[g]);
+        if let Some(o) = ux.get_mut(thread::index_1d()) {
+            *o = (*o + bx) / denom;
+        }
+        if let Some(o) = uy.get_mut(thread::index_1d()) {
+            *o = (*o + by) / denom;
+        }
+        if let Some(o) = uz.get_mut(thread::index_1d()) {
+            *o = (*o + bz) / denom;
+        }
+    }
+}
+
+/// Apply implicit 3D volume penalization to `(ux, uy, uz)` in place on the GPU, using
+/// a precomputed [`VolumePenalization3d`]. Bit-for-bit equal to
+/// `VolumePenalization3d::apply`. The 3D analogue of [`penalize_apply`].
+#[allow(clippy::too_many_arguments)]
+pub fn penalize3d_apply(
+    mesh: &Mesh3d,
+    ux: &mut [f64],
+    uy: &mut [f64],
+    uz: &mut [f64],
+    pen: &VolumePenalization3d,
+    dt: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let nn = mesh.refh.n_nodes();
+    let ne = mesh.n_elements();
+    let ndof = ne * nn;
+    assert_eq!(ux.len(), ndof, "ux length must be n_elements·n_nodes");
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let mut ux_dev = up(ux)?;
+    let mut uy_dev = up(uy)?;
+    let mut uz_dev = up(uz)?;
+    let mask_dev = up(&pen.mask)?;
+    let usx_dev = up(&pen.us_x)?;
+    let usy_dev = up(&pen.us_y)?;
+    let usz_dev = up(&pen.us_z)?;
+
+    let module = kernels3d::load(&ctx)?;
+    let cfg = LaunchConfig {
+        grid_dim: (ne as u32, 1, 1),
+        block_dim: (nn as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    module.penalize3d(
+        &stream, cfg, &mut ux_dev, &mut uy_dev, &mut uz_dev, &mask_dev, &usx_dev, &usy_dev,
+        &usz_dev, dt / pen.eta_b, nn as u32,
+    )?;
+    ux.copy_from_slice(&ux_dev.to_host_vec(&stream)?);
+    uy.copy_from_slice(&uy_dev.to_host_vec(&stream)?);
+    uz.copy_from_slice(&uz_dev.to_host_vec(&stream)?);
+    Ok(())
+}
+
+/// 3D volume-penalization **stage hook** (`gale::sim::StateStageHook<Mesh3d>`): the 3D
+/// analogue of [`GpuPenalizationHook`], damping the 3-component velocity toward the
+/// solid on the GPU after each integrator stage. Wire with `Simulation::set_stage_hook`
+/// alongside [`crate::GpuDualSplitting3d`] for GPU flow past an immersed body.
+pub struct GpuPenalization3dHook {
+    velocity: gale::sim::FieldId,
+    penal: VolumePenalization3d,
+    dt: f64,
+}
+
+impl GpuPenalization3dHook {
+    pub fn new(velocity: gale::sim::FieldId, penal: VolumePenalization3d, dt: f64) -> Self {
+        Self { velocity, penal, dt }
+    }
+}
+
+impl gale::sim::StateStageHook<Mesh3d> for GpuPenalization3dHook {
+    fn after_stage(&self, state: &mut gale::sim::State<Mesh3d>, _stage: usize) {
+        let mesh = state.mesh.clone();
+        let comps = state.fields.by_id_mut(self.velocity).components_mut();
+        let (ux, rest) = comps.split_at_mut(1);
+        let (uy, uz) = rest.split_at_mut(1);
+        penalize3d_apply(&mesh, &mut ux[0], &mut uy[0], &mut uz[0], &self.penal, self.dt)
+            .expect("gale-gpu: GpuPenalization3dHook penalize3d_apply failed");
     }
 }

@@ -34,7 +34,9 @@ pub mod operators;
 pub use distributed::{multigpu_advection_2d, multigpu_advection_3d};
 pub use flow::{GpuDualSplitting, GpuStokes, GpuStokesIntegrator, GpuViscoelasticDualSplitting};
 pub use flow3d::{GpuDualSplitting3d, GpuStokes3d};
-pub use immersed::{penalize_apply, GpuPenalizationHook};
+pub use immersed::{
+    penalize3d_apply, penalize_apply, GpuPenalization3dHook, GpuPenalizationHook,
+};
 pub use operators::advection::{advection_rhs, GpuAdvection};
 pub use operators::advection3d::advection3d_rhs;
 pub use operators::burgers::burgers_rhs;

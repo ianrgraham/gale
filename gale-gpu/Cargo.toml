@@ -139,6 +139,11 @@ path = "src/bin/poisson3d_check.rs"
 name = "ns3d-check"
 path = "src/bin/ns3d_check.rs"
 
+# Validates 3D IBM in GPU flow (GpuDualSplitting3d + GpuPenalization3dHook, sphere).
+[[bin]]
+name = "flow3d-ibm-check"
+path = "src/bin/flow3d_ibm_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"
