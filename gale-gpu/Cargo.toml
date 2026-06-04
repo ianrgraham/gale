@@ -124,6 +124,11 @@ path = "src/bin/ve_check.rs"
 name = "flow-ibm-check"
 path = "src/bin/flow_ibm_check.rs"
 
+# Capstone: immersed particle in GPU viscoelastic flow (VE integrator + IBM hook).
+[[bin]]
+name = "ve-ibm-check"
+path = "src/bin/ve_ibm_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"
