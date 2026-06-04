@@ -114,6 +114,11 @@ path = "src/bin/sim_stokes_check.rs"
 name = "ns-check"
 path = "src/bin/ns_check.rs"
 
+# Validates the coupled GPU viscoelastic flow (GpuViscoelasticDualSplitting).
+[[bin]]
+name = "ve-check"
+path = "src/bin/ve_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"
