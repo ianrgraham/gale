@@ -134,6 +134,11 @@ path = "src/bin/ve_ibm_check.rs"
 name = "poisson3d-check"
 path = "src/bin/poisson3d_check.rs"
 
+# Validates the GPU 3D Navier–Stokes path (GpuStokes3d + GpuDualSplitting3d).
+[[bin]]
+name = "ns3d-check"
+path = "src/bin/ns3d_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"
