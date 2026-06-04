@@ -129,6 +129,11 @@ path = "src/bin/flow_ibm_check.rs"
 name = "ve-ibm-check"
 path = "src/bin/ve_ibm_check.rs"
 
+# Validates the 3D GPU SIPG elliptic foundation (operator + helmholtz + pressure).
+[[bin]]
+name = "poisson3d-check"
+path = "src/bin/poisson3d_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"

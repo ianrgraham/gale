@@ -11,3 +11,4 @@ pub mod euler;
 pub mod logconf;
 pub mod oldroyd;
 pub mod poisson;
+pub mod poisson3d;
