@@ -99,6 +99,11 @@ path = "src/bin/helmholtz_check.rs"
 name = "pressure-check"
 path = "src/bin/pressure_check.rs"
 
+# Validates gale_gpu::GpuStokes (flow) unsteady-Stokes solver vs CPU + analytic.
+[[bin]]
+name = "stokes-check"
+path = "src/bin/stokes_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"
