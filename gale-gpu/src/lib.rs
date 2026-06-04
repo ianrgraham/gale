@@ -37,4 +37,6 @@ pub use operators::burgers::burgers_rhs;
 pub use operators::euler::euler_rhs;
 pub use operators::logconf::logconf_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
-pub use operators::poisson::{poisson_apply, poisson_cg_solve, poisson_pcg_solve};
+pub use operators::poisson::{
+    helmholtz_cg_solve, poisson_apply, poisson_cg_solve, poisson_pcg_solve,
+};

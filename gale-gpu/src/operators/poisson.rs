@@ -74,7 +74,7 @@ mod kernels {
     pub fn operator(
         d: &[f64], u: &[f64], gx: &[f64], gy: &[f64], rx: &[f64], ry: &[f64], sx: &[f64],
         sy: &[f64], jw: &[f64], n1: u32, face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
-        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], mut out: DisjointSlice<f64>,
+        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<f64>,
     ) {
         static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         static mut PR: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
@@ -149,7 +149,9 @@ mod kernels {
         }
         let rfm = unsafe { RF[m] };
         if let Some(o) = out.get_mut(thread::index_1d()) {
-            *o = acc + rfm;
+            // SIPG stiffness `A·u` plus the Helmholtz reaction `λ·M·u` (diagonal GLL
+            // mass `M = diag(jw)`). `λ = 0` ⇒ pure Poisson, bit-identical to before.
+            *o = acc + rfm + lambda * jw[b] * u[b];
         }
     }
 
@@ -447,7 +449,7 @@ pub fn poisson_apply(
     module.operator(
         &stream, cfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev,
         &jw_dev, ma.n1, &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev,
-        &mut out_dev,
+        0.0, &mut out_dev,
     )?;
     Ok(out_dev.to_host_vec(&stream)?)
 }
@@ -462,6 +464,35 @@ pub fn poisson_cg_solve(
     mesh: &Mesh2d,
     b: &[f64],
     alpha: f64,
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg_solve_impl(mesh, b, alpha, 0.0, tol, maxit)
+}
+
+/// Solve the SIPG **Helmholtz** system `(λM + A)·u = b` by conjugate gradient on the
+/// GPU, returning the solution and iteration count. Identical to [`poisson_cg_solve`]
+/// but the operator carries the diagonal-mass reaction term `λM` (`reaction = λ`),
+/// matching `gale::dg::Poisson::with_reaction(mesh, alpha, λ).cg(b, …)`. This is the
+/// viscous-velocity solve of the dual-splitting Stokes/NS scheme.
+pub fn helmholtz_cg_solve(
+    mesh: &Mesh2d,
+    b: &[f64],
+    alpha: f64,
+    reaction: f64,
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg_solve_impl(mesh, b, alpha, reaction, tol, maxit)
+}
+
+/// Unpreconditioned CG for `(reaction·M + A)·x = b` on the GPU. `reaction = 0` is the
+/// pure SIPG Poisson; `reaction = λ > 0` is the viscous Helmholtz operator.
+fn cg_solve_impl(
+    mesh: &Mesh2d,
+    b: &[f64],
+    alpha: f64,
+    reaction: f64,
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
@@ -518,7 +549,7 @@ pub fn poisson_cg_solve(
             module.gradient(&stream, cfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
             module.operator(
                 &stream, cfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
-                &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, $dst,
+                &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, reaction, $dst,
             )?;
         }};
     }
@@ -658,7 +689,7 @@ pub fn poisson_pcg_solve(
             module.gradient(&stream, cfg[l], &dl[l], $src, &rxl[l], &ryl[l], &sxl[l], &syl[l], n1v[l], &mut gxb[l], &mut gyb[l])?;
             module.operator(
                 &stream, cfg[l], &dl[l], $src, &gxb[l], &gyb[l], &rxl[l], &ryl[l], &sxl[l], &syl[l], &jwl[l], n1v[l],
-                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], $dst,
+                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], 0.0, $dst,
             )?;
         }};
     }

@@ -89,6 +89,11 @@ path = "src/bin/poisson_cg_check.rs"
 name = "poisson-pcg-check"
 path = "src/bin/poisson_pcg_check.rs"
 
+# Validates gale_gpu::helmholtz_cg_solve (operators::poisson viscous Helmholtz CG).
+[[bin]]
+name = "helmholtz-check"
+path = "src/bin/helmholtz_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"
