@@ -32,3 +32,99 @@ path = "src/bin/advection_check.rs"
 [[bin]]
 name = "sim-gpu-check"
 path = "src/bin/sim_gpu_check.rs"
+
+# --- Migrated GPU operator / probe binaries -------------------------------------
+# These were one-off binaries under gale/src/bin. They live here now so gale stays
+# a pure-host crate (all `#[cuda_module]` device code is in gale-gpu). Each remains
+# a standalone harness validating a GPU kernel against gale's CPU oracle; promoting
+# them to reusable library components (like gale_gpu::advection) is incremental.
+
+# The original vecadd scaffold (cuda-oxide smoke test).
+[[bin]]
+name = "vecadd"
+path = "src/bin/vecadd.rs"
+
+# Milestone-1 sm_70 (Volta) probe: device inventory, FP64 arithmetic + libdevice
+# sqrt, FP64 shared-memory cooperation, and multi-GPU peer-to-peer.
+[[bin]]
+name = "probe-sm70"
+path = "src/bin/probe_sm70.rs"
+
+# Isolated FP64 transcendental probe (exp / ln / powf) — log-conformation math.
+[[bin]]
+name = "probe-fp64-math"
+path = "src/bin/probe_fp64_math.rs"
+
+# Reproducer / regression gate for cuda-oxide issue #58 (nested-array writes).
+[[bin]]
+name = "probe-nested-write"
+path = "src/bin/probe_nested_write.rs"
+
+[[bin]]
+name = "exper-kernel"
+path = "src/bin/exper_kernel.rs"
+
+# GPU port step 7a: matrix-free DG volume-stiffness kernel.
+[[bin]]
+name = "gpu-poisson-volume"
+path = "src/bin/gpu_poisson_volume.rs"
+
+# GPU port step 7b: SIPG face/flux terms.
+[[bin]]
+name = "gpu-poisson-faces"
+path = "src/bin/gpu_poisson_faces.rs"
+
+# GPU port step 7c: full SIPG operator (volume + faces, 2-kernel pipeline).
+[[bin]]
+name = "gpu-poisson-operator"
+path = "src/bin/gpu_poisson_operator.rs"
+
+# GPU port step 7d: conjugate gradient entirely on the GPU.
+[[bin]]
+name = "gpu-poisson-cg"
+path = "src/bin/gpu_poisson_cg.rs"
+
+# GPU port step 7f: p-multigrid V-cycle preconditioner + PCG, fully on-device.
+[[bin]]
+name = "gpu-poisson-pcg"
+path = "src/bin/gpu_poisson_pcg.rs"
+
+# GPU port: 3D hyperbolic operator on hexes (weak form, linear advection).
+[[bin]]
+name = "gpu-advection3d"
+path = "src/bin/gpu_advection3d.rs"
+
+# GPU port: Oldroyd-B conformation transport rhs (direct form, element-local).
+[[bin]]
+name = "gpu-oldroyd"
+path = "src/bin/gpu_oldroyd.rs"
+
+# GPU port: split-form (entropy-stable) Burgers operator.
+[[bin]]
+name = "gpu-burgers-split"
+path = "src/bin/gpu_burgers_split.rs"
+
+# GPU port: volume-penalization apply (immersed rigid bodies).
+[[bin]]
+name = "gpu-penalize"
+path = "src/bin/gpu_penalize.rs"
+
+# GPU port: compressible Euler weak-form operator (libdevice sqrt).
+[[bin]]
+name = "gpu-euler"
+path = "src/bin/gpu_euler.rs"
+
+# GPU port: log-conformation viscoelastic transport (eig + matrix exp).
+[[bin]]
+name = "gpu-logconf"
+path = "src/bin/gpu_logconf.rs"
+
+# Live multi-GPU advection across 2 devices with P2P halo exchange.
+[[bin]]
+name = "gpu-multigpu"
+path = "src/bin/gpu_multigpu.rs"
+
+# Live multi-GPU 3D hex advection across 2 devices with P2P halo exchange.
+[[bin]]
+name = "gpu-multigpu3d"
+path = "src/bin/gpu_multigpu3d.rs"

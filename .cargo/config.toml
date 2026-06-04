@@ -12,3 +12,11 @@
 # upstream and gale points back at NVlabs/cuda-oxide.
 [env]
 CUDA_OXIDE_BACKEND = "/home/ian/src/cuda-oxide-101/crates/rustc-codegen-cuda/target/debug/librustc_codegen_cuda.so"
+
+# Keep cuda-oxide's build-time codegen artifacts (.ll, .ptx, .oxide-artifacts/)
+# out of the project root — redirect them under target/ (gitignored). Runtime
+# kernel loading uses the embedded .oxart bundles, not these files, so the redirect
+# is purely cosmetic/hygiene. The dir is created on demand by the fork's pipeline.
+# (Caveat: a few file-based-loader probe bins may still write a runtime .cubin to
+# the manifest dir; the embedded-module operators do not.)
+CUDA_OXIDE_PTX_DIR = "/home/ian/src/gale/target/cuda-artifacts"
