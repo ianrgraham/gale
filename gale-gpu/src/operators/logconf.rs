@@ -1,13 +1,14 @@
-//! GPU port of the **log-conformation** (Fattal–Kupferman) viscoelastic transport —
-//! the high-Wi-robust constitutive update, and the last libdevice-blocked operator.
-//! Per node it eigendecomposes Ψ (`sqrt`/`atan2`/`sin`/`cos`) and forms the matrix
-//! `exp` (`exp`) — a full battery of libdevice math, only possible after the §1
-//! typed-pointer bitcast fix. Element-local (nodal-collocation advection). Validated
-//! against the CPU oracle `LogConfOldroydB::psi_rhs`.
+//! GPU log-conformation (Fattal–Kupferman) viscoelastic transport operator —
+//! reusable library component.
+//!
+//! Carries the `#[cuda_module]` device kernel plus a host launch wrapper
+//! ([`logconf_psi_rhs`]) for the high-Wi-robust constitutive update. Per node it
+//! eigendecomposes Ψ (`sqrt`) and forms the matrix `exp` (`exp`) — a full battery
+//! of libdevice math, the last libdevice-blocked operator. Element-local
+//! (nodal-collocation advection). Validated bit-for-bit against the CPU oracle
+//! `gale::dg::LogConfOldroydB::psi_rhs`.
 //!
 //!   ∂ₜΨ = −(u·∇)Ψ + (ΩΨ − ΨΩ) + 2B + (1/λ)(e^{−Ψ} − I).
-//!
-//! Run: cargo oxide run --bin gpu-logconf
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
@@ -173,33 +174,37 @@ mod kernels {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let p = 4;
-    let lambda = 0.7;
-    println!("=== GPU log-conformation Ψ rhs vs CPU (p={p}) ===\n");
-
-    let mesh = Mesh2d::rectangular(p, 4, 4, [0.0, 1.0], [0.0, 1.0]);
+/// Compute the log-conformation (Fattal–Kupferman) Ψ time-derivative `∂ₜΨ` on the
+/// GPU for an Oldroyd-B fluid, returning the three independent components
+/// `[∂ₜΨxx, ∂ₜΨxy, ∂ₜΨyy]` in the same `[Vec<f64>; 3]` layout as the CPU oracle.
+/// Reusable host wrapper around the [`kernels::psi_rhs`] device kernel: flattens
+/// the mesh metrics, uploads the velocity + Ψ state, launches one block per
+/// element (one thread per node), and gathers the result. Bit-for-bit equal to
+/// `gale::dg::LogConfOldroydB::psi_rhs`.
+///
+/// `lc` carries the relaxation time λ; only its reciprocal `1/λ` is needed by the
+/// kernel. `psi`, `ux`, and `uy` must each be `n_elements·n_nodes` long.
+pub fn logconf_psi_rhs(
+    mesh: &Mesh2d,
+    lc: &LogConfOldroydB,
+    psi: &[Vec<f64>; 3],
+    ux: &[f64],
+    uy: &[f64],
+) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
-    let lc = LogConfOldroydB::new(&mesh, lambda, 1.0);
-
-    // Smooth velocity + a moderately anisotropic Ψ field (SPD C = exp Ψ).
-    let (mut uxv, mut uyv) = (vec![0.0; ndof], vec![0.0; ndof]);
-    let mut psi = [vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]];
-    for (e, el) in mesh.elements.iter().enumerate() {
-        for k in 0..nn {
-            let (x, y) = (el.geom.x[k], el.geom.y[k]);
-            uxv[e * nn + k] = (2.0 * x).sin() * y + 0.3 * x;
-            uyv[e * nn + k] = -0.4 * (3.0 * y).cos() * x;
-            psi[0][e * nn + k] = 0.5 + 0.3 * (x + y).sin();
-            psi[1][e * nn + k] = 0.2 * x - 0.1 * y;
-            psi[2][e * nn + k] = -0.3 + 0.2 * (x * y).cos();
-        }
+    let n1 = mesh.order + 1;
+    assert_eq!(ux.len(), ndof, "velocity length must be n_elements·n_nodes");
+    assert_eq!(uy.len(), ndof, "velocity length must be n_elements·n_nodes");
+    for c in psi {
+        assert_eq!(c.len(), ndof, "Ψ component length must be n_elements·n_nodes");
     }
-    let cpu = lc.psi_rhs(&psi, &uxv, &uyv);
+    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
 
-    let (mut rx, mut ry, mut sx, mut sy) = (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
+    // Flatten per-node metrics.
+    let (mut rx, mut ry, mut sx, mut sy) =
+        (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
     for (e, el) in mesh.elements.iter().enumerate() {
         for k in 0..nn {
             rx[e * nn + k] = el.geom.rx[k];
@@ -213,8 +218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
     let d_dev = up(&mesh.refq.line.diff)?;
-    let ux_d = up(&uxv)?;
-    let uy_d = up(&uyv)?;
+    let ux_d = up(ux)?;
+    let uy_d = up(uy)?;
     let pxx_d = up(&psi[0])?;
     let pxy_d = up(&psi[1])?;
     let pyy_d = up(&psi[2])?;
@@ -230,25 +235,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
     module.psi_rhs(
         &stream, cfg, &d_dev, &ux_d, &uy_d, &pxx_d, &pxy_d, &pyy_d,
-        &rx_d, &ry_d, &sx_d, &sy_d, lambda.recip(), (p + 1) as u32,
+        &rx_d, &ry_d, &sx_d, &sy_d, lc.lambda.recip(), n1 as u32,
         &mut dxx, &mut dxy, &mut dyy,
     )?;
-    let gpu = [dxx.to_host_vec(&stream)?, dxy.to_host_vec(&stream)?, dyy.to_host_vec(&stream)?];
-
-    let mut max_abs = 0.0f64;
-    let mut scale = 1e-300f64;
-    for vv in 0..3 {
-        for i in 0..ndof {
-            max_abs = max_abs.max((gpu[vv][i] - cpu[vv][i]).abs());
-            scale = scale.max(cpu[vv][i].abs());
-        }
-    }
-    println!("dofs={ndof}  max|gpu − cpu| / |rhs| = {:.3e}", max_abs / scale);
-    if max_abs / scale < 1e-9 {
-        println!("\nPASS: GPU log-conformation rhs matches the CPU oracle (full libdevice math works).");
-        Ok(())
-    } else {
-        eprintln!("\nFAIL: GPU/CPU mismatch.");
-        std::process::exit(1);
-    }
+    Ok([dxx.to_host_vec(&stream)?, dxy.to_host_vec(&stream)?, dyy.to_host_vec(&stream)?])
 }

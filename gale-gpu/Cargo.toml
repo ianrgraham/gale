@@ -89,35 +89,35 @@ path = "src/bin/gpu_poisson_cg.rs"
 name = "gpu-poisson-pcg"
 path = "src/bin/gpu_poisson_pcg.rs"
 
-# GPU port: 3D hyperbolic operator on hexes (weak form, linear advection).
+# Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
-name = "gpu-advection3d"
-path = "src/bin/gpu_advection3d.rs"
+name = "advection3d-check"
+path = "src/bin/advection3d_check.rs"
 
-# GPU port: Oldroyd-B conformation transport rhs (direct form, element-local).
+# Validates the reusable gale_gpu::oldroyd_conf_rhs (operators::oldroyd) component.
 [[bin]]
-name = "gpu-oldroyd"
-path = "src/bin/gpu_oldroyd.rs"
+name = "oldroyd-check"
+path = "src/bin/oldroyd_check.rs"
 
-# GPU port: split-form (entropy-stable) Burgers operator.
+# Validates the reusable gale_gpu::burgers_rhs (operators::burgers) component.
 [[bin]]
-name = "gpu-burgers-split"
-path = "src/bin/gpu_burgers_split.rs"
+name = "burgers-check"
+path = "src/bin/burgers_check.rs"
 
 # Validates the reusable gale_gpu::penalize_apply (immersed) library component.
 [[bin]]
 name = "penalize-check"
 path = "src/bin/penalize_check.rs"
 
-# GPU port: compressible Euler weak-form operator (libdevice sqrt).
+# Validates the reusable gale_gpu::euler_rhs (operators::euler) component.
 [[bin]]
-name = "gpu-euler"
-path = "src/bin/gpu_euler.rs"
+name = "euler-check"
+path = "src/bin/euler_check.rs"
 
-# GPU port: log-conformation viscoelastic transport (eig + matrix exp).
+# Validates the reusable gale_gpu::logconf_psi_rhs (operators::logconf) component.
 [[bin]]
-name = "gpu-logconf"
-path = "src/bin/gpu_logconf.rs"
+name = "logconf-check"
+path = "src/bin/logconf_check.rs"
 
 # Live multi-GPU advection across 2 devices with P2P halo exchange.
 [[bin]]

@@ -1,18 +1,23 @@
-//! GPU port of the **Oldroyd-B conformation transport** rhs (direct form), the
-//! viscoelastic constitutive update on the headline path. Purely element-local
-//! (nodal-collocation advection — no faces, no neighbor gather) and libdevice-free
-//! (only arithmetic + the sum-factorized gradient pattern already proven on GPU),
-//! so it runs on the embedded `#[cuda_module]` path on sm_70. Validated bit-for-bit
-//! against the CPU oracle `OldroydB::conformation_rhs`.
+//! GPU Oldroyd-B conformation transport (direct form) — reusable library component.
+//!
+//! Carries the `#[cuda_module]` device kernel plus a host launch wrapper
+//! ([`oldroyd_conf_rhs`]) for the viscoelastic constitutive update on the headline
+//! path. Purely element-local (nodal-collocation advection — no faces, no neighbor
+//! gather) and libdevice-free (only arithmetic + the sum-factorized gradient pattern
+//! already proven on GPU), so it runs on the embedded `#[cuda_module]` path on sm_70.
+//! Validated bit-for-bit against the CPU oracle `gale::dg::OldroydB::conformation_rhs`.
 //!
 //!   ∂ₜC = −(u·∇)C + (L·C + C·Lᵀ) − (1/λ)(C − I),   L = ∇u.
 //!
-//! Run: cargo oxide run --bin gpu-oldroyd
+//! This is a `#[cuda_module]` in the gale-gpu crate (alongside
+//! [`crate::operators::advection`] and [`crate::immersed`]). cuda-oxide compiles every
+//! `#[kernel]` in the crate into one device bundle keyed by the crate name, so multiple
+//! cuda_modules coexist as long as their kernel export names are unique crate-wide.
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
-use gale::dg::{Mesh2d, OldroydB};
+use gale::dg::Mesh2d;
 
 const NN_MAX: usize = 81;
 
@@ -119,34 +124,39 @@ mod kernels {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let p = 4;
-    println!("=== GPU Oldroyd-B conformation rhs vs CPU (p={p}) ===\n");
-
-    let mesh = Mesh2d::rectangular(p, 4, 4, [0.0, 1.0], [0.0, 1.0]);
+/// Compute the Oldroyd-B conformation-transport RHS `∂ₜC` on the GPU for a quad
+/// mesh, returning the nodal time-derivative of the three independent conformation
+/// components `[Cxx, Cxy, Cyy]`. Reusable host wrapper around the
+/// [`kernels::conf_rhs`] device kernel: flattens the mesh metrics, uploads the
+/// velocity + conformation state, launches one block per element (one thread per
+/// node), and gathers the result. Bit-for-bit equal to
+/// `gale::dg::OldroydB::conformation_rhs`.
+///
+/// `c` holds the conformation field as `[Cxx, Cxy, Cyy]`, each of length
+/// `n_elements·n_nodes`; `ux`/`uy` are the velocity components in the same layout;
+/// `lambda` is the relaxation time. The returned `[Vec<f64>; 3]` follows the same
+/// `[dCxx, dCxy, dCyy]` layout as the CPU oracle.
+pub fn oldroyd_conf_rhs(
+    mesh: &Mesh2d,
+    c: &[Vec<f64>; 3],
+    ux: &[f64],
+    uy: &[f64],
+    lambda: f64,
+) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
-    let lambda = 0.7;
-    let op = OldroydB::new(&mesh, lambda, 1.0);
-
-    // Smooth velocity + SPD conformation fields.
-    let (mut ux, mut uy) = (vec![0.0; ndof], vec![0.0; ndof]);
-    let mut c = [vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]];
-    for (e, el) in mesh.elements.iter().enumerate() {
-        for k in 0..nn {
-            let (x, y) = (el.geom.x[k], el.geom.y[k]);
-            ux[e * nn + k] = (2.0 * x).sin() * y + 0.3 * x;
-            uy[e * nn + k] = -0.4 * (3.0 * y).cos() * x;
-            c[0][e * nn + k] = 1.5 + 0.4 * (x + y).sin();
-            c[1][e * nn + k] = 0.2 * x - 0.1 * y;
-            c[2][e * nn + k] = 1.3 + 0.3 * (x * y).cos();
-        }
-    }
-    let cpu = op.conformation_rhs(&c, &ux, &uy);
+    let n1 = mesh.order + 1;
+    assert_eq!(ux.len(), ndof, "ux length must be n_elements·n_nodes");
+    assert_eq!(uy.len(), ndof, "uy length must be n_elements·n_nodes");
+    assert_eq!(c[0].len(), ndof, "Cxx length must be n_elements·n_nodes");
+    assert_eq!(c[1].len(), ndof, "Cxy length must be n_elements·n_nodes");
+    assert_eq!(c[2].len(), ndof, "Cyy length must be n_elements·n_nodes");
+    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
 
     // Flatten per-node metrics.
-    let (mut rx, mut ry, mut sx, mut sy) = (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
+    let (mut rx, mut ry, mut sx, mut sy) =
+        (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
     for (e, el) in mesh.elements.iter().enumerate() {
         for k in 0..nn {
             rx[e * nn + k] = el.geom.rx[k];
@@ -160,8 +170,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = ctx.default_stream();
     let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
     let d_dev = up(&mesh.refq.line.diff)?;
-    let ux_dev = up(&ux)?;
-    let uy_dev = up(&uy)?;
+    let ux_dev = up(ux)?;
+    let uy_dev = up(uy)?;
     let cxx_dev = up(&c[0])?;
     let cxy_dev = up(&c[1])?;
     let cyy_dev = up(&c[2])?;
@@ -177,25 +187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
     module.conf_rhs(
         &stream, cfg, &d_dev, &ux_dev, &uy_dev, &cxx_dev, &cxy_dev, &cyy_dev,
-        &rx_dev, &ry_dev, &sx_dev, &sy_dev, lambda.recip(), (p + 1) as u32,
+        &rx_dev, &ry_dev, &sx_dev, &sy_dev, lambda.recip(), n1 as u32,
         &mut dxx, &mut dxy, &mut dyy,
     )?;
-    let gpu = [dxx.to_host_vec(&stream)?, dxy.to_host_vec(&stream)?, dyy.to_host_vec(&stream)?];
-
-    let mut max_abs = 0.0f64;
-    let mut scale = 1e-300f64;
-    for v in 0..3 {
-        for i in 0..ndof {
-            max_abs = max_abs.max((gpu[v][i] - cpu[v][i]).abs());
-            scale = scale.max(cpu[v][i].abs());
-        }
-    }
-    println!("dofs={ndof}  max|gpu − cpu| / |rhs| = {:.3e}", max_abs / scale);
-    if max_abs / scale < 1e-12 {
-        println!("\nPASS: GPU Oldroyd-B conformation rhs matches the CPU oracle.");
-        Ok(())
-    } else {
-        eprintln!("\nFAIL: GPU/CPU mismatch.");
-        std::process::exit(1);
-    }
+    Ok([dxx.to_host_vec(&stream)?, dxy.to_host_vec(&stream)?, dyy.to_host_vec(&stream)?])
 }

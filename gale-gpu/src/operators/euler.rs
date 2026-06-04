@@ -1,25 +1,29 @@
-//! GPU port of the **compressible Euler** weak-form DG operator (nv=4) with Rusanov
-//! (LLF) flux — the operator that was BLOCKED by the typed-pointer bitcast bug,
-//! because the wave speed needs in-kernel `sqrt(γp/ρ)` and `abs` (the libdevice /
-//! NVVM-text path). With the §1 exporter fix in the backend it now compiles and runs;
-//! validated bit-for-bit against `Hyperbolic::rhs` (Euler, weak form, Rusanov).
+//! GPU compressible-Euler (weak-form DG, nv=4) operator — reusable library component.
 //!
-//! State (SoA): u0=ρ, u1=ρu, u2=ρv, u3=E. Periodic mesh ⇒ no boundary flux.
+//! Carries the `#[cuda_module]` device kernel ([`kernels::euler_rhs`]) plus a host
+//! launch wrapper ([`euler_rhs`]). The wave speed needs in-kernel `sqrt(γp/ρ)` and
+//! `abs` (the libdevice / NVVM-text path), so this operator exercises the exporter
+//! fix that anchors libdevice math. Validated bit-for-bit against
+//! `gale::dg::Hyperbolic` (Euler, weak form, Rusanov / LLF flux).
 //!
-//! Run: cargo oxide run --bin gpu-euler
+//! State (SoA): `u0=ρ`, `u1=ρu`, `u2=ρv`, `u3=E`. Periodic mesh ⇒ no boundary flux.
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
-use gale::dg::{Edge, Euler, Hyperbolic, Mesh2d, Neighbor};
+use gale::dg::{Edge, Mesh2d, Neighbor};
 
-const NN_MAX: usize = 81;
+const NN_MAX: usize = 81; // (p+1)² up to p=8
 
 #[cuda_module]
 mod kernels {
     use super::*;
 
     /// `∂ₜu = M⁻¹[Dxᵀ(W Fx)+Dyᵀ(W Fy) − ∮ F*·n]`, Euler + Rusanov, one element/block.
+    ///
+    /// Named `euler_rhs` and unique crate-wide: kernel export names share a single
+    /// device bundle in cuda-oxide, so they must not clash with other operators'
+    /// kernels (cf. `advect2d_rhs`). The wave-speed `sqrt`/`abs` go through libdevice.
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn euler_rhs(
@@ -168,35 +172,35 @@ mod kernels {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let p = 4;
-    let gamma = 1.4;
-    println!("=== GPU Euler weak-form operator vs CPU (p={p}) ===\n");
-
-    let mesh = Mesh2d::rectangular_periodic(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+/// Compute the compressible-Euler weak-form RHS `∂ₜu = M⁻¹L(u)` on the GPU for a
+/// **periodic** quad mesh, returning the nodal time-derivative of each conserved
+/// component. Reusable host wrapper around the [`kernels::euler_rhs`] device kernel:
+/// flattens the mesh metrics + face connectivity, uploads, launches one block per
+/// element, and gathers the four component results. Bit-for-bit equal to
+/// `gale::dg::Hyperbolic` (Euler, weak form, Rusanov).
+///
+/// `state` is the SoA conserved state `[ρ, ρu, ρv, E]`, each of length
+/// `n_elements·n_nodes`; the returned `Vec<Vec<f64>>` preserves that 4-component
+/// layout.
+///
+/// Panics if the mesh has boundary faces (this PoC kernel handles interior faces
+/// only — use a periodic mesh).
+pub fn euler_rhs(
+    mesh: &Mesh2d,
+    state: &[Vec<f64>],
+    gamma: f64,
+) -> Result<Vec<Vec<f64>>, Box<dyn std::error::Error>> {
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
-    let op = Hyperbolic::new(&mesh, Euler { gamma });
-
-    // Smooth state: density wave + swirl.
-    let mut state: Vec<Vec<f64>> = (0..4).map(|_| vec![0.0; ndof]).collect();
-    for (e, el) in mesh.elements.iter().enumerate() {
-        for k in 0..nn {
-            let (x, y) = (el.geom.x[k], el.geom.y[k]);
-            let r = 1.0 + 0.2 * (2.0 * std::f64::consts::PI * x).sin();
-            let vx = 0.3 + 0.1 * (2.0 * std::f64::consts::PI * y).cos();
-            let vy = -0.2 + 0.1 * (2.0 * std::f64::consts::PI * x).cos();
-            let pr = 1.0 + 0.1 * (2.0 * std::f64::consts::PI * (x + y)).sin();
-            let en = pr / (gamma - 1.0) + 0.5 * r * (vx * vx + vy * vy);
-            state[0][e * nn + k] = r;
-            state[1][e * nn + k] = r * vx;
-            state[2][e * nn + k] = r * vy;
-            state[3][e * nn + k] = en;
-        }
+    let n1 = mesh.order + 1;
+    assert_eq!(state.len(), 4, "Euler state must have 4 components [ρ, ρu, ρv, E]");
+    for c in state {
+        assert_eq!(c.len(), ndof, "state length must be n_elements·n_nodes");
     }
-    let cpu = op.rhs(&state, 0.0, &|_, _, _, _: &mut [f64]| {});
+    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
 
+    // Flatten per-node metrics.
     let (mut rx, mut ry, mut sx, mut sy, mut jw) =
         (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
     for (e, el) in mesh.elements.iter().enumerate() {
@@ -208,19 +212,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             jw[e * nn + k] = el.geom.jw[k];
         }
     }
-    let n1 = (p + 1) as u32;
-    let nfc = ne * 4 * (p + 1);
+
+    // Flatten face connectivity (interior faces only).
+    let nfc = ne * 4 * n1;
     let (mut fvl, mut fnx, mut fny, mut fsw, mut fnbr) =
         (vec![0u32; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![0u32; nfc]);
     for (e, el) in mesh.elements.iter().enumerate() {
         for (t, edge) in Edge::ALL.iter().enumerate() {
             let face = &el.faces[*edge as usize];
-            let Neighbor::Interior { elem: re, edge: redge, perm } = &el.neighbors[*edge as usize] else {
-                panic!("periodic mesh: no boundary");
+            let Neighbor::Interior { elem: re, edge: redge, perm } = &el.neighbors[*edge as usize]
+            else {
+                panic!("euler_rhs: mesh has a boundary face (use a periodic mesh)");
             };
             let rf = &mesh.elements[*re].faces[*redge as usize];
-            for a in 0..(p + 1) {
-                let idx = (e * 4 + t) * (p + 1) + a;
+            for a in 0..n1 {
+                let idx = (e * 4 + t) * n1 + a;
                 fvl[idx] = face.nodes[a] as u32;
                 fnx[idx] = face.nx[a];
                 fny[idx] = face.ny[a];
@@ -257,30 +263,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = kernels::load(&ctx)?;
     let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
     module.euler_rhs(
-        &stream, cfg, &d_dev, &u0, &u1, &u2, &u3, &rxd, &ryd, &sxd, &syd, &jwd, gamma, n1,
-        &fvld, &fnxd, &fnyd, &fswd, &fnbrd, &mut d0, &mut d1, &mut d2, &mut d3,
+        &stream, cfg, &d_dev, &u0, &u1, &u2, &u3, &rxd, &ryd, &sxd, &syd, &jwd, gamma,
+        n1 as u32, &fvld, &fnxd, &fnyd, &fswd, &fnbrd, &mut d0, &mut d1, &mut d2, &mut d3,
     )?;
-    let gpu = [
+    Ok(vec![
         d0.to_host_vec(&stream)?,
         d1.to_host_vec(&stream)?,
         d2.to_host_vec(&stream)?,
         d3.to_host_vec(&stream)?,
-    ];
-
-    let mut max_abs = 0.0f64;
-    let mut scale = 1e-300f64;
-    for v in 0..4 {
-        for i in 0..ndof {
-            max_abs = max_abs.max((gpu[v][i] - cpu[v][i]).abs());
-            scale = scale.max(cpu[v][i].abs());
-        }
-    }
-    println!("dofs={ndof}  max|gpu − cpu| / |rhs| = {:.3e}", max_abs / scale);
-    if max_abs / scale < 1e-11 {
-        println!("\nPASS: GPU Euler operator matches the CPU oracle (libdevice path works).");
-        Ok(())
-    } else {
-        eprintln!("\nFAIL: GPU/CPU mismatch.");
-        std::process::exit(1);
-    }
+    ])
 }

@@ -30,3 +30,8 @@ pub mod operators;
 // Backwards-compatible flat re-exports of the most-used host API.
 pub use immersed::penalize_apply;
 pub use operators::advection::{advection_rhs, GpuAdvection};
+pub use operators::advection3d::advection3d_rhs;
+pub use operators::burgers::burgers_rhs;
+pub use operators::euler::euler_rhs;
+pub use operators::logconf::logconf_psi_rhs;
+pub use operators::oldroyd::oldroyd_conf_rhs;

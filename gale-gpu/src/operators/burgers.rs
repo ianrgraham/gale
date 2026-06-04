@@ -1,17 +1,18 @@
-//! GPU port of the **split-form (entropy-stable) DG operator** — the high-Re engine
-//! — for Burgers, validated bit-for-bit against `Hyperbolic::rhs` (SplitForm).
+//! GPU split-form (entropy-stable) DG operator for Burgers — the high-Re engine —
+//! as a reusable library component. Carries the `#[cuda_module]` device kernel plus
+//! a host launch wrapper ([`burgers_rhs`]). Validated bit-for-bit against
+//! `gale::dg::Hyperbolic::rhs` (SplitForm).
+//!
 //! Uses the entropy-CONSERVING variant (central surface flux, `dissipation=false`):
 //! the Fisher–Carpenter flux-differencing volume `(2/J)Σ D·F̃#` with metric averaging,
 //! plus the strong-form surface `(1/Jw)(F·n − F*·n)`. Burgers' EC two-point flux
 //! `(uₗ²+uₗuᵣ+uᵣ²)/6` and `F·n=½u²nₓ` are pure arithmetic ⇒ embedded path, sm_70.
 //! (Periodic mesh ⇒ no boundary flux; `fpy=0` for Burgers ⇒ only `rx,sx` metrics.)
-//!
-//! Run: cargo oxide run --bin gpu-burgers-split
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
-use gale::dg::{Burgers, Edge, Hyperbolic, Mesh2d, Neighbor, VolumeForm};
+use gale::dg::{Edge, Mesh2d, Neighbor};
 
 const NN_MAX: usize = 81;
 
@@ -112,26 +113,29 @@ mod kernels {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let p = 4;
-    println!("=== GPU split-form Burgers vs CPU (entropy-conserving, p={p}) ===\n");
-
-    let mesh = Mesh2d::rectangular_periodic(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+/// Compute the split-form (entropy-conserving) Burgers RHS `∂ₜu` on the GPU for a
+/// **periodic** quad mesh, returning the nodal time-derivative. Reusable host
+/// wrapper around the [`kernels::burgers_split`] device kernel: flattens the mesh
+/// metrics + face connectivity, uploads, launches one block per element, and
+/// gathers the result. Bit-for-bit equal to `gale::dg::Hyperbolic` split-form
+/// Burgers (entropy-conserving, `dissipation=false`).
+///
+/// Panics if the mesh has boundary faces (this PoC kernel handles interior faces
+/// only — use a periodic mesh).
+pub fn burgers_rhs(
+    mesh: &Mesh2d,
+    u: &[f64],
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
-    let op = Hyperbolic::with_options(&mesh, Burgers, VolumeForm::SplitForm, false);
-
-    let mut state = vec![vec![0.0; ndof]];
-    for (e, el) in mesh.elements.iter().enumerate() {
-        for k in 0..nn {
-            state[0][e * nn + k] = 0.5 + (2.0 * std::f64::consts::PI * el.geom.x[k]).sin() * (2.0 * std::f64::consts::PI * el.geom.y[k]).cos();
-        }
-    }
-    let cpu = op.rhs(&state, 0.0, &|_, _, _, _: &mut [f64]| {});
+    let n1 = mesh.order + 1;
+    assert_eq!(u.len(), ndof, "state length must be n_elements·n_nodes");
+    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
 
     // Flatten metrics.
-    let (mut jac, mut rx, mut sx, mut jw) = (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
+    let (mut jac, mut rx, mut sx, mut jw) =
+        (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
     for (e, el) in mesh.elements.iter().enumerate() {
         for k in 0..nn {
             jac[e * nn + k] = el.geom.jac[k];
@@ -140,18 +144,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             jw[e * nn + k] = el.geom.jw[k];
         }
     }
-    let n1 = (p + 1) as u32;
-    let nfc = ne * 4 * (p + 1);
-    let (mut fvl, mut fnx, mut fsw, mut fnbr) = (vec![0u32; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![0u32; nfc]);
+
+    // Flatten face connectivity (interior faces only).
+    let nfc = ne * 4 * n1;
+    let (mut fvl, mut fnx, mut fsw, mut fnbr) =
+        (vec![0u32; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![0u32; nfc]);
     for (e, el) in mesh.elements.iter().enumerate() {
         for (t, edge) in Edge::ALL.iter().enumerate() {
             let face = &el.faces[*edge as usize];
-            let Neighbor::Interior { elem: re, edge: redge, perm } = &el.neighbors[*edge as usize] else {
-                panic!("periodic mesh: no boundary");
+            let Neighbor::Interior { elem: re, edge: redge, perm } = &el.neighbors[*edge as usize]
+            else {
+                panic!("burgers_rhs: mesh has a boundary face (use a periodic mesh)");
             };
             let rf = &mesh.elements[*re].faces[*redge as usize];
-            for a in 0..(p + 1) {
-                let idx = (e * 4 + t) * (p + 1) + a;
+            for a in 0..n1 {
+                let idx = (e * 4 + t) * n1 + a;
                 fvl[idx] = face.nodes[a] as u32;
                 fnx[idx] = face.nx[a];
                 fsw[idx] = face.sw[a];
@@ -165,7 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
     let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
     let d_dev = up(&mesh.refq.line.diff)?;
-    let u_dev = up(&state[0])?;
+    let u_dev = up(u)?;
     let jac_dev = up(&jac)?;
     let rx_dev = up(&rx)?;
     let sx_dev = up(&sx)?;
@@ -179,22 +186,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = kernels::load(&ctx)?;
     let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
     module.burgers_split(
-        &stream, cfg, &d_dev, &u_dev, &jac_dev, &rx_dev, &sx_dev, &jw_dev, n1,
+        &stream, cfg, &d_dev, &u_dev, &jac_dev, &rx_dev, &sx_dev, &jw_dev, n1 as u32,
         &fvl_dev, &fnx_dev, &fsw_dev, &fnbr_dev, &mut out_dev,
     )?;
-    let gpu = out_dev.to_host_vec(&stream)?;
-
-    let mut max_abs = 0.0f64;
-    let scale = cpu[0].iter().fold(0.0f64, |a, &v| a.max(v.abs())).max(1e-300);
-    for i in 0..ndof {
-        max_abs = max_abs.max((gpu[i] - cpu[0][i]).abs());
-    }
-    println!("dofs={ndof}  max|gpu − cpu| / |rhs| = {:.3e}", max_abs / scale);
-    if max_abs / scale < 1e-11 {
-        println!("\nPASS: GPU split-form Burgers matches the CPU oracle.");
-        Ok(())
-    } else {
-        eprintln!("\nFAIL: GPU/CPU mismatch.");
-        std::process::exit(1);
-    }
+    Ok(out_dev.to_host_vec(&stream)?)
 }

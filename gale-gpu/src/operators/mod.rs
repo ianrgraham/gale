@@ -5,3 +5,8 @@
 //! export names must be unique across all of gale-gpu.
 
 pub mod advection;
+pub mod advection3d;
+pub mod burgers;
+pub mod euler;
+pub mod logconf;
+pub mod oldroyd;
