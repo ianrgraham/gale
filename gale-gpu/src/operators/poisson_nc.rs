@@ -25,6 +25,7 @@ use cuda_host::cuda_module;
 use gale::dg::{Edge, Mesh2d, Neighbor, RefineQuad};
 
 const NN_MAX: usize = 81; // (order 8 + 1)²
+const RED: usize = 256; // reduction block size for the CG dot product
 
 // Per-edge face-kind tags (`ekind[e*4+t]`).
 const K_CONF: u32 = 0; // conforming Interior / Dirichlet(BND) / Neumann(NEU) — `fnbr` path
@@ -283,6 +284,55 @@ mod kernels {
             *o = acc + rfm + lambda * jw[b] * u[b];
         }
     }
+
+    /// y ← y + a·x  (CG vector op; `_nc` suffix for crate-wide kernel-name uniqueness)
+    #[kernel]
+    pub fn axpy_nc(mut y: DisjointSlice<f64>, x: &[f64], a: f64) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = y.get_mut(idx) {
+            *o += a * x[i];
+        }
+    }
+
+    /// y ← x + b·y
+    #[kernel]
+    pub fn xpby_nc(mut y: DisjointSlice<f64>, x: &[f64], b: f64) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = y.get_mut(idx) {
+            *o = x[i] + b * *o;
+        }
+    }
+
+    /// Block dot-product partial reduction.
+    #[kernel]
+    pub fn dot_nc_partial(a: &[f64], b: &[f64], n: u64, mut partial: DisjointSlice<f64>) {
+        static mut SH: SharedArray<f64, RED> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let stride = thread::blockDim_x() as usize;
+        let mut acc = 0.0f64;
+        let mut i = tid;
+        while i < n as usize {
+            acc += a[i] * b[i];
+            i += stride;
+        }
+        unsafe { SH[tid] = acc; }
+        thread::sync_threads();
+        let mut s = stride / 2;
+        while s > 0 {
+            if tid < s {
+                unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
+            }
+            thread::sync_threads();
+            s /= 2;
+        }
+        if tid == 0 {
+            if let Some(o) = partial.get_mut(thread::index_1d()) {
+                *o = unsafe { SH[0] };
+            }
+        }
+    }
 }
 
 /// Per-element metrics + flattened (conforming + non-conforming) face metadata,
@@ -344,7 +394,7 @@ fn sorted_positions(mesh: &Mesh2d, e: usize, edge: Edge) -> Vec<usize> {
 /// and the mortar metadata for the `CoarseToFine`/`FineToCoarse` edges. Penalty `tau`
 /// uses `α(p+1)²/min(h_self, h_nbr)` with `h = √Σjw`; for NC faces the min is taken
 /// over the coarse and the relevant fine element(s).
-fn flatten_nc(mesh: &Mesh2d, alpha: f64) -> NcArrays {
+fn flatten_nc(mesh: &Mesh2d, alpha: f64, neumann_all: bool) -> NcArrays {
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
@@ -423,7 +473,7 @@ fn flatten_nc(mesh: &Mesh2d, alpha: f64) -> NcArrays {
                         fnx[idx] = face.nx[a];
                         fny[idx] = face.ny[a];
                         fsw[idx] = face.sw[a];
-                        fnbr[idx] = BND;
+                        fnbr[idx] = if neumann_all { NEU } else { BND };
                     }
                 }
                 Neighbor::FineToCoarse { coarse, edge: cedge, half } => {
@@ -525,7 +575,7 @@ pub fn poisson_nc_apply(
     alpha: f64,
     reaction: f64,
 ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    let ma = flatten_nc(mesh, alpha);
+    let ma = flatten_nc(mesh, alpha, false);
     assert_eq!(u.len(), ma.ndof, "state length must be n_elements·n_nodes");
 
     let ctx = CudaContext::new(0)?;
@@ -579,4 +629,131 @@ pub fn poisson_nc_apply(
         &nbr1_dev, &swf0_dev, &swf1_dev, &p0_dev, &p1_dev, reaction, &mut out_dev,
     )?;
     Ok(out_dev.to_host_vec(&stream)?)
+}
+
+/// Solve `(reaction·M + A)·x = b` on a **2:1 non-conforming** mesh by conjugate
+/// gradient entirely on the GPU (Dirichlet path). `reaction = 0` is pure Poisson.
+/// Mirrors `gale::dg::Poisson::with_reaction(mesh, alpha, reaction).cg`.
+pub fn poisson_nc_cg_solve(
+    mesh: &Mesh2d, b: &[f64], alpha: f64, reaction: f64, tol: f64, maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg_nc_impl(mesh, b, alpha, reaction, false, false, tol, maxit)
+}
+
+/// Solve the singular pure-Neumann pressure-Poisson `A·x = b` on a non-conforming mesh
+/// by **deflated** CG on the GPU (constant nullspace removed each iteration). Mirrors
+/// `gale::dg::Poisson::with_bc(mesh, alpha, 0, all-tags).cg_deflated`.
+pub fn pressure_nc_cg_solve(
+    mesh: &Mesh2d, b: &[f64], alpha: f64, tol: f64, maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg_nc_impl(mesh, b, alpha, 0.0, true, true, tol, maxit)
+}
+
+/// CG for `(reaction·M + A)·x = b` on a non-conforming mesh; `deflate` removes the
+/// constant nullspace each iteration (for the singular pure-Neumann pressure system).
+/// The matvec is the validated NC `gradient_nc → operator_nc` pipeline; vectors stay
+/// device-resident (only the CG scalars transfer host-side).
+#[allow(clippy::too_many_arguments)]
+fn cg_nc_impl(
+    mesh: &Mesh2d, b: &[f64], alpha: f64, reaction: f64, deflate: bool, neumann_all: bool, tol: f64, maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    let ma = flatten_nc(mesh, alpha, neumann_all);
+    let ndof = ma.ndof;
+    assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+    let d_dev = up(&ma.diff)?;
+    let rx_dev = up(&ma.rx)?;
+    let ry_dev = up(&ma.ry)?;
+    let sx_dev = up(&ma.sx)?;
+    let sy_dev = up(&ma.sy)?;
+    let jw_dev = up(&ma.jw)?;
+    let fvl_dev = upu(&ma.fvl)?;
+    let fnx_dev = up(&ma.fnx)?;
+    let fny_dev = up(&ma.fny)?;
+    let fsw_dev = up(&ma.fsw)?;
+    let fnbr_dev = upu(&ma.fnbr)?;
+    let ekind_dev = upu(&ma.ekind)?;
+    let enx_dev = up(&ma.enx)?;
+    let eny_dev = up(&ma.eny)?;
+    let etau_dev = up(&ma.etau)?;
+    let half0_dev = upu(&ma.half0)?;
+    let ss_dev = upu(&ma.self_sorted)?;
+    let ssw_dev = up(&ma.self_sw)?;
+    let nbr0_dev = upu(&ma.nbr0_sorted)?;
+    let nbr1_dev = upu(&ma.nbr1_sorted)?;
+    let swf0_dev = up(&ma.swf0)?;
+    let swf1_dev = up(&ma.swf1)?;
+    let p0_dev = up(&ma.p0)?;
+    let p1_dev = up(&ma.p1)?;
+
+    let mut x = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut r = up(b)?;
+    let mut p = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut ap = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let ones = up(&vec![1.0f64; ndof])?;
+
+    let module = kernels::load(&ctx)?;
+    let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: 0 };
+    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
+    let n1 = ma.n1;
+    let n64 = ndof as u64;
+    let ninv = 1.0 / ndof as f64;
+
+    macro_rules! dot {
+        ($a:expr, $b:expr) => {{
+            module.dot_nc_partial(&stream, red, $a, $b, n64, &mut partial)?;
+            partial.to_host_vec(&stream)?[0]
+        }};
+    }
+    macro_rules! deflate {
+        ($v:expr) => {{
+            if deflate {
+                let mean = dot!($v, &ones) * ninv;
+                module.axpy_nc(&stream, vec_cfg, $v, &ones, -mean)?;
+            }
+        }};
+    }
+    macro_rules! apply {
+        ($field:expr, $dst:expr) => {{
+            module.gradient_nc(&stream, cfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
+            module.operator_nc(
+                &stream, cfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
+                &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ekind_dev, &enx_dev, &eny_dev,
+                &etau_dev, &half0_dev, &ss_dev, &ssw_dev, &nbr0_dev, &nbr1_dev, &swf0_dev, &swf1_dev,
+                &p0_dev, &p1_dev, reaction, $dst,
+            )?;
+        }};
+    }
+
+    deflate!(&mut r);
+    module.xpby_nc(&stream, vec_cfg, &mut p, &r, 0.0)?; // p = r
+    let bn = dot!(&r, &r).sqrt().max(1e-300);
+    let mut rs = dot!(&r, &r);
+    let mut iters = 0;
+    for it in 0..maxit {
+        apply!(&p, &mut ap);
+        let pap = dot!(&p, &ap);
+        let alpha_cg = rs / pap;
+        module.axpy_nc(&stream, vec_cfg, &mut x, &p, alpha_cg)?;
+        module.axpy_nc(&stream, vec_cfg, &mut r, &ap, -alpha_cg)?;
+        deflate!(&mut r);
+        let rs_new = dot!(&r, &r);
+        iters = it + 1;
+        if rs_new.sqrt() / bn < tol {
+            break;
+        }
+        let beta = rs_new / rs;
+        module.xpby_nc(&stream, vec_cfg, &mut p, &r, beta)?;
+        rs = rs_new;
+    }
+    Ok((x.to_host_vec(&stream)?, iters))
 }
