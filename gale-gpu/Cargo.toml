@@ -104,10 +104,10 @@ path = "src/bin/gpu_oldroyd.rs"
 name = "gpu-burgers-split"
 path = "src/bin/gpu_burgers_split.rs"
 
-# GPU port: volume-penalization apply (immersed rigid bodies).
+# Validates the reusable gale_gpu::penalize_apply (immersed) library component.
 [[bin]]
-name = "gpu-penalize"
-path = "src/bin/gpu_penalize.rs"
+name = "penalize-check"
+path = "src/bin/penalize_check.rs"
 
 # GPU port: compressible Euler weak-form operator (libdevice sqrt).
 [[bin]]
