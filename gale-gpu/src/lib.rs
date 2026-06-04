@@ -33,7 +33,7 @@ pub mod operators;
 // Backwards-compatible flat re-exports of the most-used host API.
 pub use distributed::{multigpu_advection_2d, multigpu_advection_3d};
 pub use flow::{GpuDualSplitting, GpuStokes, GpuStokesIntegrator, GpuViscoelasticDualSplitting};
-pub use flow3d::{GpuDualSplitting3d, GpuStokes3d};
+pub use flow3d::{GpuDualSplitting3d, GpuStokes3d, GpuViscoelasticDualSplitting3d};
 pub use immersed::{
     penalize3d_apply, penalize_apply, GpuPenalization3dHook, GpuPenalizationHook,
 };
@@ -43,6 +43,7 @@ pub use operators::burgers::burgers_rhs;
 pub use operators::euler::euler_rhs;
 pub use operators::logconf::logconf_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
+pub use operators::oldroyd3d::oldroyd3d_conf_rhs;
 pub use operators::poisson::{
     helmholtz_cg_solve, poisson_apply, poisson_cg_solve, poisson_pcg_solve, pressure_cg_solve,
 };

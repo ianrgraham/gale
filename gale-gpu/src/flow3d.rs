@@ -279,3 +279,169 @@ impl gale::sim::StateIntegrator<Mesh3d> for GpuDualSplitting3d {
         state.time.step += 1;
     }
 }
+
+// ===== 3D viscoelastic coupling (Oldroyd-B) ======================================
+
+use gale::dg::OldroydB3d;
+
+fn axpy6(a: &[Vec<f64>; 6], k: &[Vec<f64>; 6], s: f64) -> [Vec<f64>; 6] {
+    std::array::from_fn(|v| a[v].iter().zip(&k[v]).map(|(x, d)| x + s * d).collect())
+}
+fn combine6(a: &[Vec<f64>; 6], wa: f64, b: &[Vec<f64>; 6], wb: f64) -> [Vec<f64>; 6] {
+    std::array::from_fn(|v| a[v].iter().zip(&b[v]).map(|(x, y)| wa * x + wb * y).collect())
+}
+
+/// One SSP-RK3 step of the 3D Oldroyd-B conformation transport with a fixed velocity,
+/// evaluating the rhs on the **GPU** ([`crate::oldroyd3d_conf_rhs`]). Mirrors
+/// `gale::dg::OldroydB3d::step_ssp_rk3` (host axpy/combine, GPU rhs).
+#[allow(clippy::type_complexity)]
+fn oldroyd3d_advance_gpu(
+    mesh: &Mesh3d,
+    c: &[Vec<f64>; 6],
+    ux: &[f64],
+    uy: &[f64],
+    uz: &[f64],
+    dt: f64,
+    lambda: f64,
+) -> Result<[Vec<f64>; 6], Box<dyn std::error::Error>> {
+    let k0 = crate::oldroyd3d_conf_rhs(mesh, c, ux, uy, uz, lambda)?;
+    let u1 = axpy6(c, &k0, dt);
+    let k1 = crate::oldroyd3d_conf_rhs(mesh, &u1, ux, uy, uz, lambda)?;
+    let u2a = axpy6(&u1, &k1, dt);
+    let u2 = combine6(c, 0.75, &u2a, 0.25);
+    let k2 = crate::oldroyd3d_conf_rhs(mesh, &u2, ux, uy, uz, lambda)?;
+    let u3a = axpy6(&u2, &k2, dt);
+    Ok(combine6(c, 1.0 / 3.0, &u3a, 2.0 / 3.0))
+}
+
+/// **Coupled GPU 3D viscoelastic** integrator (direct Oldroyd-B), the 3D analogue of
+/// [`crate::GpuViscoelasticDualSplitting`]. One dual-split advance of the 3-component
+/// velocity **and** the 6-component conformation: velocity updates on the GPU
+/// ([`GpuStokes3d::step_ns_forced`]) using `∇·τ_p` from the *old* conformation, then
+/// the conformation advances (GPU SSP-RK3) with the *new* velocity. `∇·τ_p` (cheap,
+/// element-local) and the stress map use the validated host `OldroydB3d`. (The
+/// log-conformation 3D model needs a device 3×3 eigensolver and is a later addition.)
+pub struct GpuViscoelasticDualSplitting3d {
+    pub dt: f64,
+    pub eta_s: f64,
+    pub eta_p: f64,
+    pub lambda: f64,
+    pub alpha: f64,
+    velocity: gale::sim::FieldId,
+    conformation: gale::sim::FieldId,
+    bc_u: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    bc_v: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    bc_w: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    fx: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    fy: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    fz: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+}
+
+impl GpuViscoelasticDualSplitting3d {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        velocity: gale::sim::FieldId,
+        conformation: gale::sim::FieldId,
+        dt: f64,
+        eta_s: f64,
+        eta_p: f64,
+        lambda: f64,
+        alpha: f64,
+    ) -> Self {
+        Self {
+            dt,
+            eta_s,
+            eta_p,
+            lambda,
+            alpha,
+            velocity,
+            conformation,
+            bc_u: Box::new(|_, _, _, _| 0.0),
+            bc_v: Box::new(|_, _, _, _| 0.0),
+            bc_w: Box::new(|_, _, _, _| 0.0),
+            fx: Box::new(|_, _, _, _| 0.0),
+            fy: Box::new(|_, _, _, _| 0.0),
+            fz: Box::new(|_, _, _, _| 0.0),
+        }
+    }
+
+    pub fn boundary(
+        mut self,
+        bc_u: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+        bc_v: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+        bc_w: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+    ) -> Self {
+        self.bc_u = Box::new(bc_u);
+        self.bc_v = Box::new(bc_v);
+        self.bc_w = Box::new(bc_w);
+        self
+    }
+
+    pub fn drive(
+        mut self,
+        fx: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+        fy: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+        fz: impl Fn(f64, f64, f64, f64) -> f64 + 'static,
+    ) -> Self {
+        self.fx = Box::new(fx);
+        self.fy = Box::new(fy);
+        self.fz = Box::new(fz);
+        self
+    }
+
+    /// Equilibrium conformation `C = I` → `[1,0,0,1,0,1]` over `state.mesh`.
+    pub fn equilibrium(&self, state: &gale::sim::State<Mesh3d>) -> [Vec<f64>; 6] {
+        OldroydB3d::new(&state.mesh, self.lambda, self.eta_p).identity()
+    }
+}
+
+impl gale::sim::StateIntegrator<Mesh3d> for GpuViscoelasticDualSplitting3d {
+    fn dt(&self) -> f64 {
+        self.dt
+    }
+
+    fn step(&self, state: &mut gale::sim::State<Mesh3d>, hook: &dyn gale::sim::StateStageHook<Mesh3d>) {
+        let t_new = state.time.t + self.dt;
+        let (nux, nuy, nuz, nc) = {
+            let v = state.fields.by_id(self.velocity);
+            let (ux, uy, uz) = (v.component(0).to_vec(), v.component(1).to_vec(), v.component(2).to_vec());
+            let cf = state.fields.by_id(self.conformation);
+            let c: [Vec<f64>; 6] = std::array::from_fn(|o| cf.component(o).to_vec());
+
+            // Momentum body force: ∇·τ_p (host, from OLD conformation) + drive.
+            let model = OldroydB3d::new(&state.mesh, self.lambda, self.eta_p);
+            let (mut bx, mut by, mut bz) = model.stress_divergence(&c);
+            let nn = state.mesh.refh.n_nodes();
+            for (e, el) in state.mesh.elements.iter().enumerate() {
+                for k in 0..nn {
+                    let (x, y, z) = (el.geom.x[k], el.geom.y[k], el.geom.z[k]);
+                    bx[e * nn + k] += (self.fx)(x, y, z, t_new);
+                    by[e * nn + k] += (self.fy)(x, y, z, t_new);
+                    bz[e * nn + k] += (self.fz)(x, y, z, t_new);
+                }
+            }
+            let stokes = GpuStokes3d::new(&state.mesh, self.alpha, self.eta_s, self.dt);
+            let (nux, nuy, nuz) = stokes
+                .step_ns_forced(&ux, &uy, &uz, t_new, &self.bc_u, &self.bc_v, &self.bc_w, &bx, &by, &bz)
+                .expect("gale-gpu: 3D viscoelastic velocity step failed");
+            let nc = oldroyd3d_advance_gpu(&state.mesh, &c, &nux, &nuy, &nuz, self.dt, self.lambda)
+                .expect("gale-gpu: 3D viscoelastic conformation advance failed");
+            (nux, nuy, nuz, nc)
+        };
+        {
+            let v = state.fields.by_id_mut(self.velocity);
+            v.component_mut(0).copy_from_slice(&nux);
+            v.component_mut(1).copy_from_slice(&nuy);
+            v.component_mut(2).copy_from_slice(&nuz);
+        }
+        {
+            let cf = state.fields.by_id_mut(self.conformation);
+            for o in 0..6 {
+                cf.component_mut(o).copy_from_slice(&nc[o]);
+            }
+        }
+        hook.after_stage(state, 0);
+        state.time.t = t_new;
+        state.time.step += 1;
+    }
+}

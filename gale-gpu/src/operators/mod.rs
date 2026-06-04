@@ -10,5 +10,6 @@ pub mod burgers;
 pub mod euler;
 pub mod logconf;
 pub mod oldroyd;
+pub mod oldroyd3d;
 pub mod poisson;
 pub mod poisson3d;

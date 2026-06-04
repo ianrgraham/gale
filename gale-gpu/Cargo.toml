@@ -144,6 +144,16 @@ path = "src/bin/ns3d_check.rs"
 name = "flow3d-ibm-check"
 path = "src/bin/flow3d_ibm_check.rs"
 
+# Validates the GPU 3D viscoelastic path (oldroyd3d rhs + GpuViscoelasticDualSplitting3d).
+[[bin]]
+name = "ve3d-check"
+path = "src/bin/ve3d_check.rs"
+
+# 3D capstone: immersed sphere in GPU viscoelastic flow (VE3d integrator + 3D IBM hook).
+[[bin]]
+name = "ve3d-ibm-check"
+path = "src/bin/ve3d_ibm_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"
