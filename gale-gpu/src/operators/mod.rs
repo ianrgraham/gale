@@ -14,3 +14,4 @@ pub mod oldroyd;
 pub mod oldroyd3d;
 pub mod poisson;
 pub mod poisson3d;
+pub mod poisson_nc;

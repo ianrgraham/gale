@@ -159,6 +159,11 @@ path = "src/bin/ve3d_ibm_check.rs"
 name = "logconf3d-check"
 path = "src/bin/logconf3d_check.rs"
 
+# Validates the GPU non-conforming (2:1 mortar) SIPG Poisson operator vs CPU.
+[[bin]]
+name = "poisson-nc-check"
+path = "src/bin/poisson_nc_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"
