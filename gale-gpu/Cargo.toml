@@ -154,6 +154,11 @@ path = "src/bin/ve3d_check.rs"
 name = "ve3d-ibm-check"
 path = "src/bin/ve3d_ibm_check.rs"
 
+# Validates the GPU 3D log-conformation rhs (on-device 3x3 Jacobi eigensolver).
+[[bin]]
+name = "logconf3d-check"
+path = "src/bin/logconf3d_check.rs"
+
 # Validates the reusable gale_gpu::advection3d_rhs (operators::advection3d) component.
 [[bin]]
 name = "advection3d-check"

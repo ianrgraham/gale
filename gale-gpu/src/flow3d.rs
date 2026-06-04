@@ -282,7 +282,8 @@ impl gale::sim::StateIntegrator<Mesh3d> for GpuDualSplitting3d {
 
 // ===== 3D viscoelastic coupling (Oldroyd-B) ======================================
 
-use gale::dg::OldroydB3d;
+use gale::dg::{LogConfOldroydB3d, OldroydB3d};
+use gale::sim::ViscoModel;
 
 fn axpy6(a: &[Vec<f64>; 6], k: &[Vec<f64>; 6], s: f64) -> [Vec<f64>; 6] {
     std::array::from_fn(|v| a[v].iter().zip(&k[v]).map(|(x, d)| x + s * d).collect())
@@ -314,19 +315,43 @@ fn oldroyd3d_advance_gpu(
     Ok(combine6(c, 1.0 / 3.0, &u3a, 2.0 / 3.0))
 }
 
-/// **Coupled GPU 3D viscoelastic** integrator (direct Oldroyd-B), the 3D analogue of
+/// One SSP-RK3 step of the 3D log-conformation transport with a fixed velocity,
+/// evaluating the rhs on the **GPU** ([`crate::logconf3d_psi_rhs`]). Mirrors
+/// `gale::dg::LogConfOldroydB3d::step_ssp_rk3`.
+fn logconf3d_advance_gpu(
+    mesh: &Mesh3d,
+    lc: &LogConfOldroydB3d,
+    psi: &[Vec<f64>; 6],
+    ux: &[f64],
+    uy: &[f64],
+    uz: &[f64],
+    dt: f64,
+) -> Result<[Vec<f64>; 6], Box<dyn std::error::Error>> {
+    let k0 = crate::logconf3d_psi_rhs(mesh, lc, psi, ux, uy, uz)?;
+    let u1 = axpy6(psi, &k0, dt);
+    let k1 = crate::logconf3d_psi_rhs(mesh, lc, &u1, ux, uy, uz)?;
+    let u2a = axpy6(&u1, &k1, dt);
+    let u2 = combine6(psi, 0.75, &u2a, 0.25);
+    let k2 = crate::logconf3d_psi_rhs(mesh, lc, &u2, ux, uy, uz)?;
+    let u3a = axpy6(&u2, &k2, dt);
+    Ok(combine6(psi, 1.0 / 3.0, &u3a, 2.0 / 3.0))
+}
+
+/// **Coupled GPU 3D viscoelastic** integrator, the 3D analogue of
 /// [`crate::GpuViscoelasticDualSplitting`]. One dual-split advance of the 3-component
 /// velocity **and** the 6-component conformation: velocity updates on the GPU
 /// ([`GpuStokes3d::step_ns_forced`]) using `∇·τ_p` from the *old* conformation, then
-/// the conformation advances (GPU SSP-RK3) with the *new* velocity. `∇·τ_p` (cheap,
-/// element-local) and the stress map use the validated host `OldroydB3d`. (The
-/// log-conformation 3D model needs a device 3×3 eigensolver and is a later addition.)
+/// the conformation advances (GPU SSP-RK3) with the *new* velocity. Supports both the
+/// direct Oldroyd-B and the log-conformation models (the latter via the on-device 3×3
+/// eigensolver in [`crate::logconf3d_psi_rhs`]). `∇·τ_p` (cheap, element-local) and the
+/// stress map use the validated host constitutive model.
 pub struct GpuViscoelasticDualSplitting3d {
     pub dt: f64,
     pub eta_s: f64,
     pub eta_p: f64,
     pub lambda: f64,
     pub alpha: f64,
+    pub model: ViscoModel,
     velocity: gale::sim::FieldId,
     conformation: gale::sim::FieldId,
     bc_u: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
@@ -347,6 +372,7 @@ impl GpuViscoelasticDualSplitting3d {
         eta_p: f64,
         lambda: f64,
         alpha: f64,
+        model: ViscoModel,
     ) -> Self {
         Self {
             dt,
@@ -354,6 +380,7 @@ impl GpuViscoelasticDualSplitting3d {
             eta_p,
             lambda,
             alpha,
+            model,
             velocity,
             conformation,
             bc_u: Box::new(|_, _, _, _| 0.0),
@@ -389,9 +416,15 @@ impl GpuViscoelasticDualSplitting3d {
         self
     }
 
-    /// Equilibrium conformation `C = I` → `[1,0,0,1,0,1]` over `state.mesh`.
+    /// Equilibrium state over `state.mesh`: `C = I` (`[1,0,0,1,0,1]`) for Oldroyd-B,
+    /// `Ψ = log I = 0` for log-conformation.
     pub fn equilibrium(&self, state: &gale::sim::State<Mesh3d>) -> [Vec<f64>; 6] {
-        OldroydB3d::new(&state.mesh, self.lambda, self.eta_p).identity()
+        match self.model {
+            ViscoModel::OldroydB => OldroydB3d::new(&state.mesh, self.lambda, self.eta_p).identity(),
+            ViscoModel::LogConf => {
+                LogConfOldroydB3d::new(&state.mesh, self.lambda, self.eta_p).identity()
+            }
+        }
     }
 }
 
@@ -409,8 +442,14 @@ impl gale::sim::StateIntegrator<Mesh3d> for GpuViscoelasticDualSplitting3d {
             let c: [Vec<f64>; 6] = std::array::from_fn(|o| cf.component(o).to_vec());
 
             // Momentum body force: ∇·τ_p (host, from OLD conformation) + drive.
-            let model = OldroydB3d::new(&state.mesh, self.lambda, self.eta_p);
-            let (mut bx, mut by, mut bz) = model.stress_divergence(&c);
+            let (mut bx, mut by, mut bz) = match self.model {
+                ViscoModel::OldroydB => {
+                    OldroydB3d::new(&state.mesh, self.lambda, self.eta_p).stress_divergence(&c)
+                }
+                ViscoModel::LogConf => {
+                    LogConfOldroydB3d::new(&state.mesh, self.lambda, self.eta_p).stress_divergence(&c)
+                }
+            };
             let nn = state.mesh.refh.n_nodes();
             for (e, el) in state.mesh.elements.iter().enumerate() {
                 for k in 0..nn {
@@ -424,8 +463,16 @@ impl gale::sim::StateIntegrator<Mesh3d> for GpuViscoelasticDualSplitting3d {
             let (nux, nuy, nuz) = stokes
                 .step_ns_forced(&ux, &uy, &uz, t_new, &self.bc_u, &self.bc_v, &self.bc_w, &bx, &by, &bz)
                 .expect("gale-gpu: 3D viscoelastic velocity step failed");
-            let nc = oldroyd3d_advance_gpu(&state.mesh, &c, &nux, &nuy, &nuz, self.dt, self.lambda)
-                .expect("gale-gpu: 3D viscoelastic conformation advance failed");
+            let nc = match self.model {
+                ViscoModel::OldroydB => {
+                    oldroyd3d_advance_gpu(&state.mesh, &c, &nux, &nuy, &nuz, self.dt, self.lambda)
+                }
+                ViscoModel::LogConf => {
+                    let lc = LogConfOldroydB3d::new(&state.mesh, self.lambda, self.eta_p);
+                    logconf3d_advance_gpu(&state.mesh, &lc, &c, &nux, &nuy, &nuz, self.dt)
+                }
+            }
+            .expect("gale-gpu: 3D viscoelastic conformation advance failed");
             (nux, nuy, nuz, nc)
         };
         {

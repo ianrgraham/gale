@@ -10,7 +10,7 @@
 
 use gale::dg::immersed3d::{Sphere, VolumePenalization3d};
 use gale::dg::{Mesh3d, OldroydB3d, Stokes3d};
-use gale::sim::{Penalization3dDrag, Simulation, State};
+use gale::sim::{Penalization3dDrag, Simulation, State, ViscoModel};
 
 fn rel_l2(a: &[f64], b: &[f64]) -> f64 {
     let num: f64 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum();
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gst: State<Mesh3d> = State::new(mesh.clone());
     let gvid = gst.add_field("velocity", 3);
     let gcid = gst.add_field("conformation", 6);
-    let ginteg = gale_gpu::GpuViscoelasticDualSplitting3d::new(gvid, gcid, dt, eta_s, eta_p, lambda, alpha)
+    let ginteg = gale_gpu::GpuViscoelasticDualSplitting3d::new(gvid, gcid, dt, eta_s, eta_p, lambda, alpha, ViscoModel::OldroydB)
         .boundary(bc, bc, bc)
         .drive(drive, zero, zero);
     let eq = ginteg.equilibrium(&gst);

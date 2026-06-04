@@ -9,6 +9,7 @@ pub mod advection3d;
 pub mod burgers;
 pub mod euler;
 pub mod logconf;
+pub mod logconf3d;
 pub mod oldroyd;
 pub mod oldroyd3d;
 pub mod poisson;

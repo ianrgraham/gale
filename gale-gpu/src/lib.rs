@@ -42,6 +42,7 @@ pub use operators::advection3d::advection3d_rhs;
 pub use operators::burgers::burgers_rhs;
 pub use operators::euler::euler_rhs;
 pub use operators::logconf::logconf_psi_rhs;
+pub use operators::logconf3d::logconf3d_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
 pub use operators::oldroyd3d::oldroyd3d_conf_rhs;
 pub use operators::poisson::{
