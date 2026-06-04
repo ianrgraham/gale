@@ -84,3 +84,33 @@ pub fn penalize_apply(
     uy.copy_from_slice(&uy_dev.to_host_vec(&stream)?);
     Ok(())
 }
+
+/// Implicit volume-penalization **stage hook** for the GPU flow integrators: applies
+/// the IBM no-slip relaxation `u ← (u + β u_s)/(1 + β)` to the velocity field after
+/// each integrator stage, on the GPU (via [`penalize_apply`]). The GPU analogue of
+/// `gale::sim::PenalizationHook`; wire it with `Simulation::set_stage_hook` so a
+/// [`crate::GpuDualSplitting`] / [`crate::GpuViscoelasticDualSplitting`] flow enforces
+/// an immersed rigid body each step.
+pub struct GpuPenalizationHook {
+    velocity: gale::sim::FieldId,
+    penal: VolumePenalization,
+    dt: f64,
+}
+
+impl GpuPenalizationHook {
+    /// Penalize the 2-component `velocity` field with `penal` over a step `dt` (must
+    /// match the integrator's step size; β = (dt/η_b)·χ).
+    pub fn new(velocity: gale::sim::FieldId, penal: VolumePenalization, dt: f64) -> Self {
+        Self { velocity, penal, dt }
+    }
+}
+
+impl gale::sim::StateStageHook for GpuPenalizationHook {
+    fn after_stage(&self, state: &mut gale::sim::State, _stage: usize) {
+        let mesh = state.mesh.clone();
+        let comps = state.fields.by_id_mut(self.velocity).components_mut();
+        let (ux, uy) = comps.split_at_mut(1);
+        penalize_apply(&mesh, &mut ux[0], &mut uy[0], &self.penal, self.dt)
+            .expect("gale-gpu: GpuPenalizationHook penalize_apply failed");
+    }
+}
