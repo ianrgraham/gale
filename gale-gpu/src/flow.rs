@@ -14,6 +14,17 @@
 //! machinery. Bit-for-bit (to solver tolerance) equal to `gale::dg::Stokes::step`.
 
 use crate::operators::poisson::{helmholtz_cg_solve, pressure_cg_solve};
+use crate::operators::poisson_nc::{poisson_nc_cg_solve, pressure_nc_cg_solve};
+
+/// True if the mesh has any 2:1 non-conforming interface (hanging nodes). The GPU
+/// elliptic solves must then route through the mortar-capable NC path; conforming
+/// meshes use the (faster) uniform path.
+fn mesh_is_nonconforming(mesh: &Mesh2d) -> bool {
+    use gale::dg::Neighbor;
+    mesh.elements.iter().any(|el| {
+        el.neighbors.iter().any(|n| matches!(n, Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. }))
+    })
+}
 use gale::dg::{
     ConstitutiveModel, ConvectionScheme, Hyperbolic, IncompressibleConvection, LogConfOldroydB,
     Mesh2d, OldroydB, Poisson, VolumeForm,
@@ -213,7 +224,12 @@ impl<'m> GpuStokes<'m> {
         let div = self.divergence(&uhx, &uhy);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _| 0.0, |_, _| 0.0);
-        let (p, _it) = pressure_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?;
+        let nc = mesh_is_nonconforming(mesh);
+        let (p, _it) = if nc {
+            pressure_nc_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+        } else {
+            pressure_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+        };
         for (e, el) in mesh.elements.iter().enumerate() {
             let gpx = el.geom.grad_x(refq, &p[e * nn..(e + 1) * nn]);
             let gpy = el.geom.grad_y(refq, &p[e * nn..(e + 1) * nn]);
@@ -228,8 +244,16 @@ impl<'m> GpuStokes<'m> {
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let bx = self.velocity.rhs(&fxv, |x, y| bc_u(x, y, t));
         let by = self.velocity.rhs(&fyv, |x, y| bc_v(x, y, t));
-        let (uxn, _) = helmholtz_cg_solve(mesh, &bx, self.alpha, lambda, self.tol, self.maxit)?;
-        let (uyn, _) = helmholtz_cg_solve(mesh, &by, self.alpha, lambda, self.tol, self.maxit)?;
+        let (uxn, _) = if nc {
+            poisson_nc_cg_solve(mesh, &bx, self.alpha, lambda, self.tol, self.maxit)?
+        } else {
+            helmholtz_cg_solve(mesh, &bx, self.alpha, lambda, self.tol, self.maxit)?
+        };
+        let (uyn, _) = if nc {
+            poisson_nc_cg_solve(mesh, &by, self.alpha, lambda, self.tol, self.maxit)?
+        } else {
+            helmholtz_cg_solve(mesh, &by, self.alpha, lambda, self.tol, self.maxit)?
+        };
         Ok((uxn, uyn))
     }
 
