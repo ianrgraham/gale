@@ -2,34 +2,83 @@
 //!
 //! Build order (see `docs/implicit-solver-strategy.md` §7):
 //! reference element → mesh (face-based) → operators → scalar elliptic solve → flow.
+//!
+//! ## Source layout
+//!
+//! The module source files are grouped into folders by role to keep the directory
+//! navigable — `reference/`, `geometry/`, `mesh/`, `operators/`, `amr/`,
+//! `immersed/`, plus `distributed.rs` at the root. The grouping is **physical
+//! only** (via `#[path]`): the module tree stays flat, so every item is reached as
+//! `dg::<module>::Item` (or the re-exports below) regardless of which folder its
+//! file lives in. This keeps all intra-crate `super::` paths and external
+//! `gale::dg::*` call sites stable.
 
-pub mod amr;
-pub mod amr3d;
-pub mod dgmesh;
-pub mod distributed;
-pub mod face;
-pub mod face3d;
-pub mod filter;
-pub mod geometry;
-pub mod geometry3d;
-pub mod hex;
-pub mod hyperbolic;
-pub mod hyperbolic3d;
-pub mod immersed;
-pub mod immersed3d;
-pub mod membrane;
-pub mod mesh;
-pub mod mesh3d;
-pub mod multigrid;
-pub mod nonconforming;
-pub mod poisson;
-pub mod poisson3d;
-pub mod stokes3d;
-pub mod viscoelastic3d;
-pub mod quad;
+// reference element: 1D operators, tensor-product quad/hex reference elements
+#[path = "reference/reference.rs"]
 pub mod reference;
+#[path = "reference/quad.rs"]
+pub mod quad;
+#[path = "reference/hex.rs"]
+pub mod hex;
+
+// geometry: per-element metric terms + face geometry (2D edges, 3D faces)
+#[path = "geometry/geometry.rs"]
+pub mod geometry;
+#[path = "geometry/geometry3d.rs"]
+pub mod geometry3d;
+#[path = "geometry/face.rs"]
+pub mod face;
+#[path = "geometry/face3d.rs"]
+pub mod face3d;
+
+// mesh: face-based connectivity (2D/3D), the DgMesh trait, nonconforming meshes
+#[path = "mesh/mesh.rs"]
+pub mod mesh;
+#[path = "mesh/mesh3d.rs"]
+pub mod mesh3d;
+#[path = "mesh/dgmesh.rs"]
+pub mod dgmesh;
+#[path = "mesh/nonconforming.rs"]
+pub mod nonconforming;
+
+// operators: hyperbolic, elliptic (Poisson), Stokes, viscoelastic, filter, mg
+#[path = "operators/hyperbolic.rs"]
+pub mod hyperbolic;
+#[path = "operators/hyperbolic3d.rs"]
+pub mod hyperbolic3d;
+#[path = "operators/poisson.rs"]
+pub mod poisson;
+#[path = "operators/poisson3d.rs"]
+pub mod poisson3d;
+#[path = "operators/stokes.rs"]
 pub mod stokes;
+#[path = "operators/stokes3d.rs"]
+pub mod stokes3d;
+#[path = "operators/viscoelastic.rs"]
 pub mod viscoelastic;
+#[path = "operators/viscoelastic3d.rs"]
+pub mod viscoelastic3d;
+#[path = "operators/filter.rs"]
+pub mod filter;
+#[path = "operators/multigrid.rs"]
+pub mod multigrid;
+
+// adaptive mesh refinement (2D/3D)
+#[path = "amr/amr.rs"]
+pub mod amr;
+#[path = "amr/amr3d.rs"]
+pub mod amr3d;
+
+// immersed boundary method: rigid bodies (2D/3D) + deformable membranes
+#[path = "immersed/immersed.rs"]
+pub mod immersed;
+#[path = "immersed/immersed3d.rs"]
+pub mod immersed3d;
+#[path = "immersed/membrane.rs"]
+pub mod membrane;
+
+// multi-GPU / multi-rank domain decomposition + halo exchange
+pub mod distributed;
 
 pub use amr::{
     adapt_scalar, remap_component_flat, remap_scalar, smoothness_per_cell, RefineQuad,
