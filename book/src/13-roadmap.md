@@ -1,7 +1,5 @@
 # Roadmap and Open Problems
 
-> 🎓 **Reviewer — chapter verdict:** The honesty here is well-judged — it neither over-apologizes nor puffs. The framing "this is the map of where the interesting work lives" is exactly the right register for a research code, and the closing "not a list of regrets; it is the payoff structure the architecture was designed to unlock" is a strong, non-defensive landing. The risk in a chapter like this is the opposite of over-apology: a flat list of nine "not done" bullets can read as a backlog dump and sap the book's momentum right at the finish. Two fixes (see marks): order the gaps by *interestingness*, not by build-order, and make sure the genuinely hard open *problems* (deformable particles, load balancing) are visibly distinguished from the merely-unstarted *ports* (FENE-P, BDF2, pyo3) — right now they sit at the same altitude.
-
 This book has described what gale *is*. This chapter is honest about what it is *not yet*
 — the capabilities that are designed, scoped, or partially built but not finished. For a
 research code this is not an embarrassment; it is the map of where the interesting work
@@ -28,14 +26,14 @@ genuinely hard pieces.
 
 ## Parked and planned work
 
-### 3D non-conforming adaptivity
+### 3D non-conforming adaptivity *(substantial port)*
 2D adaptivity is complete (Chapter 10), and the GPU flow solver runs on 2:1
 non-conforming meshes. **3D** non-conforming adaptivity is not built: it needs `Mesh3d`
 octree non-conforming connectivity (currently 3D meshes are conforming only) and the 3D
 hex mortar operators, *then* a GPU 3D non-conforming operator. This is the most direct
 extension of finished work — the 2D path is the template — but it is a substantial port.
 
-### p- and hp-adaptivity
+### p- and hp-adaptivity *(substantial port)*
 gale has `h`-adaptivity (subdivide elements) but a single, uniform polynomial degree per
 mesh. **p-adaptivity** (per-element degree) and **hp-adaptivity** (both) are not built.
 This is the one axis where the reference literature (the Nayak–Mavriplis interior-penalty
@@ -48,7 +46,7 @@ it is needed. The design — generalize the mortar to a rectangular degree-proje
 The 2D non-conforming GPU mortar plumbing built in Chapter 10 is the prerequisite, and it
 now exists, so this is unblocked.
 
-### Toward suspensions: deformable particles and two-phase flow
+### Toward suspensions: deformable particles and two-phase flow *(open problem)*
 Today's immersed boundaries are *rigid* (or prescribed-motion) bodies. The headline
 target — particle-laden suspensions — ultimately wants:
 
@@ -64,33 +62,31 @@ target — particle-laden suspensions — ultimately wants:
 choices. These are the largest remaining physics extensions, and the reason the
 discretization was built to be high-order and adaptive from the start.
 
-### Constitutive models beyond Oldroyd-B
+### Constitutive models beyond Oldroyd-B *(contained)*
 Oldroyd-B allows *infinite* polymer extension, which is unphysical and a source of
 high-Wi pathology. **FENE-P** (finitely-extensible nonlinear elastic, Peterlin closure)
 bounds the stretch and is the natural next model. The log-conformation machinery of
 Chapter 8 carries over directly; this is a contained addition.
 
-> 🎓 **Reviewer:** Good instinct labeling FENE-P "a contained addition" — and it genuinely is, which is the point worth making *visible* across the whole chapter. The reader can't easily tell, scanning these sections, which gaps are an afternoon (FENE-P closure swaps the relaxation term, BDF2 swaps the time-stencil) versus which are a research project (deformable particles are an open FSI problem, SFC load balancing is a genuine distributed-systems design). A one-word tag at the head of each subsection — *(contained)* / *(substantial port)* / *(open problem)* — would turn this from a flat backlog into a difficulty-sorted map, and it's the single highest-value edit in the chapter. You're already saying it in prose for some ("the most direct extension," "contained addition," "the largest remaining physics extensions") — just make it systematic and scannable.
-
-### Higher-order time integration
+### Higher-order time integration *(contained)*
 The dual-splitting scheme is currently **BDF1** (first-order in time). Higher-order BDF /
 stiffly-stable schemes, and possibly IMEX treatments of the coupling, are a known upgrade
 (Chapter 6). Worth doing once spatial accuracy and stability are no longer the binding
 constraint.
 
-### Performance
+### Performance *(open problem)*
 gale has been built **correctness-first**: every kernel is validated bit-for-bit against
 the CPU oracle (Chapter 12), but it has not had a systematic performance pass. A roofline
 study of the elliptic solver (the flagged bottleneck), occupancy and shared-memory
 tuning, and multi-GPU scaling beyond two devices are all open. The architecture
 (Chapter 11) was designed to make this tractable, but the work is not done.
 
-### Load balancing for adaptive multi-GPU
+### Load balancing for adaptive multi-GPU *(open problem)*
 The current domain decomposition is block-based. Adaptive meshes that refine and coarsen
 during a run need **space-filling-curve (Hilbert/Morton) load balancing** to stay
 balanced across GPUs — noted in the code as a drop-in replacement, not yet implemented.
 
-### A Python entry point
+### A Python entry point *(contained)*
 gale is Rust-first, but the long-term intent (per `CLAUDE.md`) is a **pyo3** interface so
 that simulations can be assembled and driven from Python, bridging to the wider analysis
 ecosystem. Not started.

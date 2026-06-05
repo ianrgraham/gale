@@ -1,7 +1,5 @@
 # Appendix: Notation and Dimensionless Numbers
 
-> 🎓 **Reviewer — chapter verdict:** Accurate reference overall — all four dimensionless groups check out dimensionally (including \\( \mathrm{El}=\lambda\nu/L^2 \\)) and the constitutive symbols are right. Two glossary one-liners are imprecise enough to mislead a newcomer (Deborah-vs-Weissenberg, and the HWNP "loss of positive-definiteness" framing), flagged below.
-
 A reference for the symbols, dimensionless groups, and acronyms used throughout the book.
 
 ## Symbols
@@ -45,10 +43,13 @@ These set gale's regime and explain its method choices (Chapter 2).
   problem (Chapter 8).
 
 - **Deborah number** \\( \mathrm{De}=\lambda/T \\): relaxation time vs. a flow/observation
-  timescale \\( T \\). Closely related to \\( \mathrm{Wi} \\); large \\( \mathrm{De} \\)
-  means the fluid "remembers."
-
-> 🎓 **Reviewer (deepen):** "Closely related to Wi" undersells a distinction worth one clause, because conflating them is the single most common viscoelasticity misconception. They coincide only in steady, homogeneous flows. The honest split: **Wi** measures the strength of the elastic response in a flow with a well-defined deformation rate (\\( \lambda\dot\gamma \\) — how stretched the polymers get), while **De** measures whether the flow is *transient relative to relaxation* (\\( \lambda/T \\) — whether the fluid has time to forget). A steady shear flow can have large Wi but \\( \mathrm{De}=0 \\) (nothing is changing, so there's no observation timescale to be fast); a small-amplitude oscillation can have large De but vanishing Wi. Recommend stating they coincide only when the flow timescale *is* \\( 1/\dot\gamma \\), so the reader doesn't treat them as synonyms.
+  timescale \\( T \\). Large \\( \mathrm{De} \\) means the fluid "remembers." Not a synonym
+  for \\( \mathrm{Wi} \\): \\( \mathrm{Wi}=\lambda\dot\gamma \\) measures how stretched the
+  polymers get in a flow with a well-defined deformation rate, while \\( \mathrm{De} \\)
+  measures whether the flow is transient relative to relaxation — whether the fluid has
+  time to forget. They coincide only when the flow timescale *is* \\( 1/\dot\gamma \\)
+  (steady, homogeneous flow); a steady shear has large Wi but \\( \mathrm{De}=0 \\), and a
+  small-amplitude oscillation can have large De but vanishing Wi.
 
 - **Elasticity number** \\( \mathrm{El}=\mathrm{Wi}/\mathrm{Re}=\lambda\nu/L^2 \\):
   elasticity vs. inertia, independent of flow speed. *Large* in microfluidics — the
@@ -79,11 +80,12 @@ These set gale's regime and explain its method choices (Chapter 2).
 - **Conformation tensor / Oldroyd-B / UCD** — the SPD tensor tracking polymer
   microstructure, the canonical viscoelastic model, and the objective (upper-convected)
   time derivative it evolves under (Chapter 8).
-- **HWNP** — High-Weissenberg-Number Problem: numerical loss of positive-definiteness of
-  \\( \mathbf{C} \\) at strong elasticity, cured by the log-conformation representation
-  (Chapter 8).
-
-> 🎓 **Reviewer (flag):** This one-liner names the *symptom* as if it were the *cause*, which is the framing log-conformation's own authors pushed back on. Loss of SPD-ness of \\( \mathbf{C} \\) is what you *observe*; the underlying problem is that the exponential stress profiles in stress boundary/birefringent-strand layers (e.g. near stagnation points) are badly under-resolved by polynomial interpolation, and the resulting Gibbs-type oscillations drive \\( \mathbf{C} \\) negative, after which the constitutive equation is locally Hadamard-unstable and blows up. Log-conformation helps for two reasons, and the entry credits only the first: (1) evolving \\( \Psi=\log\mathbf{C} \\) and exponentiating *guarantees* \\( \mathbf{C}=e^\Psi \\) stays SPD by construction, and (2) the log variable turns those exponential layers into roughly linear ones that polynomials *can* resolve. Recommend: "numerical breakdown at high Wi — under-resolved exponential stress layers drive the (analytically SPD) conformation tensor to lose positive-definiteness, after which it blows up; log-conformation both guarantees SPD-ness by construction and linearizes the layers." Don't let the reference reduce HWNP to a positivity bug.
+- **HWNP** — High-Weissenberg-Number Problem: numerical breakdown at high Wi — under-resolved
+  exponential stress layers drive the (analytically SPD) conformation tensor \\( \mathbf{C} \\)
+  to lose positive-definiteness, after which it blows up. Log-conformation cures it for two
+  reasons: evolving \\( \Psi=\log\mathbf{C} \\) and exponentiating guarantees
+  \\( \mathbf{C}=e^\Psi \\) stays SPD by construction, and the log variable linearizes those
+  exponential layers so polynomials can resolve them (Chapter 8).
 - **IBM / volume penalization (Brinkman)** — immersed-boundary method; representing a
   solid by penalizing the fluid toward the solid velocity inside a mask, applied
   implicitly for stability (Chapter 9).

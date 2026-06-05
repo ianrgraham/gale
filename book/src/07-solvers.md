@@ -1,7 +1,5 @@
 # Linear Solvers on the GPU
 
-> 🎓 **Reviewer — chapter verdict:** Strong, and admirably disciplined about *not* turning into a CG textbook — the "matvec, dot, axpy, nothing else" framing is the honest and useful one, and the GPU-residency section is the kind of practitioner detail that justifies the whole book. The multigrid V-cycle intuition is correct and the right length. Two things to fix: the deflation nullspace argument is right in spirit but glosses the consistency condition on \\( b \\) (the real reason singular-CG misbehaves), and the \\( \sqrt{\kappa} \\) iteration-count claim deserves the half-sentence of nuance that keeps it from being wrong in the cases that matter. Praise where due below.
-
 Chapter 6 reduced incompressible flow to a sequence of **SPD elliptic solves** — a
 pressure-Poisson and a viscous-Helmholtz problem every timestep. Those solves are the
 *bottleneck* of high-order incompressible flow: profiling and the literature both put the
@@ -73,14 +71,15 @@ The reason CG is perfect for the GPU is what each iteration needs:
 No factorization, no matrix storage — just matvec, dot, and axpy, all of which are
 embarrassingly parallel. The one thing to watch is **convergence speed**, which is
 governed by the **condition number** \\( \kappa(A) \\): the number of iterations to a fixed
-tolerance scales like \\( \sqrt{\kappa} \\). For the SIPG operators \\( \kappa \\) grows with
+tolerance scales like \\( \sqrt{\kappa} \\) — though that is only the worst-case bound. CG's
+real convergence depends on the *whole spectrum*, not just its extremes: clustered
+eigenvalues converge superlinearly (CG "deflates" them as it goes) and a few stray large
+ones cost only a handful of extra iterations. This is the key to what follows —
+preconditioning helps precisely because it does not merely shrink \\( \kappa \\) but
+*clusters* the spectrum near 1. For the SIPG operators \\( \kappa \\) grows with
 resolution (smaller \\( h \\)) and with polynomial order \\( p \\). Unpreconditioned CG is
 fine for modest problems — and gale validates it directly — but on a real mesh the
 iteration count grows uncomfortably, which motivates the next layer.
-
-> 🎓 **Reviewer (deepen):** The \\( \sqrt{\kappa} \\) bound is right but it's the *worst-case* bound, and the gap matters for what comes next. CG's real convergence depends on the *whole spectrum*, not just its extremes: clustered eigenvalues converge superlinearly (CG "deflates" them as it goes), and a few stray large eigenvalues cost only a few extra iterations. The \\( \sqrt{\kappa} \\) story is the headline, but the reason *preconditioning works* is precisely that \\( M^{-1}A \\) doesn't just shrink \\( \kappa \\) — it *clusters* the spectrum near 1. I'd add half a sentence to that effect, because otherwise §"Preconditioning" reads as merely "make \\( \kappa \\) smaller," and the deflation section later is *also* a spectral-clustering argument (remove the zero eigenvalue) — connecting them under "CG cares about the spectrum, not just its condition number" makes both sections click.
-
-> 🎓 **Reviewer:** Nice restraint not writing out the CG recurrence. Resist any urge to add it — the three-bullet "matvec, dot, axpy" list does all the work a newcomer needs, and the moment you write \\( \alpha_k = r_k^\top r_k / p_k^\top A p_k \\) you've become the textbook the preface promised not to be.
 
 ## Preconditioning, and gale's p-multigrid
 
@@ -94,7 +93,12 @@ in the solver-strategy document. To understand it, start with the observation th
 all multigrid: a cheap **smoother** — here a **damped-Jacobi** sweep, \\( x \leftarrow x +
 \omega\,D^{-1}(b - Ax) \\) with \\( D = \mathrm{diag}(A) \\) — is very good at killing the
 *high-frequency* (oscillatory) components of the error, but very bad at the *low-frequency*
-(smooth) components. A few Jacobi sweeps leave a smooth error that just sits there.
+(smooth) components. A few Jacobi sweeps leave a smooth error that just sits there. The
+damping factor \\( \omega \\) (the classic 1D optimum is \\( \omega \approx 2/3 \\)) is what
+earns the word "damped": undamped Jacobi barely touches the highest-frequency mode — it is
+an eigenvector with eigenvalue near \\( -1 \\), so it gets flipped in sign and hardly
+shrunk — and the damping is exactly what turns Jacobi into the high-frequency smoother
+multigrid needs.
 
 The multigrid insight is that a smooth error on a fine discretization looks *oscillatory*
 when viewed on a coarse one — so transfer the problem to a coarser level and let the
@@ -117,13 +121,12 @@ One full **V-cycle** — the shape that gives multigrid its name — does, recur
 5. **post-smooth** on the fine level.
 
 Going *down* the V handles progressively lower-frequency error on progressively coarser
-levels; coming back *up* carries the corrections home. One V-cycle is the preconditioner:
-inside CG, each iteration applies one V-cycle as \\( M^{-1} \\). The result is an iteration
-count that grows far more slowly with \\( p \\) and \\( h \\) than unpreconditioned CG.
-
-> 🎓 **Reviewer:** The intuition is correct and the length is right — don't expand it. One honesty caveat worth a clause, though: using a V-cycle as a CG preconditioner is only strictly legitimate if the preconditioner is **symmetric positive-definite**, because CG needs \\( M^{-1} \\) SPD to preserve the conjugacy it's built on. A V-cycle is SPD only if you make it so deliberately — symmetric smoother schedule (same number of pre- and post-smooths, and for Gauss–Seidel you'd reverse the sweep direction on the way up). Damped-Jacobi is symmetric already, so gale is fine, but a reader who later swaps in Gauss–Seidel and sees CG stall will want to have known this. One sentence: "the V-cycle is built symmetric (matched pre/post-smoothing) so it remains a valid SPD preconditioner for CG." That's the kind of trap this book is good at pre-empting.
-
-> 🎓 **Reviewer (deepen):** Why *damped* Jacobi — the \\( \omega \\) is doing real work and is currently unexplained. Undamped Jacobi (\\( \omega=1 \\)) on a Laplacian doesn't even smooth: the highest-frequency mode is an eigenvector with eigenvalue near \\( -1 \\), so it's *amplified in sign* and barely damped in magnitude — useless as a smoother. The damping (\\( \omega \approx 2/3 \\) is the classic 1D optimum) is what turns Jacobi into an actual high-frequency smoother, which is the one job multigrid needs it to do. Half a sentence here pays off the word "damped" you're already using.
+levels; coming back *up* carries the corrections home. The V-cycle is built symmetric
+(matched pre- and post-smoothing) so it remains a valid SPD preconditioner for CG, which
+relies on \\( M^{-1} \\) being SPD to preserve its conjugacy. One V-cycle is the
+preconditioner: inside CG, each iteration applies one V-cycle as \\( M^{-1} \\). The result
+is an iteration count that grows far more slowly with \\( p \\) and \\( h \\) than
+unpreconditioned CG.
 
 A caveat the strategy document is careful about: the *best* preconditioner is
 mesh-dependent — cheap p-multigrid wins on regular meshes, but on highly distorted meshes
@@ -140,13 +143,17 @@ defined only **up to an additive constant**. In operator terms, \\( A\,\mathbf{1
 the constant vector \\( \mathbf{1} \\) is in the **nullspace** of the pressure operator,
 which is thus **singular**.
 
-CG on a singular system misbehaves. The right-hand side may have a small spurious component
-along \\( \mathbf{1} \\) (from discretization and rounding); CG has no way to resolve that
-component — there is no finite solution for it — so the iteration **drifts** along the
-nullspace and the residual stops dropping cleanly, sometimes failing the tolerance test
-entirely. The fix is **deflation**: explicitly project the nullspace out of the iteration.
-
-> 🎓 **Reviewer (flag):** The mechanism is right but the framing buries the actual culprit, which is a **consistency (compatibility) condition**, not just "drift." A singular system \\( A x = b \\) with \\( A\mathbf{1}=0 \\) and \\( A \\) symmetric has a solution *if and only if* \\( b \perp \mathbf{1} \\) (the right-hand side has zero mean) — that's the Fredholm alternative, and physically it's the discrete statement that the net mass source must balance for an all-Neumann pressure problem. If \\( b \\) has a nonzero mean component, there is **no** solution at all, and CG can't converge because you've asked it to solve an inconsistent system — that's the real reason it stalls, sharper than "drifts along the nullspace." The clean way to say it: deflation does *two* jobs at once — (1) it removes the \\( \mathbf{1} \\)-component of the **residual/RHS**, enforcing the consistency condition so a solution exists; and (2) it pins the solution to the unique zero-mean representative. Right now the text only tells the (2) story. Worth getting right because "remove the mean of the residual each iteration" works precisely *because* it's also projecting \\( b \\) onto the consistent subspace.
+A singular SPD system \\( A x = b \\) with \\( A\mathbf{1} = 0 \\) has a solution *if and
+only if* the right-hand side satisfies the **consistency (compatibility) condition**
+\\( b \perp \mathbf{1} \\) — i.e. \\( b \\) has zero mean. This is the Fredholm alternative,
+and physically it is the discrete statement that the net mass source must balance for an
+all-Neumann pressure problem. In practice \\( b \\) carries a small spurious mean component
+(from discretization and rounding), so the system handed to CG is slightly *inconsistent*:
+there is no finite solution for that component, the iteration drifts along the nullspace,
+and the residual stops dropping cleanly — sometimes failing the tolerance test entirely.
+The fix is **deflation**, which does two jobs at once: it removes the \\( \mathbf{1} \\)-
+component of the residual (enforcing the consistency condition so a solution exists) and it
+pins the iterate to the unique zero-mean representative.
 
 Since the nullspace is the constants, projecting it out just means **removing the mean**,
 
@@ -158,9 +165,11 @@ applied to the residual at every iteration. With the constant component continuo
 removed, CG sees an effectively SPD system on the orthogonal complement and converges to
 the unique zero-mean pressure — which is all the projection in Chapter 6 needs, because
 only \\( \nabla p \\) matters and the gradient is blind to the constant. gale's pressure
-solver applies exactly this mean-removal each iteration.
-
-> 🎓 **Reviewer:** Minor terminology, take it or leave it: what gale does — projecting out the *known* constant nullspace — is more precisely **nullspace projection** (or "singular CG with the consistency projection"). "Deflation" in the Krylov literature usually means the heavier machinery of projecting out a subspace of approximate eigenvectors to accelerate convergence (deflated CG / deflated GMRES). They coincide here because the deflation subspace *is* the nullspace, so the name isn't wrong — but a reader who later searches "deflated CG" will land on the fancier method and wonder where the recycling/eigenvector estimation went. One parenthetical ("this is the nullspace-projection special case of deflation") would inoculate them.
+solver applies exactly this mean-removal each iteration. (Strictly, projecting out the
+*known* constant nullspace is the nullspace-projection special case of deflation; the term
+"deflated CG" in the Krylov literature usually means the heavier machinery of projecting
+out approximate eigenvectors, which coincides here because the deflation subspace *is* the
+nullspace.)
 
 ## The GPU residency / hybrid pattern
 

@@ -1,18 +1,15 @@
 # Elliptic Operators: The Interior-Penalty Method
 
-> 🎓 **Reviewer — chapter verdict:** Strong load-bearing chapter — the three-term anatomy and the "two ways to break τ" framing are genuinely well done and stay blog-readable. It earns a stickler's pass on two points: the coercivity argument is asserted rather than argued (the penalty must beat the *symmetry* term's indefinite part, but the reader is never shown that the inverse-trace bound is what sets the threshold — the two halves are described in separate sections and never joined), and a couple of phrasings ("positive-definite at all", "blows up like τ") need tightening.
-
 [Chapter 4](04-hyperbolic.md) handled transport — the part of fluid motion where
 information races along characteristics and stability is won by *adding dissipation* in
 the right places. This chapter is about the opposite kind of operator and the opposite
 kind of danger. **Elliptic** operators — diffusion-like, built around the Laplacian
 \\( -\nabla^2 \\) — have no characteristics and no preferred direction; a disturbance
 anywhere is felt *everywhere* instantly. They are the slow, global, expensive part of a
-fluid solver, and getting them stable means not "drain the right energy" but "build a
-discrete operator that is positive-definite at all." This chapter is the story of one
-parameter that decides whether that is true.
-
-> 🎓 **Reviewer (rewrite):** "build a discrete operator that is positive-definite at all" reads as a typo-level stumble — the "at all" dangles. You mean: the danger isn't energy leaking out of the system, it's that the discrete operator might not be positive-definite *in the first place*. Try: "...getting them stable isn't about *draining* the right energy (as in Chapter 4) — it's about making sure the discrete operator is positive-definite *to begin with*. Get that wrong and there is no solution to find, stable or otherwise." Cleaner contrast, and it lands the elliptic-vs-hyperbolic pivot you're setting up.
+fluid solver, and getting them stable isn't about *draining* the right energy (as in
+Chapter 4) — it's about making sure the discrete operator is positive-definite *to begin
+with*. Get that wrong and there is no solution to find, stable or otherwise. This chapter
+is the story of one parameter that decides whether that is true.
 
 ## Why elliptic operators are the hot path
 
@@ -76,13 +73,19 @@ the bilinear form **symmetric** in \\( u \\) and \\( v \\). Why insist on that? 
 symmetric bilinear form yields a **symmetric matrix**, and symmetry is not cosmetic — it
 is the property that unlocks the conjugate gradient solver and gives the method clean
 *adjoint consistency* (the discrete adjoint problem is also consistent, which is what
-delivers the optimal high-order convergence rate). It is consistent to add because for the
+delivers the optimal high-order convergence rate). That accuracy payoff is concrete: the
+symmetric form converges in the \\( L^2 \\) norm at the full rate \\( h^{p+1} \\), whereas
+dropping the adjoint term (the non-symmetric NIPG/IIPG variants) costs a full power —
+\\( L^2 \\) error degrades to \\( h^{p} \\), and on even-degree elements can be worse. The
+reason is a duality (Aubin–Nitsche) argument: the \\( L^2 \\) estimate borrows accuracy
+from the adjoint problem, and only the symmetric form makes the discrete adjoint
+consistent. So the symmetry term is not just "free symmetry for CG" — it buys a full order
+of accuracy in the norm that matters, and that is the historically correct reason SIPG
+won. It is consistent to add because for the
 true solution \\( [u]=0 \\), so this term vanishes on the exact solution and does not spoil
 consistency. We pay a price for it, though: with the symmetry term added, the consistency
 term alone is no longer enough to keep the operator positive. That is what the third term
 fixes.
-
-> 🎓 **Reviewer (deepen):** This is the cleanest passage in the chapter, and you can make the adjoint-consistency payoff land harder with one glossed sentence, because right now "optimal high-order convergence rate" is asserted in passing and a newcomer won't know what's at stake. The mechanism worth glossing: the symmetric (SIPG) form converges in the \\( L^2 \\) norm at the full rate \\( h^{p+1} \\), whereas dropping the adjoint term (the NIPG/IIPG variants) costs you a power — \\( L^2 \\) error degrades to \\( h^{p} \\) (and on even-degree elements can be even worse). The reason is a Nitsche/Aubin–Lions duality argument: the \\( L^2 \\) estimate borrows accuracy from the *adjoint* problem, and only the symmetric form makes the discrete adjoint consistent. So the adjoint term isn't just "free symmetry for CG" — it's buying you a full order of accuracy in the norm that matters. That's a much stronger motivation than "it makes the matrix symmetric," and it's the historically correct reason SIPG won.
 
 **The penalty term** \\( +\oint \tau\,[u][v] \\). This is the stability term. It penalizes
 the jump in the solution directly: the larger the discontinuity across a face, the larger
@@ -92,9 +95,17 @@ discontinuous), it *weakly* discourages discontinuity with a stiffness \\( \tau 
 \\( \tau \\) large enough, the penalty term dominates the indefinite contribution the
 symmetry term introduced, and the whole operator becomes **coercive** (positive-definite).
 With \\( \tau \\) too small, it does not, and the operator is indefinite and the solver
-fails. Which brings us to the one number that matters.
+fails.
 
-> 🎓 **Reviewer (flag):** This is the chapter's central stability claim and it's *asserted*, not *argued* — and the missing step is exactly the one a sharp reader will ask about. You say the penalty must "dominate the indefinite contribution the symmetry term introduced," but you never say *how big* that contribution is, so "τ large enough" is left as magic. The actual coercivity sketch is one line and worth it: bound the two cross terms with Young's inequality, \\( 2\{\nabla u\cdot\mathbf{n}\}[u] \le \epsilon\,h\,\{\nabla u\cdot\mathbf{n}\}^2 + \tfrac{1}{\epsilon h}[u]^2 \\); the first piece is reabsorbed into the volume gradient energy *using the inverse-trace inequality* (which is what bounds the face-gradient by the volume energy with constant \\( \sim (p+1)^2/h \\)), and the leftover \\( \tfrac{1}{\epsilon h}[u]^2 \\) is what the penalty \\( \tau[u]^2 \\) must beat. That is why the very same constant \\( (p+1)^2/h \\) shows up in the threshold — the indefinite part the penalty fights *is* the inverse-trace constant. As written, the "indefinite contribution" here and the "\\((p+1)^2/h\\)" two sections down are never connected, so the reader is told the answer twice without being told they're the same fact. Join them: that connection is the whole intellectual payoff of the section.
+How big is that indefinite contribution, exactly? The one-line coercivity sketch answers
+it. Bound the two cross terms with Young's inequality,
+\\( 2\{\nabla u\cdot\mathbf{n}\}[u] \le \epsilon\,h\,\{\nabla u\cdot\mathbf{n}\}^2 + \tfrac{1}{\epsilon h}[u]^2 \\):
+the first piece is reabsorbed into the volume gradient energy *using the inverse-trace
+inequality* (which bounds the face-gradient by the volume energy with a constant
+\\( \sim (p+1)^2/h \\)), and the leftover \\( \tfrac{1}{\epsilon h}[u]^2 \\) is precisely
+what the penalty \\( \tau[u]^2 \\) must beat. So the indefinite part the penalty fights
+*is* the inverse-trace constant — which is why the very same \\( (p+1)^2/h \\) reappears in
+the threshold below. Which brings us to the one number that matters.
 
 ## The penalty parameter: the stability knob
 
@@ -119,24 +130,29 @@ accuracy degradation; it is a hard failure.
 
 **Too large ⇒ ill-conditioning.** If \\( \tau \\) is far above what is needed, the operator
 is still SPD, but the penalty term now dominates everything and the **condition number**
-of \\( A \\) blows up like \\( \tau \\). A Krylov solver's iteration count grows with the
+of \\( A \\) grows linearly in \\( \tau \\). A Krylov solver's iteration count grows with the
 square root of the condition number, so the solve gets slow — and slow matters when this
-is the per-step bottleneck. Worse, an enormous penalty over-stiffens the weak continuity
-and can actually *degrade accuracy*. So \\( \tau \\) must be large enough to be stable and
-no larger.
-
-> 🎓 **Reviewer:** The CG bound is right (\\( \#\text{iters} \sim \sqrt{\kappa} \\)) and the "linear in τ" conditioning scaling is the standard result — good. One honest footnote you could add in half a clause: the SIPG condition number is already \\( O(p^4/h^2) \\) from the operator itself even at the *minimal* τ, so τ-inflation makes a bad situation worse rather than creating it from nothing. That's also the real reason Chapter 7's p-multigrid preconditioner exists, so a forward-pointer here ("which is one reason the raw operator needs preconditioning at all — Ch. 7") would tie the knot nicely.
+is the per-step bottleneck. It is worth being honest that the SIPG operator is already
+ill-conditioned at the *minimal* \\( \tau \\) — its condition number is \\( O(p^4/h^2) \\)
+from the discretization itself — so \\( \tau \\)-inflation worsens a bad situation rather
+than creating one from nothing; this is one reason the raw operator needs preconditioning
+at all ([Chapter 7](07-solvers.md)'s p-multigrid). Worse still, an enormous penalty
+over-stiffens the weak continuity and can actually *degrade accuracy*. So \\( \tau \\) must
+be large enough to be stable and no larger.
 
 **Why \\( (p+1)^2/h \\), specifically.** The threshold is set by a sharp inequality from
 finite-element analysis — the **inverse trace inequality** — which bounds the size of a
 polynomial's normal gradient *on the face* by its size *in the volume*. For a degree-\\( p \\)
 polynomial on an element of size \\( h \\), that boundary-gradient term scales like
-\\( (p+1)^2/h \\): it grows quadratically with the polynomial order (higher-order
-polynomials have steeper gradients packed near the element edges) and inversely with
-element size (smaller elements have sharper gradients). The penalty has to *beat* this
-term to guarantee coercivity, so it must scale the same way — hence \\( \tau \propto (p+1)^2/h \\).
-
-> 🎓 **Reviewer (flag):** Two precision issues in an otherwise good intuition. (1) "higher-order polynomials have steeper gradients packed near the element edges" is a heuristic dressed as the reason — the actual source of the \\( p^2 \\) is the inverse-trace constant for the Markov-brothers-type bound on the unit element; it's worth flagging it as *intuition for* the \\( p^2 \\), not the derivation, so a careful reader doesn't go looking for an edge-clustering argument that isn't quite the mechanism. (2) "inversely with element size (smaller elements have sharper gradients)" conflates two different \\( h \\)-effects — the \\( 1/h \\) in the inverse-trace bound is the geometric scaling of the *face measure relative to the volume* under the reference-to-physical map, not a statement that the solution's gradient is physically sharper on small elements (it needn't be). Minor, but you're being a stickler about τ elsewhere, so be one here: say it's a *mapping/scaling* factor, not a physical-sharpness claim.
+\\( (p+1)^2/h \\): it grows quadratically with the polynomial order and inversely with
+element size. The \\( p^2 \\) is the inverse-trace constant for the Markov-brothers-type
+bound on the reference element; as *intuition* (not the derivation), think of higher-order
+polynomials as having steeper gradients packed near the element edges. The \\( 1/h \\) is
+the geometric scaling of the face measure relative to the volume under the
+reference-to-physical map — a mapping/scaling factor, not a claim that the solution's
+gradient is physically sharper on small elements (it need not be). The penalty has to
+*beat* this term to guarantee coercivity, so it must scale the same way — hence
+\\( \tau \propto (p+1)^2/h \\).
 This is the reason the parameter is not a free fudge factor but a precisely shaped
 quantity: it is the minimum stiffness that dominates the worst the geometry and polynomial
 order can throw at it. In gale's `Poisson::penalty`, \\( h \\) on an interior face is taken
@@ -166,17 +182,11 @@ to that adjoint term.
 
 ## The diagonal mass matrix, and why it is a gift
 
-Chapter 3 established that GLL **collocation** makes the mass matrix \\( M \\) **diagonal**
-— "mass lumping." It is worth restating *why*, because the elliptic operator exploits it
-twice. The nodal basis functions are Lagrange polynomials: each is \\( 1 \\) at its own GLL
-node and \\( 0 \\) at every other node. The mass matrix entry \\( M_{ij}=\int \phi_i\phi_j \\)
-is computed by GLL quadrature *using those very same nodes*. The integrand \\( \phi_i\phi_j \\)
-is sampled only at the nodes, where it is zero unless \\( i=j \\) — so every off-diagonal
-entry is exactly zero and \\( M = \mathrm{diag}(Jw) \\), the Jacobian-weighted quadrature
-weights. (This is an *aliasing* of the mass integral, in the Chapter 4 sense, but here it
-is entirely benign and in fact the point.)
-
-> 🎓 **Reviewer (cut):** This paragraph re-derives mass lumping from scratch — "each is 1 at its own node and 0 at every other node... sampled only at the nodes, where it is zero unless i=j" — but you already told the reader this is "established in Chapter 3." Re-deriving it here is the one spot the chapter drifts from blog into FEM-lecture. Trim to a one-sentence reminder ("Recall from Ch. 3: collocating the basis on the same GLL nodes used for quadrature zeros every off-diagonal, so \\( M = \mathrm{diag}(Jw) \\)") and spend the saved space on the two *gifts*, which are the genuinely new and useful content. Keep the parenthetical aliasing aside — that one earns its place.
+Recall from Chapter 3 that GLL **collocation** — putting the basis on the same GLL nodes
+used for quadrature — zeros every off-diagonal of the mass matrix \\( M \\), so
+\\( M = \mathrm{diag}(Jw) \\), the Jacobian-weighted quadrature weights ("mass lumping").
+(This is an *aliasing* of the mass integral, in the Chapter 4 sense, but here it is
+entirely benign and in fact the point.) The elliptic operator exploits this twice.
 
 Two gifts follow.
 
@@ -230,7 +240,14 @@ lives on the complement of the nullspace. gale's `cg_deflated` (and its GPU twin
 `neumann_poisson_converges_up_to_a_constant` verifies it recovers \\( \cos\pi x\cos\pi y \\)
 up to the expected free constant.
 
-> 🎓 **Reviewer (flag):** The nullspace setup is correct and the Ch. 7 hand-off is clean, but there's a solvability condition you've left implicit that belongs here because it's a classic source of silent divergence: a singular system \\( A p = b \\) only has a solution if \\( b \perp \ker A \\), i.e. the RHS must have zero mean (the discrete compatibility / Fredholm condition). For the pressure-Poisson this is the discrete analogue of \\( \oint \mathbf{u}\cdot\mathbf{n} = 0 \\), and if the velocity field fed in isn't discretely divergence-compatible, deflating the *iterate* won't save you — the residual never reaches zero. "Subtract the mean each step" handles the nullspace of \\( A \\); it does not by itself guarantee the RHS is in the range. Worth one sentence so the reader knows deflation is necessary but not sufficient. The full deflation story belongs to
+Deflation is necessary but not sufficient: a singular system \\( A p = b \\) has a solution
+only if \\( b \perp \ker A \\), i.e. the right-hand side must have zero mean (the discrete
+compatibility, or Fredholm, condition — the discrete analogue of
+\\( \oint \mathbf{u}\cdot\mathbf{n} = 0 \\)). Subtracting the mean each step handles the
+*nullspace* of \\( A \\); it does not by itself put the RHS in the range, so if the velocity
+field fed in is not discretely divergence-compatible the residual never reaches zero.
+
+The full deflation story belongs to
 [Chapter 7](07-solvers.md); the point here is that the *boundary condition choice* of the
 flow solver is what makes the operator singular in the first place.
 

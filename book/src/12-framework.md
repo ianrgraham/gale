@@ -1,7 +1,5 @@
 # The Simulation Framework and Validation
 
-> 🎓 **Reviewer — chapter verdict:** The validation half of this chapter is excellent and the "CPU is the oracle" discipline is conveyed as the genuinely smart move it is — the "silently, with a plausible-looking wrong number" paragraph is the emotional core and lands hard. My one structural worry: the chapter front-loads a lot of framework taxonomy (integrator families, four-homes rule, hooks vs computes) before it gets to the validation payoff, and a blog reader's attention is finite. The "two integrator families" section is the most interesting framework idea and is well-argued (the "forcing a projection into method-of-lines would be a lie" line is great); the "four-homes rule" is the most at-risk of reading as bookkeeping. Consider whether the chapter is really *two* posts — "how you assemble a sim" and "how we know it's right" — because the second is strong enough to stand alone and is currently buried below the fold.
-
 The last chapter explained how gale's operators run on the GPU. This one is about the
 layer *above* the operators — the part a user actually touches. How do you take the
 pieces this book has built — a hyperbolic operator, an elliptic solver, a projection
@@ -66,8 +64,6 @@ incompressibility, then an implicit viscous Helmholtz *solve*. A pressure projec
 is a constraint solve, not a term you can add to \\\( \partial_t u \\\). Trying to force
 it into the method-of-lines shape would be a lie.
 
-> 🎓 **Reviewer:** This is the right call and well-argued — "a pressure projection is a constraint solve, not a term you can add to ∂ₜu" is the sentence a reader will remember, and refusing to fake an additive interface for it is exactly the kind of honest design choice worth dwelling on. Praise noted; don't touch it. (If you want one more drop of intuition: the deeper reason is that projection methods are *fractional-step* — they deliberately split the operator and accept a splitting error in exchange for turning one hard saddle-point system into a sequence of nice SPD solves. Method-of-lines integrators assume the rhs *is* the dynamics; a fractional step is a sequence that is only the dynamics *after* all the stages compose. That's why it can't be a `StateSemi`.)
-
 So gale uses **one trait, multiple families** (the "one `Integrator` trait" idea from
 `api-design.md`). Both `Mol` and the structured `DualSplitting` implement the same
 `StateIntegrator` trait — `dt()` and `step(state, hook)` — but they honor it
@@ -88,8 +84,10 @@ integrators look identical from the outside.
 
 ## Hooks and computes: the "four homes" rule
 
-Where does a given piece of physics *live*? `api-design.md` answers this with the
-**four-homes rule**: every contribution lands in exactly one of {Equations, Term,
+A spectral filter and an immersed-solid projection are completely different physics,
+yet in gale they are the *same kind of object*. The rule that tells you why is the
+question of where a given piece of physics *lives*, which `api-design.md` answers with
+the **four-homes rule**: every contribution lands in exactly one of {Equations, Term,
 Integrator, StageHook}, and which one is a question about the *numerical treatment*,
 not the physics.
 
@@ -113,12 +111,10 @@ A **`Compute`** is the read-only counterpart: a diagnostic pulled from the state
 demand, never mutating it — the hydrodynamic-drag report `F = ∫ (χ/η_b)(u − u_s)`
 that goes with the penalization, kinetic energy, max-Weissenberg, and so on.
 
-> 🎓 **Reviewer (rewrite):** The section *says* "this taxonomy is not bureaucracy" — which is a tell that you're worried it reads like bureaucracy, and it slightly does. The fix isn't to argue harder, it's to lead with the payoff instead of the rule. Right now the structure is: (1) here is a four-way classification, (2) here is the decision rule, (3) here are two examples, (4) trust me it's not bureaucracy. Invert it: open with the concrete tension — "a filter and an immersed-solid projection are completely different physics, yet in gale they are *the same kind of object*. Here's the rule that tells you why." Then the four homes arrive as the explanation for a surprise the reader already feels, rather than a taxonomy they have to hold in their head before they know what it buys. Same content, momentum restored.
-
-This taxonomy is not bureaucracy. It is what lets the framework stay composable: a
-filter and a penalization projection are *different physics* but the *same kind of
-operation* (a per-stage `u ← g(u)`), so they plug into the same `StageHook` seam, and
-any integrator picks them up uniformly.
+The payoff is composability: a filter and a penalization projection are *different
+physics* but the *same kind of operation* (a per-stage `u ← g(u)`), so they plug into
+the same `StageHook` seam, and any integrator picks them up uniformly. That shared
+shape — not the physics — is exactly what the four-homes rule classifies.
 
 ## How the GPU plugs into the same seams
 
@@ -155,19 +151,25 @@ is then validated *against that oracle*, not against the physics directly.
 The mechanism is a fleet of small `*-check` binaries in `gale-gpu/src/bin/` — one per
 operator (`advection_check`, `poisson_cg_check`, `euler_check`, `logconf_check`,
 `penalize_check`, `ns_check`, `ve_check`, and so on). Each one builds the same problem
-two ways, runs the CPU oracle and the GPU kernel, and compares them **bit-for-bit**,
-demanding agreement to roughly \\\( 10^{-14} \\\) relative — machine precision, not a
-loose tolerance. The advection check is representative: it constructs a mesh, runs
-`gale::dg::Hyperbolic` on the CPU and `gale_gpu::advection_rhs` on the device, and
-asserts `max|gpu − cpu| / |op| < 1e-10`, typically landing near \\\( 4\times10^{-16} \\\).
+two ways, runs the CPU oracle and the GPU kernel, and compares them to
+**floating-point round-off** — agreement to roughly \\\( 10^{-15} \\\) relative, machine
+precision, not a loose tolerance. The advection check is representative: it constructs
+a mesh, runs `gale::dg::Hyperbolic` on the CPU and `gale_gpu::advection_rhs` on the
+device, and asserts `max|gpu − cpu| / |op| < 1e-10`, typically landing near
+\\\( 4\times10^{-16} \\\). That residual last bit is not a bug: a GPU fused multiply-add
+(FMA) contracts `a*b+c` into a single rounding where the CPU may round twice, so a
+*correct* port routinely differs in the last bit or two — that is the floating-point
+standard at work, not an error. Accordingly, most checks demand agreement to round-off
+(the FMA-level difference you would expect from a faithful port), while a subset that
+avoid fused or reordered arithmetic are genuinely **bit-for-bit identical** — zero
+difference.
 
-> 🎓 **Reviewer (flag):** Be careful with "bit-for-bit" as the headline phrase when the actual assertion is `< 1e-10` and the achieved number is ~4e-16. Those are three different claims and the prose uses all three interchangeably. *Bit-for-bit* means identical bit patterns — zero difference — and you do say "several exact (zero difference)" later, so the term is earned for *some* kernels but not the advection one you hold up as representative, which agrees to round-off, not to the bit. This matters because a GPU FMA (fused multiply-add) contracts `a*b+c` into one rounding where the CPU may do two, so a *correct* port routinely differs in the last bit or two — that's the 4e-16, and it is not a bug, it's the FP standard. I'd state this explicitly: most checks are "agree to floating-point round-off (≈1e-15, the FMA-level difference you'd expect from a correct port)," and a *subset* that avoid fused/reordered arithmetic are genuinely bit-identical. Right now the chapter slightly over-claims "bit-for-bit" across the board, and a hardware-literate reader will catch it — better to own the FMA story, which is more impressive anyway because it shows you know exactly *why* the last bit moves.
 This is why the *deterministic, race-free* gather formulation of Chapter 11 matters
 so much: a racy kernel could never be pinned to an oracle this tightly. Across gale's
 operator set these checks come in at \\\( 10^{-14} \\\) to \\\( 10^{-16} \\\), with several
 *exact* (zero difference).
 
-Three complementary layers sit around the bit-for-bit checks:
+Three complementary layers sit around the oracle checks:
 
 - **Manufactured solutions (MMS)** check the *physics*, not just CPU↔GPU agreement.
   You pick an exact solution, derive the source term that makes it satisfy the
@@ -189,10 +191,13 @@ Why this much discipline? Because a young GPU stack fails in the worst possible 
 **silently, with a plausible-looking wrong number.** A dropped write, a pointer
 bitcast omitted, an off-by-one in a flux index — none of these throw an error; they
 just shift the answer. The only defense is an independent, trusted reference and an
-unforgiving comparison. The CPU oracle is that reference, and the bit-for-bit check is
-> 🎓 **Reviewer (deepen):** This paragraph — "fails silently, with a plausible-looking wrong number" — is the heart of the whole chapter and the single best justification for the oracle discipline. Keep it. Worth adding the practitioner punchline that makes it bite even harder: the reason the CPU oracle is *trustworthy* as a reference isn't that it's correct in some absolute sense — it's that the CPU and GPU implementations fail *independently*. An off-by-one in a flux index would have to be made identically in two separately-written codebases to escape detection, and that essentially never happens. That's the real engineering content of "independent reference": not that the oracle is right, but that two implementations are unlikely to be wrong the *same way*. Say that and the discipline stops sounding like belt-and-suspenders and starts sounding like the only thing that actually works.
-
-that comparison. This is the engineering analogue of the numerical-stability care
+unforgiving comparison. The CPU oracle is that reference, and the round-off check is
+that comparison. What makes the oracle trustworthy is not that it is correct in some
+absolute sense — it is that the CPU and GPU implementations fail *independently*. An
+off-by-one in a flux index would have to be made identically in two separately-written
+codebases to escape detection, and that essentially never happens; the real content of
+"independent reference" is that two implementations are unlikely to be wrong the *same
+way*. This is the engineering analogue of the numerical-stability care
 elsewhere in the book: there, the worry was that an accurate-on-paper scheme produces
 `NaN` on a real problem; here, the worry is that a fast GPU kernel produces a number
 that is wrong by \\\( 10^{-3} \\\) and nobody notices. Both are defeated by asking, at

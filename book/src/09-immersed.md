@@ -1,7 +1,5 @@
 # Immersed Boundaries and Particles
 
-> 🎓 **Reviewer — chapter verdict:** This is the strongest "stability story" chapter in the book — the explicit-vs-implicit penalization argument is correct, well-motivated, and lands the β→∞ punchline cleanly. The rigid→deformable→two-phase ladder is honestly framed and the "does it return to a reference shape?" litmus test is a genuinely good organizing idea. Two gaps keep it from being airtight: (1) the accuracy section conflates two distinct convergence axes (penalty error in η_b vs spatial error in h/p) under the single word "first-order," and (2) it omits the one thing every IBM practitioner gets burned by — the smeared mask is *not* a smooth field a high-order polynomial can represent, so you get Gibbs oscillations at the interface, and that is the real reason low η_b is double-edged. Fix those and this chapter is excellent.
-
 So far we have solved fluid flow inside a fixed box. The headline application —
 particle-laden suspensions — needs *objects in the flow*: a cylinder to flow past, a
 disk to drag downstream, eventually a whole crowd of particles tumbling through a
@@ -37,9 +35,11 @@ give up exact, high-order resolution of the surface — the boundary now lives *
 elements, smeared over roughly a cell — but you gain enormous geometric freedom:
 arbitrary shapes, arbitrary motion, arbitrarily many bodies, topology changes (particles
 touching and separating) all for free, on a mesh that never changes. For moving bodies
-and suspensions, that trade is the whole game.
-
-> 🎓 **Reviewer:** Good, honest framing. One thing a newcomer should be told here, because it bites *immediately* on a high-order method: "smeared over roughly a cell" is not just a resolution penalty, it is a *smoothness* penalty. The mask χ jumps from 0 to 1 across the body surface, and a degree-\\( p \\) polynomial cannot represent a step without ringing (Gibbs). So the smeared boundary is the price you pay to keep the *field* representable at all — which is also why the `tanh` smoothing of the mask, mentioned later, is not cosmetic. Worth one sentence here so the reader expects the oscillation problem before it shows up.
+and suspensions, that trade is the whole game. And on a high-order method the smearing is
+not merely a resolution penalty but a *smoothness* one: the mask jumps from 0 to 1 across
+the surface, and a degree-\\( p \\) polynomial cannot represent a step without ringing
+(Gibbs), so smearing the boundary is the price of keeping the field representable at all —
+which is why the `tanh` smoothing of the mask, below, is not cosmetic.
 
 > **The honest tension.** Body-fitted = accurate surface, painful geometry. Immersed =
 > trivial geometry, smeared surface. gale uses *both*: static body-fitted meshes for
@@ -77,9 +77,15 @@ with three ingredients:
   porous medium's relaxation time: the smaller \\( \eta_b \\), the stiffer the drag and the
   more strictly the no-slip constraint is enforced. As \\( \eta_b \to 0 \\) the masked
   region behaves as a perfect rigid solid; the modelling error of a finite \\( \eta_b \\)
-  scales like \\( \sqrt{\eta_b} \\) for a no-slip (Dirichlet) surface.
-
-> 🎓 **Reviewer (deepen):** This is exactly the place to say *why low \\( \eta_b \\) is a double-edged sword*, because the reader will otherwise conclude "just take \\( \eta_b \\) as small as floating point allows." Driving \\( \eta_b \to 0 \\) shrinks the *modelling* error (the \\( \sqrt{\eta_b} \\) boundary-layer slip), but the penalized solution then develops an internal boundary layer of thickness \\( \sim\sqrt{\nu\,\eta_b} \\) right at the mask edge — and your mesh has to resolve *that* layer or the high-order element rings across it. So the two error sources pull in opposite directions: too-large \\( \eta_b \\) leaks flow through the body; too-small \\( \eta_b \\) creates a sub-cell layer the polynomial cannot see, and you get spurious oscillations and a noisy drag signal. The practitioner's rule of thumb is to balance the penalty layer against the local mesh size, not to minimize \\( \eta_b \\) blindly. The fact that gale's tests sit at \\( 10^{-3} \\)–\\( 10^{-4} \\) rather than \\( 10^{-8} \\) is precisely this balance — worth saying so out loud.
+  scales like \\( \sqrt{\eta_b} \\) for a no-slip (Dirichlet) surface. But \\( \eta_b \\)
+  is double-edged: driving it toward zero shrinks that modelling slip, yet the penalized
+  solution then grows an internal boundary layer of thickness \\( \sim\sqrt{\nu\,\eta_b} \\)
+  at the mask edge, and unless the mesh resolves *that* layer the high-order element rings
+  across it. The two errors pull opposite ways — too large leaks flow through the body, too
+  small hides a sub-cell layer the polynomial cannot see — so the rule of thumb is to
+  balance the penalty layer against the local mesh size rather than minimize \\( \eta_b \\)
+  blindly. That is exactly why gale's tests sit at \\( 10^{-3} \\)–\\( 10^{-4} \\), not
+  \\( 10^{-8} \\).
 
 So far this is just an extra term in the momentum equation. The interesting part — the
 part this chapter is really about — is *how you integrate it in time*.
@@ -100,8 +106,6 @@ time step — and the stiffer (more rigid) we make the body, the smaller the ste
 take. Explicit penalization makes \\( \Delta t \to 0 \\) exactly in the limit we care about.
 This is the same villain as in every other chapter: a physically reasonable scheme that
 is unconditionally *unstable* for the regime of interest.
-
-> 🎓 **Reviewer:** This argument is correct and it is the heart of the chapter — keep it exactly as is. One tiny precision so a careful reader doesn't trip: forward Euler on \\( \dot u = -(\chi/\eta_b)(u-u_s) \\) is stable for \\( \Delta t < 2\eta_b/\chi \\) (the factor of 2), so "\\( \Delta t \lesssim \eta_b \\)" is right in spirit and right in scaling. The scaling is the whole point, so I would not clutter the prose with the 2 — just flagging that the inequality is an order-of-magnitude statement, which the "\\( \lesssim \\)" already signals. No change needed.
 
 The cure is to integrate the relaxation **implicitly** (backward Euler). The drag ODE
 \\( \dot{\mathbf{u}} = -(\chi/\eta_b)(\mathbf{u}-\mathbf{u}_s) \\), solved implicitly over a
@@ -135,14 +139,16 @@ rather than as an additive source.
 
 Volume penalization buys stability and geometric freedom, but it has a known, documented
 weakness: it **smears the boundary over roughly a cell** and is only about **first-order
-accurate at the interface** — in fact the no-slip velocity error scales like
-\\( \sqrt{\eta_b} \\), and the polymer-stress field does not even converge pointwise right
-at the surface. High polynomial order \\( p \\) does *not* rescue this: spectral accuracy
-needs a smooth field within the element, and the penalized solution is *not* smooth across
-a sharp body surface. So high \\( p \\) still pays off in the bulk (the matrix flow, the
+accurate at the interface**. Two distinct knobs limit accuracy here, and it helps to keep
+them apart: the *penalty* \\( \eta_b \\), whose modelling error (the no-slip velocity slip)
+scales like \\( \sqrt{\eta_b} \\) as \\( \eta_b \to 0 \\); and the *mesh* \\( h \\), whose
+discretization error is the \\( O(h) \\), first-order-at-the-interface story as \\( h \to 0 \\).
+Both bottom out at low order near the surface, and the polymer-stress field does not even
+converge pointwise right at the body. High polynomial order \\( p \\) does *not* rescue this
+on either axis: spectral accuracy needs a smooth field within the element, and the penalized
+solution is *not* smooth across a sharp body surface — it is that lack of smoothness that
+caps the order. So high \\( p \\) still pays off in the bulk (the matrix flow, the
 stress transport of Chapter 8), but near the body the interface error dominates.
-
-> 🎓 **Reviewer (flag):** Two genuinely different error axes are being braided together under the word "first-order," and a sharp reader will catch the seam. There is the *penalty* error (how close the model is to true no-slip), which scales like \\( \sqrt{\eta_b} \\) as \\( \eta_b \to 0 \\); and there is the *discretization* error (how well the mesh resolves the smeared/penalized solution), which is the \\( O(h) \\) / "first-order at the interface" story as \\( h \to 0 \\). The paragraph slides from "\\( \sqrt{\eta_b} \\)" (penalty axis) to "first-order accurate at the interface" (spatial axis) to "the near-surface field is only half-order" (back to penalty axis) without naming the switch. The claims are individually defensible, but the reader can't tell whether you're refining \\( \eta_b \\) or \\( h \\). I'd add one clause: "two knobs limit accuracy here — the penalty \\( \eta_b \\) and the mesh \\( h \\) — and both bottom out at low order near the surface." Then the "high \\( p \\) doesn't rescue this" point is unambiguous: it's the *smoothness* of the penalized field that caps the order, on either axis.
 
 The good news, and the reason this remains usable, is that **integrated quantities still
 converge**: the net force and torque on the body are first-order accurate even though the
@@ -201,11 +207,11 @@ flow and pushes back — genuine two-way **fluid–structure interaction**. This
 with forces spread to the fluid and the fluid velocity interpolated back to advect the
 markers (a Peskin-style front-tracking coupling). It is harder because the interface
 *moves with its own physics* and you must watch membrane stiffness (a new time-step
-constraint), area/volume conservation, and locking. gale has only a *foundation* here
+constraint — the same kind of stiffness villain we defeated implicitly above, and the
+reason stiff membranes call for implicit or semi-implicit integration), area/volume
+conservation, and locking. gale has only a *foundation* here
 (`src/dg/membrane.rs`: a DG-basis spread/interpolate pair and a stretching-spring capsule
 that relaxes stably) — not a validated deformable-particle solver.
-
-> 🎓 **Reviewer:** Honestly scoped, and right to name the membrane-stiffness time-step constraint — that explicit elastic-force CFL (\\( \Delta t \lesssim \sqrt{m\,h/k} \\) in the stiff-membrane limit) is the classic Peskin-IBM killer and the reason people reach for implicit or semi-implicit membrane integrators. Worth one half-sentence that this stiffness constraint is the *same kind of villain* as the penalty stiffness you just defeated in section "Why apply it implicitly" — it ties the ladder back to the chapter's throughline and tells the reader the cure (implicit treatment) is already familiar. Don't expand beyond that; the rung is planned, not built, and the section correctly resists over-claiming.
 
 **(c) True two-phase flow — planned/parked.** Here the "particle" is *itself a fluid* — a
 droplet of one fluid in another (e.g. a viscoelastic drop in a Newtonian matrix) — with an

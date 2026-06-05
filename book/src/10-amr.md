@@ -1,7 +1,5 @@
 # Adaptive Mesh Refinement
 
-> 🎓 **Reviewer — chapter verdict:** The best section here is "Three properties the mortar must have" — each property is argued as a genuine *requirement* with a named failure mode (leak / phantom free-stream kink / CG stalls), which is exactly the "what breaks if you skip it" framing the mandate wanted, and it's correct. The symmetry-preservation argument in particular is the kind of insight most textbooks assert and never justify; gale's book earns it. Two things to fix: the Persson–Peraire description is a defensible simplification but drops the one feature that makes it *Persson–Peraire* (the log-scale / single-mode comparison against a \\( p \\)-dependent threshold), and the conservation Jacobian arithmetic (the "½ × ½ = ¼" sentence) is currently a magic-numbers claim a reader can't follow. The honesty about the p-/hp gap is appropriately handled and not over-claimed — leave that alone.
-
 The features that matter in gale's target flows are *thin and local*. The viscoelastic
 stress boundary layers of Chapter 8 collapse into birefringent strands a fraction of a
 millimetre wide. The immersed interface of Chapter 9 is smeared over a cell that you would
@@ -23,9 +21,7 @@ representation inside its neighbors; the only thing you must handle is the *flux
 shared face*, which DG already treats as a first-class object. AMR in a continuous
 finite-element method requires fussy constraint equations to keep the solution continuous
 across a refinement boundary; in DG it reduces to "what is the flux across a mismatched
-face?" That is the entire technical content of this chapter.
-
-> 🎓 **Reviewer:** This is the right hook and it's correct — DG buys you AMR almost for free precisely because the coupling is already a face object. Keep it. The one nuance worth a clause: "the only thing you must handle is the flux" is true for the *hyperbolic* operator, but the elliptic SIPG operator also couples *gradients* across the face, which is why section "Three properties" has to worry about symmetry at all. You half-acknowledge this later ("the gradient and its transpose are also an adjoint pair"); a forward nod here ("for elliptic operators there's a second trace — the gradient — but the same mortar handles it") would stop a sharp reader thinking the flux is the whole story.
+face?" That is the entire technical content of this chapter. (For the elliptic operators there is a second trace — the gradient — coupled across the face as well, but the same mortar handles it.)
 
 ## The flavors of adaptivity
 
@@ -103,13 +99,12 @@ Whatever mass or momentum leaves the coarse element across that face must arrive
 gets this wrong, the discrete conservation law has a *leak at every non-conforming
 interface*, and in a suspension with hundreds of such interfaces those leaks accumulate
 into spurious mass/momentum sources that corrupt the whole solution. gale's mortar is
-conservative by construction: the conservative restriction carries a \\( \tfrac12 \\)
-Jacobian, and the geometry conspires so that (coarse-edge Jacobian \\( \tfrac12 \\)) \\(\times\\)
-(mortar restriction \\( \tfrac12 \\)) equals the fine-edge Jacobian \\( \tfrac14 \\). The tests
-
-> 🎓 **Reviewer (flag):** As written this is magic-number arithmetic — \\( \tfrac12 \times \tfrac12 = \tfrac14 \\) is arithmetically obvious but the reader has no idea *what* these three Jacobians are or why two of them should multiply to the third. The real statement is geometric and worth one clean sentence: each fine half-edge is *half the length* of the coarse edge, so the fine-edge surface Jacobian is half the coarse-edge one; the mortar restriction \\( P^{T} \\) carries the matching \\( \tfrac12 \\) so that summing the two half-edge contributions exactly reconstitutes the coarse-edge integral. (The "\\( \tfrac14 \\)" only appears if you're measuring against a 2D *element* Jacobian rather than an *edge* Jacobian — which is it? Right now the reader can't tell, and the dimensional bookkeeping looks off: a 1D edge integral picks up a 1D length factor, not an area factor.) Please pin down whether these are edge or element Jacobians and state the length-halving explicitly; the conclusion is correct, the derivation as shown is unfollowable.
-
-The tests
+conservative by construction, and the bookkeeping is purely geometric. Each fine half-edge
+is *half the length* of the coarse edge, so its surface (edge) Jacobian is half the
+coarse-edge one; the conservative restriction \\( P^{T} \\) carries the matching
+\\( \tfrac12 \\) factor, so that summing the two half-edge contributions — each already
+weighted by its halved edge Jacobian — exactly reconstitutes the single coarse-edge
+integral. The tests
 confirm the coarse-edge flux integral equals the sum of the fine half-edge integrals to
 \\( 10^{-12} \\), and that a refined mesh's total rate of change matches the analytic
 outer-boundary flux to \\( 10^{-9} \\).
@@ -139,9 +134,10 @@ its transpose are also an adjoint pair — the SIPG operator stays symmetric acr
 hanging node. The test verifies \\( \langle A u, v\rangle = \langle A v, u\rangle \\) to
 \\( 10^{-9} \\) on a refined mesh, and a manufactured solve converges. This is why the same
 mortar serves both the hyperbolic flux and the elliptic operator: conservation and
-consistency keep the flux right; symmetry preservation keeps CG (Chapter 7) working.
-
-> 🎓 **Reviewer:** This is the best paragraph in the chapter. "Use \\( P \\) and its *exact* transpose, or CG loses its convergence guarantee" is a real requirement with a real, named failure mode, and most treatments simply assert "the mortar must be adjoint-consistent" and move on. The throughline payoff — same mortar, three properties, three different things that break — is genuinely satisfying. Keep verbatim. (If you wanted to twist the knife one notch: a *non*-symmetric mortar doesn't always blow up loudly; it often just degrades CG into a slow stall that looks like a preconditioner problem, so people waste days before suspecting the mortar. That "it fails quietly" detail is what a practitioner would add.)
+consistency keep the flux right; symmetry preservation keeps CG (Chapter 7) working. The insidious part is that a
+non-symmetric mortar rarely blows up loudly; more often it just degrades CG into a slow
+stall that looks like a preconditioner problem, so the mortar is the last thing anyone
+suspects.
 
 ## Where to refine: the smoothness indicator
 
@@ -158,10 +154,12 @@ modes:
 \\]
 
 A smooth, well-resolved field gives \\( s_e \approx 0 \\); a pure top-mode field gives
-\\( s_e = 1 \\); an under-resolved oscillation lands in between. Elements whose indicator
-exceeds a threshold are flagged for refinement
-
-> 🎓 **Reviewer (flag):** The *intuition* (spectral decay = smoothness) is exactly right and well told, but as a description of the *Persson–Peraire* indicator specifically it's missing the two features that make it that indicator rather than a generic high-mode-energy ratio. PP (Persson & Peraire 2006) (1) typically compares the energy in the *single highest mode* (or the top mode against the field minus its top mode), not a band of "top modes," and (2) crucially works on a **logarithmic** scale, \\( s_e = \log_{10}(\text{top-mode energy}/\text{total}) \\), then compares against a threshold that *scales like* \\( \sim 1/p^4 \\) — because for a smooth field the modal energy decays algebraically and the natural resolution scale is \\( p \\)-dependent. The linear \\( s_e \in [0,1] \\) "fraction of energy" you describe is a reasonable cousin and may well be what gale actually computes — but then it's a simplification of PP, not PP itself, and the chapter should either (a) say "a Persson–Peraire-*style* decay measure" or (b) describe the log/\\( p^{-4} \\) threshold. As stated, a reader who later reads the PP paper will be confused that the formulas don't match. Cheap fix: one sentence acknowledging the log-scale, \\( p \\)-dependent threshold, or soften to "PP-style."
+\\( s_e = 1 \\); an under-resolved oscillation lands in between. (The original
+Persson–Peraire measure is a touch sharper: it compares the *single highest mode* against
+the total on a **logarithmic** scale and tests it against a threshold that scales like
+\\( \sim 1/p^4 \\), since for a smooth field the modal energy decays algebraically and the
+natural resolution scale is \\( p \\)-dependent. gale's linear top-mode fraction is a
+PP-style simplification of the same idea.)
 
 Elements whose indicator
 exceeds a threshold are flagged for refinement — for example the high-stress strands at a
@@ -219,9 +217,11 @@ indicator, not the IB mask. Closing this would mean generalizing the mortar from
 machinery, with a rectangular 1D operator between mismatched-order traces — giving each
 element its own order, and adding an IB-targeted refinement band. That is the documented
 path forward (Chapter 13); it is honestly *not built yet*, and localized hp-refinement is
-how one would eventually make the immersed boundaries of Chapter 9 high-order accurate.
-
-> 🎓 **Reviewer:** The honesty here is well-judged — neither defensive nor over-promising — and "generalize the mortar from an \\( h \\)-projection to a \\( (p_L\!\to\!p_R) \\) projection" is *exactly* the right characterization of the gap; that's the same Galerkin-projection machinery with a rectangular operator, and it's good that the book names it precisely rather than waving at "future work." One caution so the reader doesn't underestimate the lift: \\( p \\)-adaptivity isn't *only* a mortar change. A per-element \\( p \\) axis ripples through the whole data layout — `Mesh2d`'s "single uniform order" assumption (you flag this earlier) is baked into how nodal arrays are sized and how the GPU kernels are launched with a compile-time order. So "the same machinery, with a rectangular 1D operator" is true at the *math* layer but undersells the *engineering* (variable-length per-element state, divergent kernel launches). Worth half a sentence, because a newcomer reading this might think it's a weekend's work on one operator.
+how one would eventually make the immersed boundaries of Chapter 9 high-order accurate. The
+rectangular mortar is only the *math* layer of the lift, though: a per-element \\( p \\) axis
+also ripples through the data layout — `Mesh2d`'s single-uniform-order assumption is baked
+into how nodal arrays are sized and how the GPU kernels launch with a compile-time order, so
+variable-length per-element state and divergent kernel launches are part of the price.
 
 ## How gale does it
 
