@@ -74,6 +74,48 @@ stiffly-stable schemes, and possibly IMEX treatments of the coupling, are a know
 (Chapter 6). Worth doing once spatial accuracy and stability are no longer the binding
 constraint.
 
+### Temporal adaptivity: local time-stepping and local implicitness *(researched, parked)*
+gale takes one global time step everywhere. A refined small cell, or a stiff
+high-stress region, can force that global step to be tiny — the temporal analogue of the
+spatial waste that AMR exists to remove. The fix is **temporal adaptivity**, and a
+dedicated, adversarially-verified research pass (`docs/implicit-solver-strategy.md §3b`)
+mapped the design space and reached a deliberately cautious conclusion: it is *designed*
+but not built, and the order in which to build it is not the obvious one.
+
+The pass turned on a single distinction — *why* is a cell's step small?
+
+- **A small cell with a fast local speed is CFL-limited** → the cure is **local
+  time-stepping (LTS)**: let different cells subcycle at different rates.
+- **A high-stress, slowly-relaxing cell is stiffness-limited** (relaxation $ \sim 1/\mathrm{Wi} $,
+  the high-Weissenberg problem of Chapter 8) → the cure is **local implicitness / IMEX**:
+  treat *only* the stiff cells implicitly, the rest explicitly.
+
+These are different mechanisms with different cures, and the order matters for gale
+specifically, for two architectural reasons. First, **our spine is implicit**: the
+incompressible solve is a dual-splitting projection with a *global* pressure-Poisson
+every step (Chapters 6–7), which couples the whole domain regardless of any local time
+step. So LTS can only ever accelerate the **explicit substeps — advection and
+conformation-stress transport** — never the flow solve, and its payoff is Amdahl-bounded
+by that global solve. Second, **gale's hard cells are stiff, not CFL-limited**:
+high-Weissenberg stress layers are stiffness-plus-under-resolution. The prescribed cure
+for them is therefore **spatial AMR + local implicit/IMEX, not smaller explicit steps** —
+which makes locally-implicit/IMEX treatment of the stiff coupling the genuinely valuable
+near-term temporal upgrade, ranking *above* LTS proper.
+
+If LTS is ever built, the research pins down the only viable form: **cluster-based,
+power-of-2, level-batched** subcycling (the SeisSol design — per-element *asynchronous*
+LTS is GPU-hostile), with **2:1 temporal grading** between neighbors (the time analogue
+of the 2:1 spatial balance of Chapter 10, so time-refinement tracks $h$-refinement). One
+sharp trap is recorded: for a projection/dual-splitting solver, classical
+**Berger–Colella refluxing is the *wrong* correctness mechanism** at coarse↔fine time
+interfaces — the conservation fix that works for explicit hyperbolic AMR does not carry
+over. Two genuine gaps remain open even in the literature: the multirate
+method-of-lines order conditions for a fast-explicit-transport / slow-implicit-pressure
+split, and the LTS × immersed-boundary interaction.
+
+The one concrete thing to preserve now, ahead of any implementation, is a **per-cell
+time-level** in the time-integration abstraction, so this is addable without a rewrite.
+
 ### Performance *(open problem)*
 gale has been built **correctness-first**: every kernel is validated bit-for-bit against
 the CPU oracle (Chapter 12), but it has not had a systematic performance pass. A roofline
