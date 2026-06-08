@@ -68,15 +68,15 @@ standing start is a real climb.
 
 Mathematical conventions used throughout (collected in the [Appendix](appendix-notation.md)):
 
-- \\( \mathbf{u} = (u, v, w) \\) is velocity, \\( p \\) pressure, \\( t \\) time.
+- $ \mathbf{u} = (u, v, w) $ is velocity, $ p $ pressure, $ t $ time.
 - Bold lowercase = vectors, bold uppercase or sans = tensors/matrices, e.g. the
-  conformation tensor \\( \mathbf{C} \\).
-- \\( \nabla \cdot \\) is divergence, \\( \nabla \\) gradient, \\( \nabla^2 = \Delta \\)
+  conformation tensor $ \mathbf{C} $.
+- $ \nabla \cdot $ is divergence, $ \nabla $ gradient, $ \nabla^2 = \Delta $
   the Laplacian.
-- \\( \rho \\) density, \\( \mu \\) (or \\( \eta \\)) viscosity, \\( \nu = \mu/\rho \\)
+- $ \rho $ density, $ \mu $ (or $ \eta $) viscosity, $ \nu = \mu/\rho $
   kinematic viscosity.
-- "Element" = one cell of the mesh; \\( p \\) (overloaded with pressure, but the meaning
-  is always clear from context) = the polynomial degree inside an element; \\( h \\) = a
+- "Element" = one cell of the mesh; $ p $ (overloaded with pressure, but the meaning
+  is always clear from context) = the polynomial degree inside an element; $ h $ = a
   representative element size.
 
 > **A word on honesty.** gale is a research code under active construction. Where a

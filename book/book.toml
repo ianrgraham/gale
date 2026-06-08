@@ -3,10 +3,18 @@ title = "The Theory of gale — DG, Immersed Boundaries & Viscoelastic Flow on t
 authors = ["Ian Graham", "Claude (Anthropic)"]
 description = "A from-the-ground-up guide to the numerical methods behind gale: discontinuous Galerkin spectral elements, incompressible and viscoelastic flow, immersed boundaries, adaptivity, and their GPU implementation — with the reasoning (especially numerical stability) behind each design choice."
 language = "en"
+# Set explicitly: mdbook 0.5 otherwise emits `text-direction: null`, which the
+# mdbook-katex 0.9.4 config deserializer rejects (it expects a concrete value).
+text-direction = "ltr"
 src = "src"
 
+[preprocessor.katex]
+# Renders math at build time, BEFORE the markdown pass, so LaTeX spacing (\, \;),
+# subscripts (_{...}), and brackets can't be mangled by pulldown-cmark. Replaces the
+# old `mathjax-support` (client-side render after markdown, which corrupted math).
+# Delimiters: $...$ inline, $$...$$ block.
+
 [output.html]
-mathjax-support = true
 default-theme = "rust"
 git-repository-url = "https://github.com/ianrgraham/gale"
 additional-css = []

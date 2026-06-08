@@ -46,7 +46,7 @@ Here is the most interesting design decision in the framework, and it is forced 
 the physics this book covers.
 
 The obvious way to advance a PDE in time is the **method of lines**: write the
-spatial discretization as an ODE \\\( \partial_t u = \mathrm{rhs}(u) \\\), then march it
+spatial discretization as an ODE \$ \partial_t u = \mathrm{rhs}(u) \$, then march it
 with a standard time-stepper. This is exactly right for the hyperbolic/transport
 operators of Chapter 4. In gale a `StateSemi` (semidiscretization) defines that
 right-hand side — a base operator per evolving field, plus additive cross-field
@@ -61,7 +61,7 @@ dual-splitting projection scheme is not "sum up some right-hand-side contributio
 and step." It is a structured sequence of *stages* that depend on each other: an
 explicit convection/body-force substep, then a pressure-Poisson *solve* to enforce
 incompressibility, then an implicit viscous Helmholtz *solve*. A pressure projection
-is a constraint solve, not a term you can add to \\\( \partial_t u \\\). Trying to force
+is a constraint solve, not a term you can add to \$ \partial_t u \$. Trying to force
 it into the method-of-lines shape would be a lie.
 
 So gale uses **one trait, multiple families** (the "one `Integrator` trait" idea from
@@ -92,14 +92,14 @@ Integrator, StageHook}, and which one is a question about the *numerical treatme
 not the physics.
 
 The decision rule, simplified: if a contribution is additive
-(\\\( \partial_t u \mathrel{+}= f(u) \\\)) it is a **Term**. If it is a solve or a stiff
+(\$ \partial_t u \mathrel{+}= f(u) \$) it is a **Term**. If it is a solve or a stiff
 split, it belongs to the **Integrator**. And if it is a relaxation of the form
-\\\( u \leftarrow g(u) \\\) — applied *to* the solution rather than added to its
+\$ u \leftarrow g(u) \$ — applied *to* the solution rather than added to its
 derivative — it is a **StageHook**, run between RK stages.
 
 The implicit **volume-penalization** projection of Chapter 9 is the textbook
 StageHook. Brinkman penalization drives the velocity inside an immersed solid toward
-the body's velocity by the relaxation \\\( u \leftarrow (u + \beta\,u_s)/(1+\beta) \\\).
+the body's velocity by the relaxation \$ u \leftarrow (u + \beta\,u_s)/(1+\beta) \$.
 That is `u ← g(u)`, not an additive rhs term — so by the four-homes rule it is a
 `StateStageHook`, applied after each integrator stage, **not** a `Term`. gale's
 `PenalizationHook` is exactly that, wrapping the validated `VolumePenalization`
@@ -152,11 +152,11 @@ The mechanism is a fleet of small `*-check` binaries in `gale-gpu/src/bin/` — 
 operator (`advection_check`, `poisson_cg_check`, `euler_check`, `logconf_check`,
 `penalize_check`, `ns_check`, `ve_check`, and so on). Each one builds the same problem
 two ways, runs the CPU oracle and the GPU kernel, and compares them to
-**floating-point round-off** — agreement to roughly \\\( 10^{-15} \\\) relative, machine
+**floating-point round-off** — agreement to roughly \$ 10^{-15} \$ relative, machine
 precision, not a loose tolerance. The advection check is representative: it constructs
 a mesh, runs `gale::dg::Hyperbolic` on the CPU and `gale_gpu::advection_rhs` on the
 device, and asserts `max|gpu − cpu| / |op| < 1e-10`, typically landing near
-\\\( 4\times10^{-16} \\\). That residual last bit is not a bug: a GPU fused multiply-add
+\$ 4\times10^{-16} \$. That residual last bit is not a bug: a GPU fused multiply-add
 (FMA) contracts `a*b+c` into a single rounding where the CPU may round twice, so a
 *correct* port routinely differs in the last bit or two — that is the floating-point
 standard at work, not an error. Accordingly, most checks demand agreement to round-off
@@ -166,7 +166,7 @@ difference.
 
 This is why the *deterministic, race-free* gather formulation of Chapter 11 matters
 so much: a racy kernel could never be pinned to an oracle this tightly. Across gale's
-operator set these checks come in at \\\( 10^{-14} \\\) to \\\( 10^{-16} \\\), with several
+operator set these checks come in at \$ 10^{-14} \$ to \$ 10^{-16} \$, with several
 *exact* (zero difference).
 
 Three complementary layers sit around the oracle checks:
@@ -200,7 +200,7 @@ codebases to escape detection, and that essentially never happens; the real cont
 way*. This is the engineering analogue of the numerical-stability care
 elsewhere in the book: there, the worry was that an accurate-on-paper scheme produces
 `NaN` on a real problem; here, the worry is that a fast GPU kernel produces a number
-that is wrong by \\\( 10^{-3} \\\) and nobody notices. Both are defeated by asking, at
+that is wrong by \$ 10^{-3} \$ and nobody notices. Both are defeated by asking, at
 every step, *what could be wrong here, and what are we doing to catch it?*
 
 ## How gale does it

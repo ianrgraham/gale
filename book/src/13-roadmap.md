@@ -41,7 +41,7 @@ hp-IBM paper) is ahead of gale, and it matters for exactly gale's problems: it i
 clean way to recover the accuracy that volume-penalized immersed boundaries (Chapter 9)
 and steep viscoelastic stress layers (Chapter 8) lose, by raising the order *only* where
 it is needed. The design — generalize the mortar to a rectangular degree-projection
-\\( P(p_\text{from} \to p_\text{to}) \\), carry per-element degree in the mesh, and add a
+$ P(p_\text{from} \to p_\text{to}) $, carry per-element degree in the mesh, and add a
 "by-order batched" GPU launch — is written up in `docs/hp-adaptivity-and-ibm-gaps.md`.
 The 2D non-conforming GPU mortar plumbing built in Chapter 10 is the prerequisite, and it
 now exists, so this is unblocked.

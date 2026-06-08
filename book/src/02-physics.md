@@ -18,24 +18,24 @@ Fluid dynamics is bookkeeping. Two quantities are conserved — mass and momentu
 the governing equations are just the statement that they cannot appear or vanish, only
 move around and be pushed.
 
-**Mass.** For a fluid of density \\( \rho \\) moving with velocity \\( \mathbf{u} \\), the
+**Mass.** For a fluid of density $ \rho $ moving with velocity $ \mathbf{u} $, the
 mass in any fixed region changes only by flux through its boundary:
 
-\\[
+$$
 \frac{\partial \rho}{\partial t} + \nabla\cdot(\rho\,\mathbf{u}) = 0.
-\\]
+$$
 
 **Momentum.** Newton's second law, written per unit volume: the rate of change of
 momentum equals the forces acting. The forces are the *surface stresses* the surrounding
-fluid exerts (gathered into a stress tensor \\( \boldsymbol{\sigma} \\)) plus any body
-force \\( \mathbf{f} \\) (gravity, an immersed-boundary penalty force):
+fluid exerts (gathered into a stress tensor $ \boldsymbol{\sigma} $) plus any body
+force $ \mathbf{f} $ (gravity, an immersed-boundary penalty force):
 
-\\[
+$$
 \rho\left(\frac{\partial \mathbf{u}}{\partial t} + (\mathbf{u}\cdot\nabla)\mathbf{u}\right)
 = \nabla\cdot\boldsymbol{\sigma} + \mathbf{f}.
-\\]
+$$
 
-The term \\( (\mathbf{u}\cdot\nabla)\mathbf{u} \\) is *advection* — the fluid carrying its
+The term $ (\mathbf{u}\cdot\nabla)\mathbf{u} $ is *advection* — the fluid carrying its
 own momentum along with it. It is nonlinear, and it is the source of most of the
 interesting (and most of the unstable) behavior in high-Reynolds flow. Keep an eye on
 it; later chapters spend real effort taming it.
@@ -43,26 +43,26 @@ it; later chapters spend real effort taming it.
 ## The stress tensor, and what makes a fluid "Newtonian"
 
 Everything physical about *which* fluid we are simulating is hidden in the stress tensor
-\\( \boldsymbol{\sigma} \\). Splitting it into an isotropic pressure part and a
+$ \boldsymbol{\sigma} $. Splitting it into an isotropic pressure part and a
 deviatoric (shape-changing) part:
 
-\\[
+$$
 \boldsymbol{\sigma} = -p\,\mathbf{I} + \boldsymbol{\tau}.
-\\]
+$$
 
-The \\( -p\,\mathbf{I} \\) term is pressure: it pushes equally in all directions and only
-resists *volume* change. The deviatoric part \\( \boldsymbol{\tau} \\) is where the
+The $ -p\,\mathbf{I} $ term is pressure: it pushes equally in all directions and only
+resists *volume* change. The deviatoric part $ \boldsymbol{\tau} $ is where the
 material's personality lives. For a **Newtonian** fluid — water, air, glycerin — stress
 is simply proportional to the local rate of strain:
 
-\\[
+$$
 \boldsymbol{\tau} = \mu\left(\nabla\mathbf{u} + \nabla\mathbf{u}^{\mathsf T}\right),
-\\]
+$$
 
-where \\( \mu \\) is the (dynamic) viscosity. The combination
-\\( \nabla\mathbf{u} + \nabla\mathbf{u}^{\mathsf T} \\) is twice the symmetric
-rate-of-strain tensor \\( \mathbf{D} \\); using the symmetric (physical) gradient here,
-rather than just \\( \nabla\mathbf{u} \\), turns out to matter for a subtle stability
+where $ \mu $ is the (dynamic) viscosity. The combination
+$ \nabla\mathbf{u} + \nabla\mathbf{u}^{\mathsf T} $ is twice the symmetric
+rate-of-strain tensor $ \mathbf{D} $; using the symmetric (physical) gradient here,
+rather than just $ \nabla\mathbf{u} $, turns out to matter for a subtle stability
 property called *pressure-robustness* that Chapter 6 returns to. The key feature of a
 Newtonian fluid is that it has **no memory**: the stress *right now* depends only on the
 deformation rate *right now*. Stop shearing it and the stress vanishes instantly. Much
@@ -73,28 +73,28 @@ of this chapter is about what happens when that stops being true.
 In the microfluidic world gale targets, flow speeds are far below the speed of sound, so
 density variations are negligible: the fluid is **incompressible**. Mass conservation
 then collapses to the statement that the velocity field is divergence-free, and with
-constant \\( \rho \\) and \\( \mu \\) the momentum equation becomes the incompressible
+constant $ \rho $ and $ \mu $ the momentum equation becomes the incompressible
 Navier–Stokes equations:
 
-\\[
+$$
 \rho\left(\frac{\partial \mathbf{u}}{\partial t} + (\mathbf{u}\cdot\nabla)\mathbf{u}\right)
 = -\nabla p + \mu\,\nabla^2\mathbf{u} + \mathbf{f},
 \qquad
 \nabla\cdot\mathbf{u} = 0.
-\\]
+$$
 
 This is the workhorse system. The first equation evolves momentum; the
-\\( \mu\,\nabla^2\mathbf{u} \\) term is viscous diffusion (it smooths velocity and is the
-stiff, elliptic part that wants implicit treatment); \\( \mathbf{f} \\) is where polymers
+$ \mu\,\nabla^2\mathbf{u} $ term is viscous diffusion (it smooths velocity and is the
+stiff, elliptic part that wants implicit treatment); $ \mathbf{f} $ is where polymers
 and immersed bodies will enter as body forces.
 
 ### Incompressibility is a constraint, not an evolution equation
 
-Notice what the second equation is *not*. There is no \\( \partial p/\partial t \\)
+Notice what the second equation is *not*. There is no $ \partial p/\partial t $
 anywhere. Pressure has no evolution equation of its own. This is the single most
 important structural fact about incompressible flow, and it shapes the entire solver.
 
-The right way to read \\( \nabla\cdot\mathbf{u}=0 \\) is as a **constraint** the velocity
+The right way to read $ \nabla\cdot\mathbf{u}=0 $ is as a **constraint** the velocity
 must satisfy at every instant — like the rigidity constraint on a pendulum's arm. And
 just as a constraint force keeps the pendulum's length fixed, **pressure is the
 Lagrange multiplier that enforces incompressibility.** At each moment, pressure
@@ -111,75 +111,75 @@ the coupled velocity–pressure problem into a sequence of solvable pieces.
 
 ## The dimensionless numbers that define gale's regime
 
-A simulation does not really care about the dimensional values of \\( \rho \\), \\( \mu \\),
+A simulation does not really care about the dimensional values of $ \rho $, $ \mu $,
 or the channel width — it cares about their *ratios*. Two flows with the same
 dimensionless numbers behave the same. A handful of these numbers pin down gale's
 regime.
 
 **Reynolds number** — inertia versus viscosity:
 
-\\[
+$$
 Re = \frac{UL}{\nu} = \frac{\rho\,U L}{\mu},
-\\]
+$$
 
-with \\( U \\) a characteristic speed, \\( L \\) a length, and \\( \nu = \mu/\rho \\) the
-kinematic viscosity. High \\( Re \\) means inertia dominates: turbulence, sharp wakes, the
-nonlinear advection term running the show. Low \\( Re \\) means viscosity dominates: flow
-is smooth, slow, reversible, "creeping." **Microfluidics is firmly low-\\( Re \\)** —
-small \\( L \\), modest \\( U \\) — often \\( Re \ll 1 \\). The advection term is *weak*, which
+with $ U $ a characteristic speed, $ L $ a length, and $ \nu = \mu/\rho $ the
+kinematic viscosity. High $ Re $ means inertia dominates: turbulence, sharp wakes, the
+nonlinear advection term running the show. Low $ Re $ means viscosity dominates: flow
+is smooth, slow, reversible, "creeping." **Microfluidics is firmly low-$ Re $** —
+small $ L $, modest $ U $ — often $ Re \ll 1 $. The advection term is *weak*, which
 sounds like a simplification (and for stability of advection, it is). The price is that
 the stiff viscous and pressure parts now completely dominate, so the implicit elliptic
 solve is everything.
 
 For viscoelastic fluids we need two more numbers, because the fluid now has an internal
-clock — a relaxation time \\( \lambda \\), the time the polymer takes to "forget" a
+clock — a relaxation time $ \lambda $, the time the polymer takes to "forget" a
 deformation.
 
 **Weissenberg number** — elastic stretching versus relaxation:
 
-\\[
+$$
 Wi = \lambda\,\dot\gamma,
-\\]
+$$
 
-where \\( \dot\gamma \\) is a characteristic shear (strain) rate. \\( Wi \\) measures how
+where $ \dot\gamma $ is a characteristic shear (strain) rate. $ Wi $ measures how
 hard the flow is stretching the polymers relative to how fast they relax back. Low
-\\( Wi \\): polymers relax faster than the flow deforms them, elasticity is a mild
-perturbation. High \\( Wi \\): the flow stretches polymers faster than they recover, and
+$ Wi $: polymers relax faster than the flow deforms them, elasticity is a mild
+perturbation. High $ Wi $: the flow stretches polymers faster than they recover, and
 elastic stresses build up enormously. This is where viscoelastic flows do their
 spectacular, counterintuitive things.
 
 **Deborah number** — elastic memory versus the flow's own timescale:
 
-\\[
+$$
 De = \frac{\lambda}{t_{\text{flow}}},
-\\]
+$$
 
 the ratio of the relaxation time to a characteristic time of the flow itself. The two
 numbers are easy to conflate, but they measure genuinely different things, and the
-distinction is one practitioners actually argue about. \\( Wi \\) measures how much the
+distinction is one practitioners actually argue about. $ Wi $ measures how much the
 flow *stretches and deforms the microstructure* — it is built from a deformation *rate*,
-strong flow versus relaxation. \\( De \\) measures how *unsteady* the flow is on the
+strong flow versus relaxation. $ De $ measures how *unsteady* the flow is on the
 polymer's clock — the relaxation time versus the time over which a fluid element's
 *environment* changes as it passes an obstacle, traverses a contraction, or completes one
 oscillation. The reason you need *both* is the case that breaks the lazy intuition that
-they coincide: **steady simple shear has \\( Wi \\) arbitrarily large but \\( De = 0 \\)** —
+they coincide: **steady simple shear has $ Wi $ arbitrarily large but $ De = 0 $** —
 each fluid element sees an unchanging shear rate forever, so nothing is transient even
 though the polymers are hugely stretched. Conversely, small-amplitude oscillation can give
-large \\( De \\) at tiny \\( Wi \\). The two collapse to the same number only when the
+large $ De $ at tiny $ Wi $. The two collapse to the same number only when the
 single timescale setting the deformation rate is *also* the timescale over which an
 element's environment changes — flow through a periodic array of posts at one speed, say.
 gale's target instabilities are precisely where the flow is both strongly stretched (high
-\\( Wi \\)) *and* unsteady along a pathline (high \\( De \\)); the two numbers stop being
+$ Wi $) *and* unsteady along a pathline (high $ De $); the two numbers stop being
 redundant exactly in the regime we care about.
 
 ### Why this particular corner is where the interesting physics live
 
-Here is the crucial combination. Microfluidics gives us **low \\( Re \\)** (inertia is
-weak) — but nothing stops \\( Wi \\) from being **large**, because \\( Wi \\) depends on the
+Here is the crucial combination. Microfluidics gives us **low $ Re $** (inertia is
+weak) — but nothing stops $ Wi $ from being **large**, because $ Wi $ depends on the
 polymer relaxation time, not on inertia. You can have a slow, creeping, perfectly
 laminar-looking flow that is nonetheless violently elastic.
 
-That regime — low \\( Re \\), high \\( Wi \\) — is exactly where the famous *purely elastic
+That regime — low $ Re $, high $ Wi $ — is exactly where the famous *purely elastic
 instabilities* and *elastic turbulence* appear: chaotic, mixing flows driven entirely by
 polymer stress, with no inertia in sight. The engine is concrete: curved streamlines plus
 the tensile "hoop" stress along them feed back to amplify perturbations — the
@@ -200,42 +200,42 @@ small concentration of long, flexible polymer chains.
 In a quiescent fluid those chains are coiled up in a relaxed, high-entropy blob. When the
 flow shears or stretches the fluid, it stretches the chains, and like tiny springs they
 store elastic energy and pull back. Crucially, this pull-back is not instantaneous: the
-chains relax over the timescale \\( \lambda \\). So the stress in the fluid *now* depends
+chains relax over the timescale $ \lambda $. So the stress in the fluid *now* depends
 on the *history* of deformation — the fluid remembers. That memory is what makes
 "viscoelastic" simultaneously viscous (it dissipates, like a liquid) and elastic (it
 springs back, like a solid).
 
-Mechanically, the polymers contribute an extra stress \\( \boldsymbol{\tau}_p \\) that
+Mechanically, the polymers contribute an extra stress $ \boldsymbol{\tau}_p $ that
 *evolves in time* and gets added to the momentum balance:
 
-\\[
+$$
 \rho\left(\frac{\partial \mathbf{u}}{\partial t} + (\mathbf{u}\cdot\nabla)\mathbf{u}\right)
 = -\nabla p + \eta_s\,\nabla^2\mathbf{u} + \nabla\cdot\boldsymbol{\tau}_p + \mathbf{f},
 \qquad \nabla\cdot\mathbf{u}=0,
-\\]
+$$
 
-where \\( \eta_s \\) is the *solvent* viscosity and the polymer feeds back into the flow
-only through the divergence of its stress, \\( \nabla\cdot\boldsymbol{\tau}_p \\). The
-total zero-shear viscosity is \\( \eta_0 = \eta_s + \eta_p \\), with \\( \eta_p \\) the
+where $ \eta_s $ is the *solvent* viscosity and the polymer feeds back into the flow
+only through the divergence of its stress, $ \nabla\cdot\boldsymbol{\tau}_p $. The
+total zero-shear viscosity is $ \eta_0 = \eta_s + \eta_p $, with $ \eta_p $ the
 polymer contribution.
 
-The open question is: what determines \\( \boldsymbol{\tau}_p \\)? We need a *constitutive
+The open question is: what determines $ \boldsymbol{\tau}_p $? We need a *constitutive
 model* — an evolution law for the polymer stress. The standard, physically grounded way
 to track it is not the stress tensor directly but a **conformation tensor**
-\\( \mathbf{C} \\): roughly, a statistical measure of how stretched and oriented the polymer
+$ \mathbf{C} $: roughly, a statistical measure of how stretched and oriented the polymer
 chains are (its eigenvalues are stretch-squared along each principal direction, so for an
-unstretched fluid \\( \mathbf{C} = \mathbf{I} \\)). The conformation tensor obeys an
+unstretched fluid $ \mathbf{C} = \mathbf{I} $). The conformation tensor obeys an
 advection-stretch-relaxation equation, and the stress is read off from it, e.g. for the
-Oldroyd-B model \\( \boldsymbol{\tau}_p = (\eta_p/\lambda)(\mathbf{C}-\mathbf{I}) \\). The
+Oldroyd-B model $ \boldsymbol{\tau}_p = (\eta_p/\lambda)(\mathbf{C}-\mathbf{I}) $. The
 seed of the entire numerical disaster is already visible in the spring picture: those
-springs are *entropic and nonlinear in stretch*, so at high \\( Wi \\) the conformation
-eigenvalues (stretch-squared) blow up exponentially fast — and \\( \mathbf{C} \\) must stay
+springs are *entropic and nonlinear in stretch*, so at high $ Wi $ the conformation
+eigenvalues (stretch-squared) blow up exponentially fast — and $ \mathbf{C} $ must stay
 symmetric-positive-definite to even *mean* anything, since you cannot have a negative
-stretch-squared. A naive scheme that advects \\( \mathbf{C} \\) directly will, under a steep
+stretch-squared. A naive scheme that advects $ \mathbf{C} $ directly will, under a steep
 stress gradient, produce a negative eigenvalue, at which point the model is physically
 meaningless and the run dies. We develop this fully in Chapter 8 — including *why*
-\\( \mathbf{C} \\) must stay symmetric-positive-definite, why the obvious discretization
-fails to keep it so at high \\( Wi \\), and the log-conformation cure — and keeping those
+$ \mathbf{C} $ must stay symmetric-positive-definite, why the obvious discretization
+fails to keep it so at high $ Wi $, and the log-conformation cure — and keeping those
 exponentially growing eigenvalues positive is the entire fight of that chapter. For now,
 the high-level idea is enough: **a fluid with memory, whose memory is carried by an extra
 evolving tensor field.**

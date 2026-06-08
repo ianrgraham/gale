@@ -15,26 +15,26 @@ pattern that ties it together.
 
 ## Why matrix-free, iterative solvers
 
-The first instinct from a linear-algebra course is to *assemble* the matrix \\( A \\) and
+The first instinct from a linear-algebra course is to *assemble* the matrix $ A $ and
 factorize it (a direct solve) or hand it to an algebraic multigrid library. For high-order
 DG this is the wrong instinct, for a concrete and quantitative reason.
 
 The SIPG operator (Chapter 5) couples every node in an element to every other node in that
-element, plus the nodes across each face. On an element of polynomial degree \\( p \\) in
-\\( d \\) dimensions there are \\( (p+1)^d \\) nodes, and the element block is dense, so the
-assembled matrix has roughly \\( (p+1)^{2d} \\) nonzeros *per element*. In 3D at order 8
-that is \\( 9^6 \approx 5.3\times10^5 \\) entries per element — the matrix balloons in both
+element, plus the nodes across each face. On an element of polynomial degree $ p $ in
+$ d $ dimensions there are $ (p+1)^d $ nodes, and the element block is dense, so the
+assembled matrix has roughly $ (p+1)^{2d} $ nonzeros *per element*. In 3D at order 8
+that is $ 9^6 \approx 5.3\times10^5 $ entries per element — the matrix balloons in both
 memory and apply-cost as the order rises. The literature is blunt about this: assembling
-the operator at high \\( p \\) is "prohibitively expensive." On a Titan V's 12 GB of memory,
+the operator at high $ p $ is "prohibitively expensive." On a Titan V's 12 GB of memory,
 storing such a matrix for a real mesh is simply a non-starter.
 
-The way out is **matrix-free**: never form \\( A \\), only ever compute its *action* on a
-vector, \\( v \mapsto A v \\). That action is exactly the "apply" kernel from Chapter 5 —
+The way out is **matrix-free**: never form $ A $, only ever compute its *action* on a
+vector, $ v \mapsto A v $. That action is exactly the "apply" kernel from Chapter 5 —
 the volume stiffness, the symmetry lift, and the face penalty/consistency terms, evaluated
 on the fly. Done with the tensor-product (sum-factorization) structure of the spectral
-element, the apply costs only \\( O(p^{d+1}) \\) work per element instead of \\( O(p^{2d}) \\),
-and it touches only \\( O(p^d) \\) memory. The catch is that, with only the action of
-\\( A \\) available, you cannot do Gaussian elimination — you need a solver that asks for
+element, the apply costs only $ O(p^{d+1}) $ work per element instead of $ O(p^{2d}) $,
+and it touches only $ O(p^d) $ memory. The catch is that, with only the action of
+$ A $ available, you cannot do Gaussian elimination — you need a solver that asks for
 *nothing but* matrix–vector products. That is precisely what **Krylov subspace methods**
 provide, and it is why gale's elliptic solvers are all matrix-free iterative methods.
 
@@ -45,65 +45,65 @@ are **symmetric positive-definite** — which, by the design of Chapter 5, the S
 and Helmholtz operators are. (SIPG is built to be SPD on purpose; that is what makes CG
 applicable, and it is why "symmetric" is in the name.)
 
-The intuition is an energy minimization. Solving \\( A x = b \\) with \\( A \\) SPD is
+The intuition is an energy minimization. Solving $ A x = b $ with $ A $ SPD is
 equivalent to minimizing the quadratic energy
 
-\\[
+$$
   \phi(x) = \tfrac{1}{2}\,x^\top A x - b^\top x,
-\\]
+$$
 
-whose unique minimum is exactly \\( A x = b \\). A naïve descent would slide downhill along
-the residual \\( r = b - Ax \\), but successive steps interfere and zig-zag. CG's trick is to
+whose unique minimum is exactly $ A x = b $. A naïve descent would slide downhill along
+the residual $ r = b - Ax $, but successive steps interfere and zig-zag. CG's trick is to
 choose search directions that are **conjugate** — mutually orthogonal in the inner product
-defined by \\( A \\), i.e. \\( p_i^\top A p_j = 0 \\) for \\( i \neq j \\). Stepping along
+defined by $ A $, i.e. $ p_i^\top A p_j = 0 $ for $ i \neq j $. Stepping along
 conjugate directions means each step's progress is never undone by a later one, so in
-exact arithmetic CG reaches the solution in at most \\( n \\) steps, and in practice
+exact arithmetic CG reaches the solution in at most $ n $ steps, and in practice
 converges far sooner.
 
 The reason CG is perfect for the GPU is what each iteration needs:
 
-- one **matrix–vector product** \\( Ap \\) (our matrix-free apply),
-- a couple of **dot products** (to form the step length \\( \alpha \\) and the conjugacy
-  coefficient \\( \beta \\)),
-- a couple of **axpy** updates \\( y \leftarrow y + \alpha x \\) (advance the solution and
+- one **matrix–vector product** $ Ap $ (our matrix-free apply),
+- a couple of **dot products** (to form the step length $ \alpha $ and the conjugacy
+  coefficient $ \beta $),
+- a couple of **axpy** updates $ y \leftarrow y + \alpha x $ (advance the solution and
   the residual).
 
 No factorization, no matrix storage — just matvec, dot, and axpy, all of which are
 embarrassingly parallel. The one thing to watch is **convergence speed**, which is
-governed by the **condition number** \\( \kappa(A) \\): the number of iterations to a fixed
-tolerance scales like \\( \sqrt{\kappa} \\) — though that is only the worst-case bound. CG's
+governed by the **condition number** $ \kappa(A) $: the number of iterations to a fixed
+tolerance scales like $ \sqrt{\kappa} $ — though that is only the worst-case bound. CG's
 real convergence depends on the *whole spectrum*, not just its extremes: clustered
 eigenvalues converge superlinearly (CG "deflates" them as it goes) and a few stray large
 ones cost only a handful of extra iterations. This is the key to what follows —
-preconditioning helps precisely because it does not merely shrink \\( \kappa \\) but
-*clusters* the spectrum near 1. For the SIPG operators \\( \kappa \\) grows with
-resolution (smaller \\( h \\)) and with polynomial order \\( p \\). Unpreconditioned CG is
+preconditioning helps precisely because it does not merely shrink $ \kappa $ but
+*clusters* the spectrum near 1. For the SIPG operators $ \kappa $ grows with
+resolution (smaller $ h $) and with polynomial order $ p $. Unpreconditioned CG is
 fine for modest problems — and gale validates it directly — but on a real mesh the
 iteration count grows uncomfortably, which motivates the next layer.
 
 ## Preconditioning, and gale's p-multigrid
 
-A **preconditioner** is an operator \\( M^{-1} \approx A^{-1} \\) that is cheap to apply and
-makes the *preconditioned* system \\( M^{-1}A x = M^{-1} b \\) much better conditioned, so CG
-converges in far fewer iterations. The art is finding an \\( M^{-1} \\) that is a good
+A **preconditioner** is an operator $ M^{-1} \approx A^{-1} $ that is cheap to apply and
+makes the *preconditioned* system $ M^{-1}A x = M^{-1} b $ much better conditioned, so CG
+converges in far fewer iterations. The art is finding an $ M^{-1} $ that is a good
 approximate inverse without being as expensive as solving the original system.
 
 gale uses **p-multigrid**, the nekRS-style preconditioner that is the recommended choice
 in the solver-strategy document. To understand it, start with the observation that drives
-all multigrid: a cheap **smoother** — here a **damped-Jacobi** sweep, \\( x \leftarrow x +
-\omega\,D^{-1}(b - Ax) \\) with \\( D = \mathrm{diag}(A) \\) — is very good at killing the
+all multigrid: a cheap **smoother** — here a **damped-Jacobi** sweep, $ x \leftarrow x +
+\omega\,D^{-1}(b - Ax) $ with $ D = \mathrm{diag}(A) $ — is very good at killing the
 *high-frequency* (oscillatory) components of the error, but very bad at the *low-frequency*
 (smooth) components. A few Jacobi sweeps leave a smooth error that just sits there. The
-damping factor \\( \omega \\) (the classic 1D optimum is \\( \omega \approx 2/3 \\)) is what
+damping factor $ \omega $ (the classic 1D optimum is $ \omega \approx 2/3 $) is what
 earns the word "damped": undamped Jacobi barely touches the highest-frequency mode — it is
-an eigenvector with eigenvalue near \\( -1 \\), so it gets flipped in sign and hardly
+an eigenvector with eigenvalue near $ -1 $, so it gets flipped in sign and hardly
 shrunk — and the damping is exactly what turns Jacobi into the high-frequency smoother
 multigrid needs.
 
 The multigrid insight is that a smooth error on a fine discretization looks *oscillatory*
 when viewed on a coarse one — so transfer the problem to a coarser level and let the
 smoother kill it there cheaply, then transfer the correction back. "Coarse" in
-**p**-multigrid means **lower polynomial degree**: gale coarsens \\( p \to p-1 \to \cdots \\)
+**p**-multigrid means **lower polynomial degree**: gale coarsens $ p \to p-1 \to \cdots $
 down a chain of spectral-element levels on the *same* mesh, rather than coarsening the mesh
 itself. This is natural for DG-SEM, where the nodal basis at each order is readily
 interpolated to the next.
@@ -112,7 +112,7 @@ One full **V-cycle** — the shape that gives multigrid its name — does, recur
 
 1. **pre-smooth** on the fine level (a few damped-Jacobi sweeps to remove high-frequency
    error);
-2. compute the residual \\( r = b - Ax \\) and **restrict** it to the coarser (lower-order)
+2. compute the residual $ r = b - Ax $ and **restrict** it to the coarser (lower-order)
    level;
 3. recurse — smooth-restrict down to the coarsest level, where the system is small enough
    to solve cheaply (gale does a short inner CG there);
@@ -123,9 +123,9 @@ One full **V-cycle** — the shape that gives multigrid its name — does, recur
 Going *down* the V handles progressively lower-frequency error on progressively coarser
 levels; coming back *up* carries the corrections home. The V-cycle is built symmetric
 (matched pre- and post-smoothing) so it remains a valid SPD preconditioner for CG, which
-relies on \\( M^{-1} \\) being SPD to preserve its conjugacy. One V-cycle is the
-preconditioner: inside CG, each iteration applies one V-cycle as \\( M^{-1} \\). The result
-is an iteration count that grows far more slowly with \\( p \\) and \\( h \\) than
+relies on $ M^{-1} $ being SPD to preserve its conjugacy. One V-cycle is the
+preconditioner: inside CG, each iteration applies one V-cycle as $ M^{-1} $. The result
+is an iteration count that grows far more slowly with $ p $ and $ h $ than
 unpreconditioned CG.
 
 A caveat the strategy document is careful about: the *best* preconditioner is
@@ -139,32 +139,32 @@ every regime.
 
 The pressure-Poisson solve of Chapter 6 has a special difficulty: with velocity Dirichlet
 on every wall, the pressure carries an **all-Neumann** boundary condition, and is therefore
-defined only **up to an additive constant**. In operator terms, \\( A\,\mathbf{1} = 0 \\) —
-the constant vector \\( \mathbf{1} \\) is in the **nullspace** of the pressure operator,
+defined only **up to an additive constant**. In operator terms, $ A\,\mathbf{1} = 0 $ —
+the constant vector $ \mathbf{1} $ is in the **nullspace** of the pressure operator,
 which is thus **singular**.
 
-A singular SPD system \\( A x = b \\) with \\( A\mathbf{1} = 0 \\) has a solution *if and
+A singular SPD system $ A x = b $ with $ A\mathbf{1} = 0 $ has a solution *if and
 only if* the right-hand side satisfies the **consistency (compatibility) condition**
-\\( b \perp \mathbf{1} \\) — i.e. \\( b \\) has zero mean. This is the Fredholm alternative,
+$ b \perp \mathbf{1} $ — i.e. $ b $ has zero mean. This is the Fredholm alternative,
 and physically it is the discrete statement that the net mass source must balance for an
-all-Neumann pressure problem. In practice \\( b \\) carries a small spurious mean component
+all-Neumann pressure problem. In practice $ b $ carries a small spurious mean component
 (from discretization and rounding), so the system handed to CG is slightly *inconsistent*:
 there is no finite solution for that component, the iteration drifts along the nullspace,
 and the residual stops dropping cleanly — sometimes failing the tolerance test entirely.
-The fix is **deflation**, which does two jobs at once: it removes the \\( \mathbf{1} \\)-
+The fix is **deflation**, which does two jobs at once: it removes the $ \mathbf{1} $-
 component of the residual (enforcing the consistency condition so a solution exists) and it
 pins the iterate to the unique zero-mean representative.
 
 Since the nullspace is the constants, projecting it out just means **removing the mean**,
 
-\\[
+$$
   v \;\leftarrow\; v - \frac{\mathbf{1}^\top v}{n}\,\mathbf{1},
-\\]
+$$
 
 applied to the residual at every iteration. With the constant component continuously
 removed, CG sees an effectively SPD system on the orthogonal complement and converges to
 the unique zero-mean pressure — which is all the projection in Chapter 6 needs, because
-only \\( \nabla p \\) matters and the gradient is blind to the constant. gale's pressure
+only $ \nabla p $ matters and the gradient is blind to the constant. gale's pressure
 solver applies exactly this mean-removal each iteration. (Strictly, projecting out the
 *known* constant nullspace is the nullspace-projection special case of deflation; the term
 "deflated CG" in the Krylov literature usually means the heavier machinery of projecting
@@ -178,7 +178,7 @@ launches. The performance trap is **host↔device traffic**: if you copied a vec
 the CPU on every iteration, the PCIe transfer would dwarf the actual arithmetic and the GPU
 would sit idle waiting. The cardinal rule is therefore: **keep the iteration vectors
 resident on the device for the entire solve**, and transfer only the few **scalar**
-dot-products the host needs to form \\( \alpha \\) and \\( \beta \\).
+dot-products the host needs to form $ \alpha $ and $ \beta $.
 
 In gale's CG kernels the solution, residual, search direction, and the matvec scratch all
 live in `DeviceBuffer`s allocated once before the loop. Each iteration launches the
@@ -197,15 +197,15 @@ trusted, not one at the expense of the other.
 The device kernels and host launch wrappers live in `gale-gpu/src/operators/poisson.rs`.
 The kernels are deliberately small and composable:
 
-- `gradient` and `operator` — the two-kernel matrix-free SIPG apply (\\( v \mapsto Av \\)),
+- `gradient` and `operator` — the two-kernel matrix-free SIPG apply ($ v \mapsto Av $),
   order-agnostic so one kernel set serves every p-multigrid level. The `operator` kernel
-  carries an optional reaction term \\( \lambda \\), so the *same* code is the Poisson
-  operator (\\( \lambda = 0 \\)) and the viscous Helmholtz operator (\\( \lambda > 0 \\)).
+  carries an optional reaction term $ \lambda $, so the *same* code is the Poisson
+  operator ($ \lambda = 0 $) and the viscous Helmholtz operator ($ \lambda > 0 $).
 - `dot_partial` — a block-reduction dot product (the only thing that produces a
   host-visible scalar);
-- `axpy` (\\( y \leftarrow y + a x \\)), `xpby` (\\( y \leftarrow x + b y \\)), `scal`, `sub` —
+- `axpy` ($ y \leftarrow y + a x $), `xpby` ($ y \leftarrow x + b y $), `scal`, `sub` —
   the CG/V-cycle vector updates;
-- `jacobi` — the damped-Jacobi smoother sweep \\( y \leftarrow y + \omega D^{-1}(b - Ap) \\);
+- `jacobi` — the damped-Jacobi smoother sweep $ y \leftarrow y + \omega D^{-1}(b - Ap) $;
 - `prolong` / `restrict` — the inter-level transfer operators for the p-multigrid V-cycle,
   applied tensor-product-wise per element.
 
@@ -213,7 +213,7 @@ The host wrappers assemble these into complete solvers, each validated against i
 oracle:
 
 - **`poisson_cg_solve`** — device-resident unpreconditioned CG for the SIPG Poisson system.
-- **`helmholtz_cg_solve`** — the same CG with the reaction term \\( \lambda M \\) active; this
+- **`helmholtz_cg_solve`** — the same CG with the reaction term $ \lambda M $ active; this
   is the viscous-velocity solve of the dual-splitting scheme (Chapter 6).
 - **`pressure_cg_solve`** — **deflated** CG for the singular pure-Neumann pressure-Poisson:
   every boundary face is the natural Neumann condition, and the constant nullspace is
@@ -230,8 +230,8 @@ Chapter 10.
 
 **Validation.** Every one of these solvers is held to the CPU reference `Poisson::cg` (and
 `PMultigrid::pcg` for the preconditioned path) **bit-for-bit to solver tolerance**: same
-convergence criterion \\( \|r\|/\|b\| < \mathrm{tol} \\), same reductions, same answer to
-about \\( 10^{-14} \\) relative. That is the discipline of Chapter 1's "the CPU is the
+convergence criterion $ \|r\|/\|b\| < \mathrm{tol} $, same reductions, same answer to
+about $ 10^{-14} $ relative. That is the discipline of Chapter 1's "the CPU is the
 oracle" — the GPU solvers are not trusted because the linear algebra looks right, but
 because they reproduce a validated host computation exactly.
 

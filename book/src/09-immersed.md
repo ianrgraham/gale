@@ -14,7 +14,7 @@ opposite ends of a trade-off.
 The classical way is a **body-fitted** grid: you build the mesh so that element edges
 lie *on* the object's surface. The boundary then falls exactly where the no-slip
 condition is applied, you can cluster fine elements right in the boundary layer, and a
-high-order method gets to show off — the surface is resolved to the full order \\( p \\).
+high-order method gets to show off — the surface is resolved to the full order $ p $.
 For gale's hardest validation cases (the fixed-cylinder and 4:1-contraction
 viscoelastic benchmarks) this is the accuracy gold standard, and gale supports static
 body-fitted curved meshes for exactly those.
@@ -37,7 +37,7 @@ arbitrary shapes, arbitrary motion, arbitrarily many bodies, topology changes (p
 touching and separating) all for free, on a mesh that never changes. For moving bodies
 and suspensions, that trade is the whole game. And on a high-order method the smearing is
 not merely a resolution penalty but a *smoothness* one: the mask jumps from 0 to 1 across
-the surface, and a degree-\\( p \\) polynomial cannot represent a step without ringing
+the surface, and a degree-$ p $ polynomial cannot represent a step without ringing
 (Gibbs), so smearing the boundary is the price of keeping the field representable at all —
 which is why the `tanh` smoothing of the mask, below, is not cosmetic.
 
@@ -60,75 +60,75 @@ a *body force* rather than a meshed boundary.
 
 Concretely, we add a forcing term to the momentum equation,
 
-\\[
+$$
   \mathbf{f}_\text{pen} = -\frac{\chi(\mathbf{x})}{\eta_b}\,
   \bigl(\mathbf{u} - \mathbf{u}_s\bigr),
-\\]
+$$
 
 with three ingredients:
 
-- a **masking function** (indicator) \\( \chi(\mathbf{x}) \in [0,1] \\), equal to 1 inside
+- a **masking function** (indicator) $ \chi(\mathbf{x}) \in [0,1] $, equal to 1 inside
   the solid and 0 in the fluid (gale samples it onto the mesh nodes; a disk's mask is
   either a sharp Heaviside or a `tanh`-smoothed band of half-width `smooth`);
-- the **solid velocity** \\( \mathbf{u}_s \\) — zero for a fixed body, or the rigid-motion
-  field \\( \mathbf{u}_s(\mathbf{x}) = \mathbf{U} + \boldsymbol{\omega}\times(\mathbf{x}-\mathbf{x}_c) \\)
+- the **solid velocity** $ \mathbf{u}_s $ — zero for a fixed body, or the rigid-motion
+  field $ \mathbf{u}_s(\mathbf{x}) = \mathbf{U} + \boldsymbol{\omega}\times(\mathbf{x}-\mathbf{x}_c) $
   for a translating/rotating particle;
-- the **penalization (porosity) parameter** \\( \eta_b \\), with units of time. It is the
-  porous medium's relaxation time: the smaller \\( \eta_b \\), the stiffer the drag and the
-  more strictly the no-slip constraint is enforced. As \\( \eta_b \to 0 \\) the masked
-  region behaves as a perfect rigid solid; the modelling error of a finite \\( \eta_b \\)
-  scales like \\( \sqrt{\eta_b} \\) for a no-slip (Dirichlet) surface. But \\( \eta_b \\)
+- the **penalization (porosity) parameter** $ \eta_b $, with units of time. It is the
+  porous medium's relaxation time: the smaller $ \eta_b $, the stiffer the drag and the
+  more strictly the no-slip constraint is enforced. As $ \eta_b \to 0 $ the masked
+  region behaves as a perfect rigid solid; the modelling error of a finite $ \eta_b $
+  scales like $ \sqrt{\eta_b} $ for a no-slip (Dirichlet) surface. But $ \eta_b $
   is double-edged: driving it toward zero shrinks that modelling slip, yet the penalized
-  solution then grows an internal boundary layer of thickness \\( \sim\sqrt{\nu\,\eta_b} \\)
+  solution then grows an internal boundary layer of thickness $ \sim\sqrt{\nu\,\eta_b} $
   at the mask edge, and unless the mesh resolves *that* layer the high-order element rings
   across it. The two errors pull opposite ways — too large leaks flow through the body, too
   small hides a sub-cell layer the polynomial cannot see — so the rule of thumb is to
-  balance the penalty layer against the local mesh size rather than minimize \\( \eta_b \\)
-  blindly. That is exactly why gale's tests sit at \\( 10^{-3} \\)–\\( 10^{-4} \\), not
-  \\( 10^{-8} \\).
+  balance the penalty layer against the local mesh size rather than minimize $ \eta_b $
+  blindly. That is exactly why gale's tests sit at $ 10^{-3} $–$ 10^{-4} $, not
+  $ 10^{-8} $.
 
 So far this is just an extra term in the momentum equation. The interesting part — the
 part this chapter is really about — is *how you integrate it in time*.
 
 ## Why apply it implicitly (the stability lesson)
 
-Look again at the forcing. Inside the body \\( \chi = 1 \\), so the drag coefficient is
-\\( 1/\eta_b \\). If we want a near-rigid body we take \\( \eta_b \\) tiny — gale's tests use
-\\( \eta_b = 10^{-3} \\) or \\( 10^{-4} \\) — which makes \\( 1/\eta_b \\) *enormous*. The
+Look again at the forcing. Inside the body $ \chi = 1 $, so the drag coefficient is
+$ 1/\eta_b $. If we want a near-rigid body we take $ \eta_b $ tiny — gale's tests use
+$ \eta_b = 10^{-3} $ or $ 10^{-4} $ — which makes $ 1/\eta_b $ *enormous*. The
 penalty term is, in the language of Chapter 6, **extremely stiff**.
 
 Now suppose we treated it like any other source term and added it explicitly to the
-right-hand side: \\( \mathbf{u}^{n+1} = \mathbf{u}^{n} - (\Delta t\,\chi/\eta_b)(\mathbf{u}^n-\mathbf{u}_s) \\).
-That is forward Euler on the relaxation ODE \\( \dot{\mathbf{u}} = -(\chi/\eta_b)(\mathbf{u}-\mathbf{u}_s) \\),
+right-hand side: $ \mathbf{u}^{n+1} = \mathbf{u}^{n} - (\Delta t\,\chi/\eta_b)(\mathbf{u}^n-\mathbf{u}_s) $.
+That is forward Euler on the relaxation ODE $ \dot{\mathbf{u}} = -(\chi/\eta_b)(\mathbf{u}-\mathbf{u}_s) $,
 and it is only stable when the step is smaller than the relaxation time,
-\\( \Delta t \lesssim \eta_b \\). With \\( \eta_b = 10^{-4} \\) that forces a *catastrophic*
+$ \Delta t \lesssim \eta_b $. With $ \eta_b = 10^{-4} $ that forces a *catastrophic*
 time step — and the stiffer (more rigid) we make the body, the smaller the step we must
-take. Explicit penalization makes \\( \Delta t \to 0 \\) exactly in the limit we care about.
+take. Explicit penalization makes $ \Delta t \to 0 $ exactly in the limit we care about.
 This is the same villain as in every other chapter: a physically reasonable scheme that
 is unconditionally *unstable* for the regime of interest.
 
 The cure is to integrate the relaxation **implicitly** (backward Euler). The drag ODE
-\\( \dot{\mathbf{u}} = -(\chi/\eta_b)(\mathbf{u}-\mathbf{u}_s) \\), solved implicitly over a
+$ \dot{\mathbf{u}} = -(\chi/\eta_b)(\mathbf{u}-\mathbf{u}_s) $, solved implicitly over a
 step, has a closed form — it is just a convex combination:
 
-\\[
+$$
   \mathbf{u} \;\leftarrow\; \frac{\mathbf{u} + \beta\,\mathbf{u}_s}{1 + \beta},
   \qquad
   \beta = \chi\,\frac{\Delta t}{\eta_b}.
-\\]
+$$
 
-Read this off: outside the solid \\( \chi = 0 \Rightarrow \beta = 0 \\), and the velocity
-is untouched. Inside, \\( \beta \\) is huge, and the update pulls \\( \mathbf{u} \\) almost
-all the way to \\( \mathbf{u}_s \\) — the residual after one step is
-\\( 1/(1+\beta) \approx \eta_b/\Delta t \\), small precisely *because* \\( \eta_b \\) is
+Read this off: outside the solid $ \chi = 0 \Rightarrow \beta = 0 $, and the velocity
+is untouched. Inside, $ \beta $ is huge, and the update pulls $ \mathbf{u} $ almost
+all the way to $ \mathbf{u}_s $ — the residual after one step is
+$ 1/(1+\beta) \approx \eta_b/\Delta t $, small precisely *because* $ \eta_b $ is
 small. Because the new velocity is a weighted average of two existing velocities, it can
-never overshoot: the update is a contraction, **unconditionally stable** in \\( \beta \\),
-for *any* \\( \eta_b \\) and *any* \\( \Delta t \\). The stiffer we make the body, the
+never overshoot: the update is a contraction, **unconditionally stable** in $ \beta $,
+for *any* $ \eta_b $ and *any* $ \Delta t $. The stiffer we make the body, the
 *better* this behaves. That is the whole reason gale writes the penalization this way
 rather than as an additive source.
 
-> **Where it lives in the code.** Because the update is a relaxation \\( \mathbf{u}
-> \leftarrow g(\mathbf{u}) \\) and *not* an additive right-hand-side contribution, gale
+> **Where it lives in the code.** Because the update is a relaxation $ \mathbf{u}
+> \leftarrow g(\mathbf{u}) $ and *not* an additive right-hand-side contribution, gale
 > does not put it in the equation's flux/source assembly. It lives in a **post-stage
 > hook** — applied to the velocity field *after* each integrator stage — which is exactly
 > the structural consequence of choosing the implicit form. The framework's
@@ -140,14 +140,14 @@ rather than as an additive source.
 Volume penalization buys stability and geometric freedom, but it has a known, documented
 weakness: it **smears the boundary over roughly a cell** and is only about **first-order
 accurate at the interface**. Two distinct knobs limit accuracy here, and it helps to keep
-them apart: the *penalty* \\( \eta_b \\), whose modelling error (the no-slip velocity slip)
-scales like \\( \sqrt{\eta_b} \\) as \\( \eta_b \to 0 \\); and the *mesh* \\( h \\), whose
-discretization error is the \\( O(h) \\), first-order-at-the-interface story as \\( h \to 0 \\).
+them apart: the *penalty* $ \eta_b $, whose modelling error (the no-slip velocity slip)
+scales like $ \sqrt{\eta_b} $ as $ \eta_b \to 0 $; and the *mesh* $ h $, whose
+discretization error is the $ O(h) $, first-order-at-the-interface story as $ h \to 0 $.
 Both bottom out at low order near the surface, and the polymer-stress field does not even
-converge pointwise right at the body. High polynomial order \\( p \\) does *not* rescue this
+converge pointwise right at the body. High polynomial order $ p $ does *not* rescue this
 on either axis: spectral accuracy needs a smooth field within the element, and the penalized
 solution is *not* smooth across a sharp body surface — it is that lack of smoothness that
-caps the order. So high \\( p \\) still pays off in the bulk (the matrix flow, the
+caps the order. So high $ p $ still pays off in the bulk (the matrix flow, the
 stress transport of Chapter 8), but near the body the interface error dominates.
 
 The good news, and the reason this remains usable, is that **integrated quantities still
@@ -155,12 +155,12 @@ converge**: the net force and torque on the body are first-order accurate even t
 near-surface field is only half-order. For the rigid-particle proof-of-concept — where we
 care about drag, lift, and tumbling rate, not the pointwise wall stress — that is enough.
 
-The principled remedy is to **localize refinement to the boundary**: pile up \\( h \\)- and
-\\( p \\)-resolution in a thin band around the surface so the smeared interface is at least
+The principled remedy is to **localize refinement to the boundary**: pile up $ h $- and
+$ p $-resolution in a thin band around the surface so the smeared interface is at least
 resolved as finely as possible. This is precisely the subject of the Nayak–Mavriplis
 paper on hp-adaptive volume-penalty DG-SEM, and it is the natural way to make the IBM
-*accurate*. Be honest, though: **gale does not yet have this.** gale has \\( h \\)-adaptivity
-in 2D (Chapter 10), but no \\( p \\)-adaptivity and no IB-targeted refinement criterion —
+*accurate*. Be honest, though: **gale does not yet have this.** gale has $ h $-adaptivity
+in 2D (Chapter 10), but no $ p $-adaptivity and no IB-targeted refinement criterion —
 both are documented gaps on the roadmap (Chapter 13). The accuracy boost from localized
 hp-refinement is a planned capability, not a built one.
 
@@ -170,16 +170,16 @@ The penalization gives us the hydrodynamic force on the body essentially for fre
 fluid loses momentum to the body at exactly the rate the implicit relaxation removes it,
 so the force the fluid exerts on the solid is
 
-\\[
+$$
   \mathbf{F} = \int_\Omega \frac{\chi}{\eta_b}\,
   \bigl(\mathbf{u} - \mathbf{u}_s\bigr)\,dV.
-\\]
+$$
 
 Evaluated on the penalized velocity, this is consistent with the update by construction.
 gale exposes it as `VolumePenalization::force` and, in the framework, as the
 `PenalizationDrag` `Compute`. The tests confirm the physics you would demand: for a disk
-in a body-force-driven Stokes channel the drag points **downstream** (\\( F_x > 0 \\)), the
-lift is **machine-zero by symmetry** (\\( F_y \approx 0 \\)), and — being the Stokes regime —
+in a body-force-driven Stokes channel the drag points **downstream** ($ F_x > 0 $), the
+lift is **machine-zero by symmetry** ($ F_y \approx 0 $), and — being the Stokes regime —
 the drag is **exactly linear in the drive** (doubling the forcing doubles the drag, ratio
 2.000).
 
@@ -187,7 +187,7 @@ For a *freely suspended* particle there is a companion operation: an L2 projecti
 fluid velocity onto rigid motions over the masked region recovers the body's translation
 and angular velocity. A disk in simple shear comes out rotating at exactly half the
 ambient vorticity, and an ellipse reproduces the classical **Jeffery orbit**, with a
-tumbling period matching the analytic \\( (\pi/\dot\gamma)(r + 1/r) \\) to better than 0.1%.
+tumbling period matching the analytic $ (\pi/\dot\gamma)(r + 1/r) $ to better than 0.1%.
 
 ## Toward deformable particles and two-phase flow
 
@@ -231,8 +231,8 @@ elastic membrane (solid) enclosing an interior fluid distinct from the exterior
 ## How gale does it
 
 - **`VolumePenalization` (2D) / `VolumePenalization3d`** (`src/dg/immersed/`): sample a
-  solid's mask \\( \chi \\) and velocity \\( \mathbf{u}_s \\) onto the mesh nodes; `apply`
-  performs the implicit Brinkman relaxation \\( \mathbf{u} \leftarrow (\mathbf{u}+\beta\mathbf{u}_s)/(1+\beta) \\)
+  solid's mask $ \chi $ and velocity $ \mathbf{u}_s $ onto the mesh nodes; `apply`
+  performs the implicit Brinkman relaxation $ \mathbf{u} \leftarrow (\mathbf{u}+\beta\mathbf{u}_s)/(1+\beta) $
   in place; `force` returns the penalization drag; `project_rigid` recovers a
   freely-suspended body's rigid velocity. The `Disk` / `RigidBody` (disk or ellipse)
   shapes provide sharp or `tanh`-smoothed indicators.
@@ -246,8 +246,8 @@ elastic membrane (solid) enclosing an interior fluid distinct from the exterior
   them into the GPU flow integrators.
 - **The capstone** (Chapter 1): a penalized rigid disk (2D) and sphere (3D) immersed in a
   **log-conformation Oldroyd-B** channel flow (Chapter 8), end-to-end on the GPU — flow
-  suppressed inside the body, drag downstream, and the conformation tensor \\( \mathbf{C} =
-  \exp(\boldsymbol{\Psi}) \\) staying symmetric-positive-definite *everywhere, including at
+  suppressed inside the body, drag downstream, and the conformation tensor $ \mathbf{C} =
+  \exp(\boldsymbol{\Psi}) $ staying symmetric-positive-definite *everywhere, including at
   the immersed surface*. The research-flagged risk (stress pathology at the body) did not
   bite at moderate Weissenberg number — the log-conformation representation is exactly the
   stabilizer the literature prescribes for it.

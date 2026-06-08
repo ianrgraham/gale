@@ -80,10 +80,10 @@ touches. DG-SEM is all three:
   contribution to the right-hand side from its own nodal data plus a read-only peek
   at its neighbors' face values. That is a self-contained chunk of work — precisely a
   block. Inside the block, each collocation node is a thread. For a degree-4 element
-  in 2D that is \\\( (p+1)^2 = 25 \\\) threads; in 3D, \\\( (p+1)^3 = 125 \\\). The mesh
+  in 2D that is \$ (p+1)^2 = 25 \$ threads; in 3D, \$ (p+1)^3 = 125 \$. The mesh
   has thousands of elements, so the GPU is saturated. The mapping is obvious but not
   automatically efficient: 25 threads is *less than one warp* (32), so a 2D block
-  underutilizes its warp, while the 3D case (\\\( 125 \approx 4 \\\) warps) sits more
+  underutilizes its warp, while the 3D case (\$ 125 \approx 4 \$ warps) sits more
   comfortably — which is why the arithmetic-intensity and shared-memory-reuse
   arguments below are the ones doing the real work.
 - **The per-element work is dense small tensor contractions.** The volume term of a
@@ -111,7 +111,7 @@ values through `u[face_nbr[idx]]` (a read), accumulates the numerical flux into 
 output slot. Determinism here is not a nicety; it is what makes the bit-for-bit CPU
 comparison of Chapter 12 even *possible* — a racy kernel would give slightly
 different answers run to run and could never be checked against an oracle to
-\\\( 10^{-14} \\\).
+\$ 10^{-14} \$.
 
 Data layout follows from this. Nodal values are stored element-major
 (`element * n_nodes + node`), so the threads of a block read a contiguous run of

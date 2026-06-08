@@ -6,52 +6,52 @@ A reference for the symbols, dimensionless groups, and acronyms used throughout 
 
 | Symbol | Meaning |
 | --- | --- |
-| \\( \mathbf{u}=(u,v,w) \\) | velocity field |
-| \\( p \\) | pressure (also, in DG context, polynomial degree — disambiguated by context) |
-| \\( t,\ \Delta t \\) | time, time step |
-| \\( \rho \\) | density |
-| \\( \mu,\ \eta \\) | dynamic viscosity (\\( \eta_s \\) solvent, \\( \eta_p \\) polymer) |
-| \\( \nu = \mu/\rho \\) | kinematic viscosity |
-| \\( \nabla,\ \nabla\cdot,\ \nabla^2=\Delta \\) | gradient, divergence, Laplacian |
-| \\( \mathbf{C} \\) | conformation tensor (SPD), equilibrium \\( \mathbf{C}=\mathbf{I} \\) |
-| \\( \Psi=\log\mathbf{C} \\) | log-conformation variable |
-| \\( \tau_p \\) | polymer stress, \\( \tau_p=\frac{\eta_p}{\lambda}(\mathbf{C}-\mathbf{I}) \\) |
-| \\( \lambda \\) | polymer relaxation time |
-| \\( \overset{\triangledown}{\mathbf{C}} \\) | upper-convected derivative of \\( \mathbf{C} \\) |
-| \\( h \\) | representative element size |
-| \\( p \\) (degree) | polynomial degree per element (gale typically 4–8) |
-| \\( \tau \\) | SIPG interior-penalty parameter, \\( \tau=\alpha(p+1)^2/h \\) |
-| \\( \alpha \\) | penalty coefficient (user constant in \\( \tau \\)) |
-| \\( M,\ A \\) | mass matrix (diagonal for GLL), stiffness/SIPG operator |
-| \\( \mathrm{jw} \\) | nodal quadrature weight × Jacobian (the diagonal mass entries) |
-| \\( \chi \\) | immersed-body mask (1 inside solid, 0 in fluid) |
-| \\( \eta_b \\) | volume-penalization (Brinkman) parameter; small ⇒ strong no-slip |
-| \\( [\![\cdot]\!],\ \{\!\!\{\cdot\}\!\!\} \\) | jump and average across an element face |
-| \\( P,\ P^T \\) | mortar projection (coarse→fine) and its transpose (fine→coarse) |
+| $ \mathbf{u}=(u,v,w) $ | velocity field |
+| $ p $ | pressure (also, in DG context, polynomial degree — disambiguated by context) |
+| $ t,\ \Delta t $ | time, time step |
+| $ \rho $ | density |
+| $ \mu,\ \eta $ | dynamic viscosity ($ \eta_s $ solvent, $ \eta_p $ polymer) |
+| $ \nu = \mu/\rho $ | kinematic viscosity |
+| $ \nabla,\ \nabla\cdot,\ \nabla^2=\Delta $ | gradient, divergence, Laplacian |
+| $ \mathbf{C} $ | conformation tensor (SPD), equilibrium $ \mathbf{C}=\mathbf{I} $ |
+| $ \Psi=\log\mathbf{C} $ | log-conformation variable |
+| $ \tau_p $ | polymer stress, $ \tau_p=\frac{\eta_p}{\lambda}(\mathbf{C}-\mathbf{I}) $ |
+| $ \lambda $ | polymer relaxation time |
+| $ \overset{\triangledown}{\mathbf{C}} $ | upper-convected derivative of $ \mathbf{C} $ |
+| $ h $ | representative element size |
+| $ p $ (degree) | polynomial degree per element (gale typically 4–8) |
+| $ \tau $ | SIPG interior-penalty parameter, $ \tau=\alpha(p+1)^2/h $ |
+| $ \alpha $ | penalty coefficient (user constant in $ \tau $) |
+| $ M,\ A $ | mass matrix (diagonal for GLL), stiffness/SIPG operator |
+| $ \mathrm{jw} $ | nodal quadrature weight × Jacobian (the diagonal mass entries) |
+| $ \chi $ | immersed-body mask (1 inside solid, 0 in fluid) |
+| $ \eta_b $ | volume-penalization (Brinkman) parameter; small ⇒ strong no-slip |
+| $ [\![\cdot]\!],\ \{\!\!\{\cdot\}\!\!\} $ | jump and average across an element face |
+| $ P,\ P^T $ | mortar projection (coarse→fine) and its transpose (fine→coarse) |
 
 ## Dimensionless numbers
 
 These set gale's regime and explain its method choices (Chapter 2).
 
-- **Reynolds number** \\( \mathrm{Re}=\dfrac{UL}{\nu} \\): inertia vs. viscous forces.
+- **Reynolds number** $ \mathrm{Re}=\dfrac{UL}{\nu} $: inertia vs. viscous forces.
   *Low* in microfluidics — inertia is weak, so convection can be treated explicitly and
   the flow is smooth (Chapter 6).
 
-- **Weissenberg number** \\( \mathrm{Wi}=\lambda\dot{\gamma} \\): elastic relaxation time
-  vs. flow deformation rate (\\( \dot\gamma \\) a shear rate). *Can be large* in gale's
+- **Weissenberg number** $ \mathrm{Wi}=\lambda\dot{\gamma} $: elastic relaxation time
+  vs. flow deformation rate ($ \dot\gamma $ a shear rate). *Can be large* in gale's
   regime — strong elasticity, steep polymer-stress layers, and the High-Weissenberg
   problem (Chapter 8).
 
-- **Deborah number** \\( \mathrm{De}=\lambda/T \\): relaxation time vs. a flow/observation
-  timescale \\( T \\). Large \\( \mathrm{De} \\) means the fluid "remembers." Not a synonym
-  for \\( \mathrm{Wi} \\): \\( \mathrm{Wi}=\lambda\dot\gamma \\) measures how stretched the
-  polymers get in a flow with a well-defined deformation rate, while \\( \mathrm{De} \\)
+- **Deborah number** $ \mathrm{De}=\lambda/T $: relaxation time vs. a flow/observation
+  timescale $ T $. Large $ \mathrm{De} $ means the fluid "remembers." Not a synonym
+  for $ \mathrm{Wi} $: $ \mathrm{Wi}=\lambda\dot\gamma $ measures how stretched the
+  polymers get in a flow with a well-defined deformation rate, while $ \mathrm{De} $
   measures whether the flow is transient relative to relaxation — whether the fluid has
-  time to forget. They coincide only when the flow timescale *is* \\( 1/\dot\gamma \\)
-  (steady, homogeneous flow); a steady shear has large Wi but \\( \mathrm{De}=0 \\), and a
+  time to forget. They coincide only when the flow timescale *is* $ 1/\dot\gamma $
+  (steady, homogeneous flow); a steady shear has large Wi but $ \mathrm{De}=0 $, and a
   small-amplitude oscillation can have large De but vanishing Wi.
 
-- **Elasticity number** \\( \mathrm{El}=\mathrm{Wi}/\mathrm{Re}=\lambda\nu/L^2 \\):
+- **Elasticity number** $ \mathrm{El}=\mathrm{Wi}/\mathrm{Re}=\lambda\nu/L^2 $:
   elasticity vs. inertia, independent of flow speed. *Large* in microfluidics — the
   signature of the elasticity-dominated, inertia-negligible corner gale targets.
 
@@ -81,10 +81,10 @@ These set gale's regime and explain its method choices (Chapter 2).
   microstructure, the canonical viscoelastic model, and the objective (upper-convected)
   time derivative it evolves under (Chapter 8).
 - **HWNP** — High-Weissenberg-Number Problem: numerical breakdown at high Wi — under-resolved
-  exponential stress layers drive the (analytically SPD) conformation tensor \\( \mathbf{C} \\)
+  exponential stress layers drive the (analytically SPD) conformation tensor $ \mathbf{C} $
   to lose positive-definiteness, after which it blows up. Log-conformation cures it for two
-  reasons: evolving \\( \Psi=\log\mathbf{C} \\) and exponentiating guarantees
-  \\( \mathbf{C}=e^\Psi \\) stays SPD by construction, and the log variable linearizes those
+  reasons: evolving $ \Psi=\log\mathbf{C} $ and exponentiating guarantees
+  $ \mathbf{C}=e^\Psi $ stays SPD by construction, and the log variable linearizes those
   exponential layers so polynomials can resolve them (Chapter 8).
 - **IBM / volume penalization (Brinkman)** — immersed-boundary method; representing a
   solid by penalizing the fluid toward the solid velocity inside a mask, applied
@@ -95,6 +95,6 @@ These set gale's regime and explain its method choices (Chapter 2).
 - **MMS** — method of manufactured solutions: pick an exact solution, derive the forcing
   that produces it, and measure the solver's error against it (Chapter 12).
 - **Oracle / bit-for-bit validation** — the pure-host CPU implementation each GPU kernel
-  is checked against to ~\\( 10^{-14} \\) relative error (Chapter 12).
+  is checked against to ~$ 10^{-14} $ relative error (Chapter 12).
 - **PTX / libdevice / cuda-oxide** — NVIDIA's GPU assembly, its math library, and the
   Rust→PTX toolchain gale compiles its device kernels with (Chapter 11).
