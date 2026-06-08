@@ -7,6 +7,7 @@
 //! Nodal (collocation) convection only for now; the energy-stable split-form path
 //! (the high-Re option in 2D) is a later addition.
 
+use super::bc::BoundaryConditions3d;
 use super::mesh3d::Mesh3d;
 use super::poisson3d::Poisson3d;
 
@@ -16,22 +17,53 @@ pub struct Stokes3d<'m> {
     pub nu: f64,
     pub dt: f64,
     pressure: Poisson3d<'m>,
-    velocity: Poisson3d<'m>,
+    /// Per-component velocity Helmholtz operators (differ only in Neumann-tag set, for
+    /// symmetry/slip faces; identical otherwise).
+    velocity_x: Poisson3d<'m>,
+    velocity_y: Poisson3d<'m>,
+    velocity_z: Poisson3d<'m>,
+    /// Whether any boundary is an outflow (pressure pinned ⇒ plain CG, not deflated).
+    has_outflow: bool,
     tol: f64,
     maxit: usize,
 }
 
 impl<'m> Stokes3d<'m> {
+    /// Closed-box solver: all-Dirichlet velocity + pure-Neumann (deflated) pressure.
+    /// For per-region inflow/outflow/wall/symmetry conditions use [`with_bcs`](Self::with_bcs).
     pub fn new(mesh: &'m Mesh3d, alpha: f64, nu: f64, dt: f64) -> Self {
         let lambda = 1.0 / (nu * dt);
         Self {
             mesh,
             nu,
             dt,
-            // Pressure: pure-Neumann on all 6 faces (tags 0..6).
-            pressure: Poisson3d::with_bc(mesh, alpha, 0.0, vec![0, 1, 2, 3, 4, 5]),
-            // Velocity: Helmholtz (λM + A), Dirichlet.
-            velocity: Poisson3d::with_reaction(mesh, alpha, lambda),
+            // Pressure: pure-Neumann on all boundary faces.
+            pressure: Poisson3d::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
+            // Velocity: Helmholtz (λM + A), all-Dirichlet (per-component, identical here).
+            velocity_x: Poisson3d::with_reaction(mesh, alpha, lambda),
+            velocity_y: Poisson3d::with_reaction(mesh, alpha, lambda),
+            velocity_z: Poisson3d::with_reaction(mesh, alpha, lambda),
+            has_outflow: false,
+            tol: 1e-10,
+            maxit: 20000,
+        }
+    }
+
+    /// Solver with **per-region** boundary conditions (the 3D analogue of
+    /// `Stokes::with_bcs`): each boundary tag routed via `bcs` to per-component velocity
+    /// + pressure operator settings. Outflow ⇒ velocity-Neumann + pressure-Dirichlet
+    /// `p=0`; symmetry ⇒ normal-component Dirichlet + tangential Neumann.
+    pub fn with_bcs(mesh: &'m Mesh3d, alpha: f64, nu: f64, dt: f64, bcs: &BoundaryConditions3d) -> Self {
+        let lambda = 1.0 / (nu * dt);
+        Self {
+            mesh,
+            nu,
+            dt,
+            pressure: Poisson3d::with_bc(mesh, alpha, 0.0, bcs.pressure_neumann_tags(mesh)),
+            velocity_x: Poisson3d::with_bc(mesh, alpha, lambda, bcs.velocity_neumann_tags(mesh, 0)),
+            velocity_y: Poisson3d::with_bc(mesh, alpha, lambda, bcs.velocity_neumann_tags(mesh, 1)),
+            velocity_z: Poisson3d::with_bc(mesh, alpha, lambda, bcs.velocity_neumann_tags(mesh, 2)),
+            has_outflow: bcs.has_outflow(mesh),
             tol: 1e-10,
             maxit: 20000,
         }
@@ -111,7 +143,37 @@ impl<'m> Stokes3d<'m> {
             uhy[i] += dt * (fy[i] - cy[i]);
             uhz[i] += dt * (fz[i] - cz[i]);
         }
-        self.project_and_diffuse(uhx, uhy, uhz, t, bc_u, bc_v, bc_w)
+        self.project_and_diffuse(uhx, uhy, uhz, |_, x, y, z| {
+            (bc_u(x, y, z, t), bc_v(x, y, z, t), bc_w(x, y, z, t))
+        })
+    }
+
+    /// BC-aware NS step with a precomputed nodal body force — the [`with_bcs`](Self::with_bcs)
+    /// companion to [`step_ns_forced`](Self::step_ns_forced). Per-region velocity data
+    /// (inflow / walls / symmetry) comes from `bcs`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_ns_forced_bc(
+        &self,
+        ux: &[f64],
+        uy: &[f64],
+        uz: &[f64],
+        t: f64,
+        bcs: &BoundaryConditions3d,
+        fx: &[f64],
+        fy: &[f64],
+        fz: &[f64],
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let dt = self.dt;
+        let (cx, cy, cz) = self.convection(ux, uy, uz);
+        let mut uhx = ux.to_vec();
+        let mut uhy = uy.to_vec();
+        let mut uhz = uz.to_vec();
+        for i in 0..self.ndof() {
+            uhx[i] += dt * (fx[i] - cx[i]);
+            uhy[i] += dt * (fy[i] - cy[i]);
+            uhz[i] += dt * (fz[i] - cz[i]);
+        }
+        self.project_and_diffuse(uhx, uhy, uhz, |tag, x, y, z| bcs.dirichlet(tag, x, y, z, t))
     }
 
     /// One NS step with analytic forcing closures.
@@ -145,16 +207,12 @@ impl<'m> Stokes3d<'m> {
 
     /// Stages 2–3: pressure projection to divergence-free, then implicit viscous
     /// solve per component.
-    #[allow(clippy::too_many_arguments)]
     fn project_and_diffuse(
         &self,
         mut uhx: Vec<f64>,
         mut uhy: Vec<f64>,
         mut uhz: Vec<f64>,
-        t: f64,
-        bc_u: impl Fn(f64, f64, f64, f64) -> f64,
-        bc_v: impl Fn(f64, f64, f64, f64) -> f64,
-        bc_w: impl Fn(f64, f64, f64, f64) -> f64,
+        vel_dir: impl Fn(u32, f64, f64, f64) -> (f64, f64, f64),
     ) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let mesh = self.mesh;
         let refh = &mesh.refh;
@@ -162,11 +220,18 @@ impl<'m> Stokes3d<'m> {
         let dt = self.dt;
         let lambda = 1.0 / (self.nu * dt);
 
-        // Stage 2 — pressure projection: ∇²p = (1/Δt)∇·û (homogeneous Neumann).
+        // Stage 2 — pressure projection: ∇²p = (1/Δt)∇·û. Outflow pins p ⇒ plain CG;
+        // otherwise the pure-Neumann system is singular ⇒ deflated CG.
         let div = self.divergence(&uhx, &uhy, &uhz);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _, _| 0.0, |_, _, _| 0.0);
-        let (p, _it) = self.pressure.cg_deflated(&bp, self.tol, self.maxit);
+        let p = if self.has_outflow {
+            let (p, _, _) = self.pressure.cg(&bp, self.tol, self.maxit);
+            p
+        } else {
+            let (p, _it) = self.pressure.cg_deflated(&bp, self.tol, self.maxit);
+            p
+        };
         for (e, el) in mesh.elements.iter().enumerate() {
             let sl = e * nn..(e + 1) * nn;
             let gpx = el.geom.grad_x(refh, &p[sl.clone()]);
@@ -183,12 +248,12 @@ impl<'m> Stokes3d<'m> {
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let fzv: Vec<f64> = uhz.iter().map(|v| lambda * v).collect();
-        let bx = self.velocity.rhs(&fxv, |x, y, z| bc_u(x, y, z, t));
-        let by = self.velocity.rhs(&fyv, |x, y, z| bc_v(x, y, z, t));
-        let bz = self.velocity.rhs(&fzv, |x, y, z| bc_w(x, y, z, t));
-        let (uxn, _, _) = self.velocity.cg(&bx, self.tol, self.maxit);
-        let (uyn, _, _) = self.velocity.cg(&by, self.tol, self.maxit);
-        let (uzn, _, _) = self.velocity.cg(&bz, self.tol, self.maxit);
+        let bx = self.velocity_x.rhs_tagged(&fxv, |tag, x, y, z| vel_dir(tag, x, y, z).0, |_, _, _, _| 0.0);
+        let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y, z| vel_dir(tag, x, y, z).1, |_, _, _, _| 0.0);
+        let bz = self.velocity_z.rhs_tagged(&fzv, |tag, x, y, z| vel_dir(tag, x, y, z).2, |_, _, _, _| 0.0);
+        let (uxn, _, _) = self.velocity_x.cg(&bx, self.tol, self.maxit);
+        let (uyn, _, _) = self.velocity_y.cg(&by, self.tol, self.maxit);
+        let (uzn, _, _) = self.velocity_z.cg(&bz, self.tol, self.maxit);
         (uxn, uyn, uzn)
     }
 }
@@ -207,6 +272,43 @@ mod tests {
             }
         }
         v
+    }
+
+    #[test]
+    fn per_region_bcs_preserve_uniform_flow_3d() {
+        // 3D per-region BCs together: west inlet (tag 4) u=(1,0,0), east outflow (tag 5),
+        // and free-slip on the 4 lateral faces (bottom/top z-normal, south/north
+        // y-normal). u=(1,0,0) is the exact steady state and must be preserved —
+        // exercising inflow + outflow + symmetry and the per-component routing.
+        use crate::dg::bc::{BoundaryConditions3d, FlowBc3d};
+        let nu = 1.0;
+        let p = 3;
+        let mesh = Mesh3d::rectangular(p, 3, 2, 2, [0.0, 2.0], [0.0, 1.0], [0.0, 1.0]);
+        let bcs = BoundaryConditions3d::no_slip()
+            .set(4, FlowBc3d::velocity(|_, _, _, _| (1.0, 0.0, 0.0)))
+            .set(5, FlowBc3d::Outflow)
+            .set(0, FlowBc3d::Symmetry)
+            .set(1, FlowBc3d::Symmetry)
+            .set(2, FlowBc3d::Symmetry)
+            .set(3, FlowBc3d::Symmetry);
+        let dt = 0.05;
+        let st = Stokes3d::with_bcs(&mesh, 5.0, nu, dt, &bcs);
+        let nd = mesh.n_elements() * mesh.refh.n_nodes();
+        let (mut ux, mut uy, mut uz) = (vec![1.0; nd], vec![0.0; nd], vec![0.0; nd]);
+        let z = vec![0.0; nd];
+        let mut t = 0.0;
+        for _ in 0..15 {
+            t += dt;
+            let (nx, ny, nz) = st.step_ns_forced_bc(&ux, &uy, &uz, t, &bcs, &z, &z, &z);
+            ux = nx;
+            uy = ny;
+            uz = nz;
+        }
+        let err_u = ux.iter().fold(0.0f64, |a, &v| a.max((v - 1.0).abs()));
+        let err_t = uy.iter().chain(uz.iter()).fold(0.0f64, |a, &v| a.max(v.abs()));
+        eprintln!("3D per-region BC uniform flow: max|u−1|={err_u:.3e}, max|v,w|={err_t:.3e}");
+        assert!(err_u < 1e-6, "uniform flow not preserved: {err_u}");
+        assert!(err_t < 1e-6, "spurious transverse velocity: {err_t}");
     }
 
     #[test]

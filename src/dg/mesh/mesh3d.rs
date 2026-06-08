@@ -50,6 +50,44 @@ impl Mesh3d {
         self.elements.len()
     }
 
+    /// The distinct boundary-face tags present in the mesh, sorted.
+    pub fn boundary_tags(&self) -> Vec<u32> {
+        let mut tags: Vec<u32> = self
+            .elements
+            .iter()
+            .flat_map(|el| el.neighbors.iter())
+            .filter_map(|n| match n {
+                Neighbor3::Boundary { tag } => Some(*tag),
+                _ => None,
+            })
+            .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+
+    /// The axis of the (assumed axis-aligned) outward normal of boundary `tag`'s faces,
+    /// read from the first face carrying that tag: `0` for x-normal, `1` for y-normal,
+    /// `2` for z-normal. Used to route symmetry/slip BCs per velocity component.
+    pub fn boundary_tag_normal_axis(&self, tag: u32) -> Option<usize> {
+        for el in &self.elements {
+            for (f, nb) in el.neighbors.iter().enumerate() {
+                if matches!(nb, Neighbor3::Boundary { tag: t } if *t == tag) {
+                    let fc = &el.faces[f];
+                    let (ax, ay, az) = (fc.nx[0].abs(), fc.ny[0].abs(), fc.nz[0].abs());
+                    return Some(if ax >= ay && ax >= az {
+                        0
+                    } else if ay >= az {
+                        1
+                    } else {
+                        2
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// Total physical volume (∑ of element `detJ·w`).
     pub fn volume(&self) -> f64 {
         self.elements.iter().flat_map(|e| e.geom.jw.iter()).sum()

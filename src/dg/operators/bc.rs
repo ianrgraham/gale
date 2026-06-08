@@ -22,6 +22,7 @@
 //! the deflated CG is used, exactly as in the legacy all-Dirichlet path.
 
 use super::mesh::Mesh2d;
+use super::mesh3d::Mesh3d;
 use std::collections::HashMap;
 
 /// The boundary condition imposed on one boundary region (tag) of an incompressible
@@ -131,6 +132,102 @@ impl BoundaryConditions {
             .filter(|&t| match self.get(t) {
                 FlowBc::Outflow => true,
                 FlowBc::Symmetry => mesh.boundary_tag_normal_axis(t) != Some(comp),
+                _ => false,
+            })
+            .collect()
+    }
+}
+
+// ===== 3D =======================================================================
+
+/// The boundary condition imposed on one boundary region of a 3D incompressible flow —
+/// the 3D analogue of [`FlowBc`]. Faces are tagged by local face index
+/// (`Face::ALL` order: 0=Bottom, 1=Top, 2=South, 3=North, 4=West, 5=East).
+pub enum FlowBc3d {
+    /// No-slip wall: `u = 0`.
+    NoSlip,
+    /// Prescribed velocity `(u, v, w) = u_s(x, y, z, t)` — inflow / moving wall.
+    Velocity(Box<dyn Fn(f64, f64, f64, f64) -> (f64, f64, f64)>),
+    /// Traction-free outflow: natural (Neumann) velocity, pressure pinned to `0`.
+    Outflow,
+    /// Symmetry plane / free-slip wall (`u·n = 0`, tangential traction-free); pressure
+    /// Neumann. Assumes an axis-aligned boundary.
+    Symmetry,
+}
+
+impl FlowBc3d {
+    /// A prescribed-velocity BC from a closure `(x, y, z, t) -> (u, v, w)`.
+    pub fn velocity(f: impl Fn(f64, f64, f64, f64) -> (f64, f64, f64) + 'static) -> Self {
+        FlowBc3d::Velocity(Box::new(f))
+    }
+
+    fn is_outflow(&self) -> bool {
+        matches!(self, FlowBc3d::Outflow)
+    }
+
+    fn dirichlet(&self, x: f64, y: f64, z: f64, t: f64) -> (f64, f64, f64) {
+        match self {
+            FlowBc3d::NoSlip | FlowBc3d::Outflow | FlowBc3d::Symmetry => (0.0, 0.0, 0.0),
+            FlowBc3d::Velocity(f) => f(x, y, z, t),
+        }
+    }
+}
+
+/// Per-tag 3D boundary conditions — the 3D analogue of [`BoundaryConditions`].
+pub struct BoundaryConditions3d {
+    default: FlowBc3d,
+    by_tag: HashMap<u32, FlowBc3d>,
+}
+
+impl BoundaryConditions3d {
+    /// All boundaries no-slip walls unless overridden.
+    pub fn no_slip() -> Self {
+        Self { default: FlowBc3d::NoSlip, by_tag: HashMap::new() }
+    }
+
+    /// All boundaries take `default` unless overridden.
+    pub fn with_default(default: FlowBc3d) -> Self {
+        Self { default, by_tag: HashMap::new() }
+    }
+
+    /// Assign `bc` to boundary `tag` (builder style).
+    pub fn set(mut self, tag: u32, bc: FlowBc3d) -> Self {
+        self.by_tag.insert(tag, bc);
+        self
+    }
+
+    /// The BC for `tag` (falls back to the `default`).
+    pub fn get(&self, tag: u32) -> &FlowBc3d {
+        self.by_tag.get(&tag).unwrap_or(&self.default)
+    }
+
+    /// Velocity Dirichlet data `(u, v, w)` at `(x, y, z, t)` for boundary `tag`.
+    pub fn dirichlet(&self, tag: u32, x: f64, y: f64, z: f64, t: f64) -> (f64, f64, f64) {
+        self.get(tag).dirichlet(x, y, z, t)
+    }
+
+    /// Whether any boundary tag present in `mesh` is an outflow.
+    pub fn has_outflow(&self, mesh: &Mesh3d) -> bool {
+        mesh.boundary_tags().iter().any(|&t| self.get(t).is_outflow())
+    }
+
+    /// Pressure-Poisson Neumann tags: everything except outflow (pinned `p=0`).
+    pub fn pressure_neumann_tags(&self, mesh: &Mesh3d) -> Vec<u32> {
+        mesh.boundary_tags()
+            .into_iter()
+            .filter(|&t| !self.get(t).is_outflow())
+            .collect()
+    }
+
+    /// Velocity Helmholtz Neumann tags for component `comp` (0=x, 1=y, 2=z): outflow
+    /// tags plus symmetry tags where `comp` is tangential (the face normal is along a
+    /// different axis). At a symmetry face the normal component stays Dirichlet.
+    pub fn velocity_neumann_tags(&self, mesh: &Mesh3d, comp: usize) -> Vec<u32> {
+        mesh.boundary_tags()
+            .into_iter()
+            .filter(|&t| match self.get(t) {
+                FlowBc3d::Outflow => true,
+                FlowBc3d::Symmetry => mesh.boundary_tag_normal_axis(t) != Some(comp),
                 _ => false,
             })
             .collect()

@@ -6,8 +6,10 @@
 //! divergence, gradient correction, SIPG RHS) reuses the validated host `gale::dg`
 //! machinery. Faithful (to solver tolerance) to `gale::dg::Stokes3d`.
 
-use crate::operators::poisson3d::{helmholtz3d_cg_solve, pressure3d_cg_solve};
-use gale::dg::{Mesh3d, Poisson3d};
+use crate::operators::poisson3d::{
+    helmholtz3d_cg_solve, helmholtz3d_cg_solve_tags, pressure3d_cg_solve,
+};
+use gale::dg::{BoundaryConditions3d, Mesh3d, Poisson3d};
 
 type StepResult = Result<(Vec<f64>, Vec<f64>, Vec<f64>), Box<dyn std::error::Error>>;
 
@@ -18,13 +20,30 @@ pub struct GpuStokes3d<'m> {
     pub nu: f64,
     pub dt: f64,
     alpha: f64,
+    /// Pressure-Poisson assembly (pure Neumann, singular — unless an outflow pins it).
     pressure: Poisson3d<'m>,
-    velocity: Poisson3d<'m>,
+    /// Velocity Helmholtz assembly `(λM + A)`, one per component (differ only in their
+    /// Neumann-tag set, for symmetry/slip faces; identical otherwise).
+    velocity_x: Poisson3d<'m>,
+    velocity_y: Poisson3d<'m>,
+    velocity_z: Poisson3d<'m>,
+    /// Whether any boundary is an outflow (pressure pinned ⇒ non-deflated solve).
+    has_outflow: bool,
+    /// Per-component velocity-Neumann tags for the GPU Helmholtz solve (outflow +
+    /// symmetry-tangential faces).
+    velx_neumann: Vec<u32>,
+    vely_neumann: Vec<u32>,
+    velz_neumann: Vec<u32>,
+    /// Pressure-Poisson Neumann tags (everything except outflow) for the GPU solve.
+    pres_neumann_tags: Vec<u32>,
     tol: f64,
     maxit: usize,
 }
 
 impl<'m> GpuStokes3d<'m> {
+    /// Closed-box solver: all-Dirichlet velocity (data from the `bc_*` closures) +
+    /// pure-Neumann (deflated) pressure. For per-region inflow/outflow/wall/symmetry
+    /// conditions use [`with_bcs`](Self::with_bcs).
     pub fn new(mesh: &'m Mesh3d, alpha: f64, nu: f64, dt: f64) -> Self {
         let lambda = 1.0 / (nu * dt);
         Self {
@@ -32,8 +51,46 @@ impl<'m> GpuStokes3d<'m> {
             nu,
             dt,
             alpha,
-            pressure: Poisson3d::with_bc(mesh, alpha, 0.0, vec![0, 1, 2, 3, 4, 5]),
-            velocity: Poisson3d::with_reaction(mesh, alpha, lambda),
+            pressure: Poisson3d::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
+            velocity_x: Poisson3d::with_reaction(mesh, alpha, lambda),
+            velocity_y: Poisson3d::with_reaction(mesh, alpha, lambda),
+            velocity_z: Poisson3d::with_reaction(mesh, alpha, lambda),
+            has_outflow: false,
+            velx_neumann: Vec::new(),
+            vely_neumann: Vec::new(),
+            velz_neumann: Vec::new(),
+            pres_neumann_tags: mesh.boundary_tags(),
+            tol: 1e-10,
+            maxit: 20000,
+        }
+    }
+
+    /// Solver with **per-region** boundary conditions — the GPU analogue of
+    /// `gale::dg::Stokes3d::with_bcs`. Each boundary tag is routed via `bcs` to the right
+    /// pair of operator settings (no-slip/inflow ⇒ velocity-Dirichlet + pressure-Neumann;
+    /// outflow ⇒ velocity-Neumann + pressure-Dirichlet `p=0`; symmetry ⇒ normal component
+    /// Dirichlet `u·n=0` + tangential Neumann). The pinned pressure lets the deflated solve
+    /// be replaced by a plain CG. Use the `*_bc` step methods.
+    pub fn with_bcs(mesh: &'m Mesh3d, alpha: f64, nu: f64, dt: f64, bcs: &BoundaryConditions3d) -> Self {
+        let lambda = 1.0 / (nu * dt);
+        let velx_neumann = bcs.velocity_neumann_tags(mesh, 0);
+        let vely_neumann = bcs.velocity_neumann_tags(mesh, 1);
+        let velz_neumann = bcs.velocity_neumann_tags(mesh, 2);
+        let pres_neumann = bcs.pressure_neumann_tags(mesh);
+        Self {
+            mesh,
+            nu,
+            dt,
+            alpha,
+            pressure: Poisson3d::with_bc(mesh, alpha, 0.0, pres_neumann.clone()),
+            velocity_x: Poisson3d::with_bc(mesh, alpha, lambda, velx_neumann.clone()),
+            velocity_y: Poisson3d::with_bc(mesh, alpha, lambda, vely_neumann.clone()),
+            velocity_z: Poisson3d::with_bc(mesh, alpha, lambda, velz_neumann.clone()),
+            has_outflow: bcs.has_outflow(mesh),
+            velx_neumann,
+            vely_neumann,
+            velz_neumann,
+            pres_neumann_tags: pres_neumann,
             tol: 1e-10,
             maxit: 20000,
         }
@@ -185,12 +242,93 @@ impl<'m> GpuStokes3d<'m> {
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let fzv: Vec<f64> = uhz.iter().map(|v| lambda * v).collect();
-        let bx = self.velocity.rhs(&fxv, |x, y, z| bc_u(x, y, z, t));
-        let by = self.velocity.rhs(&fyv, |x, y, z| bc_v(x, y, z, t));
-        let bz = self.velocity.rhs(&fzv, |x, y, z| bc_w(x, y, z, t));
+        let bx = self.velocity_x.rhs(&fxv, |x, y, z| bc_u(x, y, z, t));
+        let by = self.velocity_y.rhs(&fyv, |x, y, z| bc_v(x, y, z, t));
+        let bz = self.velocity_z.rhs(&fzv, |x, y, z| bc_w(x, y, z, t));
         let (uxn, _) = helmholtz3d_cg_solve(mesh, &bx, self.alpha, lambda, self.tol, self.maxit)?;
         let (uyn, _) = helmholtz3d_cg_solve(mesh, &by, self.alpha, lambda, self.tol, self.maxit)?;
         let (uzn, _) = helmholtz3d_cg_solve(mesh, &bz, self.alpha, lambda, self.tol, self.maxit)?;
+        Ok((uxn, uyn, uzn))
+    }
+
+    /// BC-aware **Navier–Stokes** step with a precomputed nodal body force — the
+    /// [`with_bcs`](Self::with_bcs) companion to [`step_ns_forced`](Self::step_ns_forced).
+    /// Per-region velocity data comes from `bcs`; nodal convection only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_ns_forced_bc(
+        &self,
+        ux: &[f64],
+        uy: &[f64],
+        uz: &[f64],
+        t: f64,
+        bcs: &BoundaryConditions3d,
+        fx: &[f64],
+        fy: &[f64],
+        fz: &[f64],
+    ) -> StepResult {
+        let dt = self.dt;
+        let (cx, cy, cz) = self.convection(ux, uy, uz);
+        let mut uhx = ux.to_vec();
+        let mut uhy = uy.to_vec();
+        let mut uhz = uz.to_vec();
+        for i in 0..self.ndof() {
+            uhx[i] += dt * (fx[i] - cx[i]);
+            uhy[i] += dt * (fy[i] - cy[i]);
+            uhz[i] += dt * (fz[i] - cz[i]);
+        }
+        self.project_and_diffuse_bc(uhx, uhy, uhz, |tag, x, y, z| bcs.dirichlet(tag, x, y, z, t))
+    }
+
+    /// Stages 2–3 for the per-region BC path — the [`project_and_diffuse`] analogue
+    /// using tag-aware host RHS assembly and the tag-aware GPU elliptic solves. An
+    /// outflow pins the pressure (Dirichlet `p=0`) so the deflated solve is replaced by
+    /// a plain CG.
+    fn project_and_diffuse_bc(
+        &self,
+        mut uhx: Vec<f64>,
+        mut uhy: Vec<f64>,
+        mut uhz: Vec<f64>,
+        vel_dir: impl Fn(u32, f64, f64, f64) -> (f64, f64, f64),
+    ) -> StepResult {
+        let mesh = self.mesh;
+        let refh = &mesh.refh;
+        let nn = refh.n_nodes();
+        let dt = self.dt;
+        let lambda = 1.0 / (self.nu * dt);
+
+        // Stage 2 — pressure projection (homogeneous data either way). With an outflow
+        // the operator is non-singular (Dirichlet p=0 there) ⇒ plain Poisson CG; with
+        // no outflow it is the singular pure-Neumann system ⇒ deflated CG.
+        let div = self.divergence(&uhx, &uhy, &uhz);
+        let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
+        let bp = self.pressure.rhs_mixed(&fp, |_, _, _| 0.0, |_, _, _| 0.0);
+        let (p, _it) = if self.has_outflow {
+            helmholtz3d_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?
+        } else {
+            pressure3d_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+        };
+        for (e, el) in mesh.elements.iter().enumerate() {
+            let sl = e * nn..(e + 1) * nn;
+            let gpx = el.geom.grad_x(refh, &p[sl.clone()]);
+            let gpy = el.geom.grad_y(refh, &p[sl.clone()]);
+            let gpz = el.geom.grad_z(refh, &p[sl]);
+            for k in 0..nn {
+                uhx[e * nn + k] -= dt * gpx[k];
+                uhy[e * nn + k] -= dt * gpy[k];
+                uhz[e * nn + k] -= dt * gpz[k];
+            }
+        }
+
+        // Stage 3 — viscous Helmholtz per component, per-region velocity-Neumann tags.
+        let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
+        let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
+        let fzv: Vec<f64> = uhz.iter().map(|v| lambda * v).collect();
+        let bx = self.velocity_x.rhs_tagged(&fxv, |tag, x, y, z| vel_dir(tag, x, y, z).0, |_, _, _, _| 0.0);
+        let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y, z| vel_dir(tag, x, y, z).1, |_, _, _, _| 0.0);
+        let bz = self.velocity_z.rhs_tagged(&fzv, |tag, x, y, z| vel_dir(tag, x, y, z).2, |_, _, _, _| 0.0);
+        let (uxn, _) = helmholtz3d_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?;
+        let (uyn, _) = helmholtz3d_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.vely_neumann, self.tol, self.maxit)?;
+        let (uzn, _) = helmholtz3d_cg_solve_tags(mesh, &bz, self.alpha, lambda, &self.velz_neumann, self.tol, self.maxit)?;
         Ok((uxn, uyn, uzn))
     }
 }

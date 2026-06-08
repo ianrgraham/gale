@@ -87,7 +87,7 @@ pub use amr::{
     SmoothnessIndicator,
 };
 pub use amr3d::{RefineHex, SmoothnessIndicator3d};
-pub use bc::{BoundaryConditions, FlowBc};
+pub use bc::{BoundaryConditions, BoundaryConditions3d, FlowBc, FlowBc3d};
 pub use dgmesh::DgMesh;
 pub use distributed::{distributed_advection_rhs, halo_exchange, partition_blocks};
 pub use face::{quad_faces, Edge, FaceData};

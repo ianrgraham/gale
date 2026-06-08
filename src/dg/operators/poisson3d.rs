@@ -225,6 +225,18 @@ impl<'m> Poisson3d<'m> {
         g: impl Fn(f64, f64, f64) -> f64,
         q: impl Fn(f64, f64, f64) -> f64,
     ) -> Vec<f64> {
+        self.rhs_tagged(f, |_, x, y, z| g(x, y, z), |_, x, y, z| q(x, y, z))
+    }
+
+    /// Like [`rhs_mixed`](Self::rhs_mixed) but the Dirichlet value `g(tag, x, y, z)` and
+    /// Neumann flux `q(tag, x, y, z)` may depend on the boundary tag — the data side of
+    /// per-region 3D boundary conditions.
+    pub fn rhs_tagged(
+        &self,
+        f: &[f64],
+        g: impl Fn(u32, f64, f64, f64) -> f64,
+        q: impl Fn(u32, f64, f64, f64) -> f64,
+    ) -> Vec<f64> {
         let m = self.mesh;
         let refh = &m.refh;
         let nn = refh.n_nodes();
@@ -244,7 +256,7 @@ impl<'m> Poisson3d<'m> {
                 if self.is_neumann(tag) {
                     for a in 0..fc.nodes.len() {
                         let v = fc.nodes[a];
-                        b[e * nn + v] += fc.sw[a] * q(el.geom.x[v], el.geom.y[v], el.geom.z[v]);
+                        b[e * nn + v] += fc.sw[a] * q(tag, el.geom.x[v], el.geom.y[v], el.geom.z[v]);
                     }
                 } else {
                     let tau = self.penalty(e, None);
@@ -254,7 +266,7 @@ impl<'m> Poisson3d<'m> {
                     for a in 0..fc.nodes.len() {
                         let v = fc.nodes[a];
                         let (nx, ny, nz, sw) = (fc.nx[a], fc.ny[a], fc.nz[a], fc.sw[a]);
-                        let gv = g(el.geom.x[v], el.geom.y[v], el.geom.z[v]);
+                        let gv = g(tag, el.geom.x[v], el.geom.y[v], el.geom.z[v]);
                         b[e * nn + v] += tau * sw * gv;
                         hx[v] += sw * gv * nx;
                         hy[v] += sw * gv * ny;

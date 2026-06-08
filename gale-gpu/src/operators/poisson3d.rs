@@ -252,7 +252,7 @@ struct MeshArrays3d {
     ftau: Vec<f64>, // [ne*6]
 }
 
-fn flatten3d(mesh: &Mesh3d, alpha: f64, neumann_all: bool) -> MeshArrays3d {
+fn flatten3d(mesh: &Mesh3d, alpha: f64, neumann_tags: &[u32]) -> MeshArrays3d {
     let nn = mesh.refh.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
@@ -295,7 +295,7 @@ fn flatten3d(mesh: &Mesh3d, alpha: f64, neumann_all: bool) -> MeshArrays3d {
                 Neighbor3::Interior { elem: re, .. } => alpha * p1 * p1 / h[e].min(h[*re]),
                 Neighbor3::Boundary { .. } => alpha * p1 * p1 / h[e],
             };
-            let is_boundary = matches!(nb, Neighbor3::Boundary { .. });
+            let neumann_boundary = matches!(nb, Neighbor3::Boundary { tag } if neumann_tags.contains(tag));
             for a in 0..n2 {
                 let idx = (e * 6 + t) * n2 + a;
                 fvl[idx] = fc.nodes[a] as u32;
@@ -306,7 +306,7 @@ fn flatten3d(mesh: &Mesh3d, alpha: f64, neumann_all: bool) -> MeshArrays3d {
                 if let Neighbor3::Interior { elem: re, face: rface, perm } = nb {
                     let rf = &mesh.elements[*re].faces[*rface as usize];
                     fnbr[idx] = (*re * nn + rf.nodes[perm[a]]) as u32;
-                } else if is_boundary && neumann_all {
+                } else if neumann_boundary {
                     fnbr[idx] = NEU;
                 }
             }
@@ -322,7 +322,7 @@ fn flatten3d(mesh: &Mesh3d, alpha: f64, neumann_all: bool) -> MeshArrays3d {
 /// Apply the matrix-free SIPG Poisson/Helmholtz operator `(λM + A)·u` once on the GPU
 /// (Dirichlet boundaries). Bit-for-bit equal to `gale::dg::Poisson3d::apply`.
 pub fn poisson3d_apply(mesh: &Mesh3d, u: &[f64], alpha: f64, reaction: f64) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    let ma = flatten3d(mesh, alpha, false);
+    let ma = flatten3d(mesh, alpha, &[]);
     assert_eq!(u.len(), ma.ndof, "state length must be n_elements·n_nodes");
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -354,20 +354,39 @@ pub fn poisson3d_apply(mesh: &Mesh3d, u: &[f64], alpha: f64, reaction: f64) -> R
 /// `λ = 0` is pure Poisson) by conjugate gradient on the GPU (Dirichlet boundaries).
 /// Mirrors `gale::dg::Poisson3d::with_reaction(mesh, alpha, λ).cg`.
 pub fn helmholtz3d_cg_solve(mesh: &Mesh3d, b: &[f64], alpha: f64, reaction: f64, tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    cg3d_impl(mesh, b, alpha, reaction, false, tol, maxit)
+    cg3d_impl(mesh, b, alpha, reaction, &[], false, tol, maxit)
+}
+
+/// Tag-aware 3D CG for `(reaction·M + A)·x = b`: boundary tags in `neumann_tags` are
+/// natural (Neumann), the rest Dirichlet SIPG — the per-region (inflow/outflow/symmetry)
+/// path. Non-deflated (a Dirichlet boundary makes it non-singular); used for the velocity
+/// Helmholtz (`neumann_tags` = outflow + symmetry-tangential) and the outflow-pinned
+/// pressure (`reaction = 0`, `neumann_tags` = all except outflow). Mirrors
+/// `gale::dg::Poisson3d::with_bc(mesh, alpha, reaction, neumann_tags).cg`.
+pub fn helmholtz3d_cg_solve_tags(
+    mesh: &Mesh3d,
+    b: &[f64],
+    alpha: f64,
+    reaction: f64,
+    neumann_tags: &[u32],
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg3d_impl(mesh, b, alpha, reaction, neumann_tags, false, tol, maxit)
 }
 
 /// Solve the singular pure-Neumann 3D pressure-Poisson `A·u = b` by **deflated** CG on
 /// the GPU (constant nullspace removed each iteration). Mirrors
 /// `gale::dg::Poisson3d::with_bc(mesh, alpha, 0, all-tags).cg_deflated`.
 pub fn pressure3d_cg_solve(mesh: &Mesh3d, b: &[f64], alpha: f64, tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    cg3d_impl(mesh, b, alpha, 0.0, true, tol, maxit)
+    cg3d_impl(mesh, b, alpha, 0.0, &mesh.boundary_tags(), true, tol, maxit)
 }
 
 /// CG for `(reaction·M + A)·x = b`; `deflate` removes the constant nullspace each
 /// iteration (for the singular pure-Neumann pressure system).
-fn cg3d_impl(mesh: &Mesh3d, b: &[f64], alpha: f64, reaction: f64, deflate: bool, tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    let ma = flatten3d(mesh, alpha, deflate);
+#[allow(clippy::too_many_arguments)]
+fn cg3d_impl(mesh: &Mesh3d, b: &[f64], alpha: f64, reaction: f64, neumann_tags: &[u32], deflate: bool, tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    let ma = flatten3d(mesh, alpha, neumann_tags);
     let ndof = ma.ndof;
     assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
     let ctx = CudaContext::new(0)?;
