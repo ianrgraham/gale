@@ -13,7 +13,7 @@
 //! gradient correction, SIPG RHS lifting) reuses the validated host `gale::dg`
 //! machinery. Bit-for-bit (to solver tolerance) equal to `gale::dg::Stokes::step`.
 
-use crate::operators::poisson::{helmholtz_cg_solve, pressure_cg_solve};
+use crate::operators::poisson::{helmholtz_cg_solve, helmholtz_cg_solve_tags, pressure_cg_solve};
 use crate::operators::poisson_nc::{poisson_nc_cg_solve, pressure_nc_cg_solve};
 
 /// True if the mesh has any 2:1 non-conforming interface (hanging nodes). The GPU
@@ -26,8 +26,8 @@ fn mesh_is_nonconforming(mesh: &Mesh2d) -> bool {
     })
 }
 use gale::dg::{
-    ConstitutiveModel, ConvectionScheme, Hyperbolic, IncompressibleConvection, LogConfOldroydB,
-    Mesh2d, OldroydB, Poisson, VolumeForm,
+    BoundaryConditions, ConstitutiveModel, ConvectionScheme, Hyperbolic, IncompressibleConvection,
+    LogConfOldroydB, Mesh2d, OldroydB, Poisson, VolumeForm,
 };
 
 type StepResult = Result<(Vec<f64>, Vec<f64>), Box<dyn std::error::Error>>;
@@ -45,11 +45,20 @@ pub struct GpuStokes<'m> {
     pressure: Poisson<'m>,
     /// Velocity Helmholtz assembly `(λM + A)` (Dirichlet).
     velocity: Poisson<'m>,
+    /// Whether any boundary is an outflow (pressure pinned ⇒ non-deflated solve).
+    has_outflow: bool,
+    /// Outflow boundary tags (velocity-Neumann faces for the GPU Helmholtz solve).
+    outflow_tags: Vec<u32>,
+    /// Pressure-Poisson Neumann tags (everything except outflow) for the GPU solve.
+    pres_neumann_tags: Vec<u32>,
     tol: f64,
     maxit: usize,
 }
 
 impl<'m> GpuStokes<'m> {
+    /// Closed-box solver: all-Dirichlet velocity (data from the `bc_u`/`bc_v` closures)
+    /// + pure-Neumann (deflated) pressure. For per-region inflow/outflow/wall
+    /// conditions use [`with_bcs`](Self::with_bcs).
     pub fn new(mesh: &'m Mesh2d, alpha: f64, nu: f64, dt: f64) -> Self {
         let lambda = 1.0 / (nu * dt);
         Self {
@@ -58,8 +67,40 @@ impl<'m> GpuStokes<'m> {
             dt,
             convection_scheme: ConvectionScheme::Nodal,
             alpha,
-            pressure: Poisson::with_bc(mesh, alpha, 0.0, vec![0, 1, 2, 3]),
+            pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
             velocity: Poisson::with_reaction(mesh, alpha, lambda),
+            has_outflow: false,
+            outflow_tags: Vec::new(),
+            pres_neumann_tags: mesh.boundary_tags(),
+            tol: 1e-10,
+            maxit: 20000,
+        }
+    }
+
+    /// Solver with **per-region** boundary conditions — the GPU analogue of
+    /// `gale::dg::Stokes::with_bcs`. Each boundary tag is routed via `bcs` to the right
+    /// pair of operator settings (no-slip/inflow ⇒ velocity-Dirichlet + pressure-Neumann;
+    /// outflow ⇒ velocity-Neumann + pressure-Dirichlet `p=0`). The pinned pressure lets
+    /// the deflated solve be replaced by a plain CG. Use the `*_bc` step methods.
+    pub fn with_bcs(mesh: &'m Mesh2d, alpha: f64, nu: f64, dt: f64, bcs: &BoundaryConditions) -> Self {
+        let lambda = 1.0 / (nu * dt);
+        let outflow = bcs.outflow_tags(mesh);
+        let pres_neumann: Vec<u32> = mesh
+            .boundary_tags()
+            .into_iter()
+            .filter(|t| !outflow.contains(t))
+            .collect();
+        Self {
+            mesh,
+            nu,
+            dt,
+            convection_scheme: ConvectionScheme::Nodal,
+            alpha,
+            pressure: Poisson::with_bc(mesh, alpha, 0.0, pres_neumann.clone()),
+            velocity: Poisson::with_bc(mesh, alpha, lambda, outflow.clone()),
+            has_outflow: !outflow.is_empty(),
+            outflow_tags: outflow,
+            pres_neumann_tags: pres_neumann,
             tol: 1e-10,
             maxit: 20000,
         }
@@ -257,6 +298,110 @@ impl<'m> GpuStokes<'m> {
         Ok((uxn, uyn))
     }
 
+    /// BC-aware **Stokes** step (no convection) — the [`with_bcs`](Self::with_bcs)
+    /// companion to [`step`](Self::step). Per-region velocity data comes from `bcs`;
+    /// `fx`/`fy` are the analytic body force.
+    pub fn step_bc(
+        &self,
+        ux: &[f64],
+        uy: &[f64],
+        t: f64,
+        bcs: &BoundaryConditions,
+        fx: impl Fn(f64, f64, f64) -> f64,
+        fy: impl Fn(f64, f64, f64) -> f64,
+    ) -> StepResult {
+        let mesh = self.mesh;
+        let nn = mesh.refq.n_nodes();
+        let dt = self.dt;
+        let mut uhx = ux.to_vec();
+        let mut uhy = uy.to_vec();
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let (x, y) = (el.geom.x[k], el.geom.y[k]);
+                uhx[e * nn + k] += dt * fx(x, y, t);
+                uhy[e * nn + k] += dt * fy(x, y, t);
+            }
+        }
+        self.project_and_diffuse_bc(uhx, uhy, |tag, x, y| bcs.dirichlet(tag, x, y, t))
+    }
+
+    /// BC-aware **Navier–Stokes** step with a precomputed nodal body force — the
+    /// [`with_bcs`](Self::with_bcs) companion to [`step_ns_forced`](Self::step_ns_forced).
+    /// Nodal convection only (the split-form convection BC hook is tag-agnostic).
+    pub fn step_ns_forced_bc(
+        &self,
+        ux: &[f64],
+        uy: &[f64],
+        t: f64,
+        bcs: &BoundaryConditions,
+        force_x: &[f64],
+        force_y: &[f64],
+    ) -> StepResult {
+        assert!(
+            matches!(self.convection_scheme, ConvectionScheme::Nodal),
+            "per-region BCs with split-form convection are not yet supported"
+        );
+        let dt = self.dt;
+        let (cx, cy) = self.convection(ux, uy);
+        let mut uhx = ux.to_vec();
+        let mut uhy = uy.to_vec();
+        for i in 0..self.ndof() {
+            uhx[i] += dt * (force_x[i] - cx[i]);
+            uhy[i] += dt * (force_y[i] - cy[i]);
+        }
+        self.project_and_diffuse_bc(uhx, uhy, |tag, x, y| bcs.dirichlet(tag, x, y, t))
+    }
+
+    /// Stages 2–3 for the per-region BC path — the [`project_and_diffuse`] analogue
+    /// using tag-aware host RHS assembly and the tag-aware GPU elliptic solves. An
+    /// outflow pins the pressure (Dirichlet `p=0`) so the deflated solve is replaced by
+    /// a plain CG. Conforming meshes only (NC + per-region BCs is a follow-up).
+    fn project_and_diffuse_bc(
+        &self,
+        mut uhx: Vec<f64>,
+        mut uhy: Vec<f64>,
+        vel_dir: impl Fn(u32, f64, f64) -> (f64, f64),
+    ) -> StepResult {
+        let mesh = self.mesh;
+        let refq = &mesh.refq;
+        let nn = refq.n_nodes();
+        let dt = self.dt;
+        let lambda = 1.0 / (self.nu * dt);
+        assert!(
+            !mesh_is_nonconforming(mesh),
+            "per-region GPU BCs on non-conforming meshes are not yet supported"
+        );
+
+        // Stage 2 — pressure projection (homogeneous data either way). With an outflow
+        // the operator is non-singular (Dirichlet p=0 there) ⇒ plain Poisson CG; with
+        // no outflow it is the singular pure-Neumann system ⇒ deflated CG.
+        let div = self.divergence(&uhx, &uhy);
+        let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
+        let bp = self.pressure.rhs_mixed(&fp, |_, _| 0.0, |_, _| 0.0);
+        let (p, _it) = if self.has_outflow {
+            helmholtz_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?
+        } else {
+            pressure_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+        };
+        for (e, el) in mesh.elements.iter().enumerate() {
+            let gpx = el.geom.grad_x(refq, &p[e * nn..(e + 1) * nn]);
+            let gpy = el.geom.grad_y(refq, &p[e * nn..(e + 1) * nn]);
+            for k in 0..nn {
+                uhx[e * nn + k] -= dt * gpx[k];
+                uhy[e * nn + k] -= dt * gpy[k];
+            }
+        }
+
+        // Stage 3 — viscous Helmholtz per component, outflow tags = velocity-Neumann.
+        let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
+        let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
+        let bx = self.velocity.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
+        let by = self.velocity.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
+        let (uxn, _) = helmholtz_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.outflow_tags, self.tol, self.maxit)?;
+        let (uyn, _) = helmholtz_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.outflow_tags, self.tol, self.maxit)?;
+        Ok((uxn, uyn))
+    }
+
     /// Velocity-field L2 norm (uses the velocity operator's mass).
     pub fn l2_norm(&self, v: &[f64]) -> f64 {
         self.velocity.l2_norm(v)
@@ -346,6 +491,9 @@ pub struct GpuDualSplitting {
     velocity: gale::sim::FieldId,
     bc_u: Box<dyn Fn(f64, f64, f64) -> f64>,
     bc_v: Box<dyn Fn(f64, f64, f64) -> f64>,
+    /// Per-region BCs. `Some` ⇒ the [`GpuStokes::with_bcs`] path; `None` ⇒ the legacy
+    /// `bc_u`/`bc_v` all-Dirichlet path.
+    bcs: Option<BoundaryConditions>,
     #[allow(clippy::type_complexity)]
     body_force: Box<dyn Fn(&gale::sim::State, f64) -> (Vec<f64>, Vec<f64>)>,
 }
@@ -362,6 +510,7 @@ impl GpuDualSplitting {
             velocity,
             bc_u: Box::new(|_, _, _| 0.0),
             bc_v: Box::new(|_, _, _| 0.0),
+            bcs: None,
             body_force: Box::new(|s: &gale::sim::State, _t: f64| {
                 let n = s.ndof();
                 (vec![0.0; n], vec![0.0; n])
@@ -377,6 +526,14 @@ impl GpuDualSplitting {
     ) -> Self {
         self.bc_u = Box::new(bc_u);
         self.bc_v = Box::new(bc_v);
+        self
+    }
+
+    /// Set **per-region** boundary conditions (inflow / outflow / walls by tag),
+    /// overriding the single global [`boundary`](Self::boundary) closure. Routes the
+    /// GPU flow step through [`GpuStokes::with_bcs`].
+    pub fn boundary_conditions(mut self, bcs: BoundaryConditions) -> Self {
+        self.bcs = Some(bcs);
         self
     }
 
@@ -404,16 +561,24 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
 
     fn step(&self, state: &mut gale::sim::State, hook: &dyn gale::sim::StateStageHook) {
         let t_new = state.time.t + self.dt;
-        let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt);
-        stokes.convection_scheme = self.convection_scheme;
         let (ux, uy) = {
             let v = state.fields.by_id(self.velocity);
             (v.component(0).to_vec(), v.component(1).to_vec())
         };
         let (bx, by) = (self.body_force)(state, t_new);
-        let (nux, nuy) = stokes
-            .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
-            .expect("gale-gpu: GpuDualSplitting step failed");
+        let (nux, nuy) = if let Some(bcs) = &self.bcs {
+            let mut stokes = GpuStokes::with_bcs(&state.mesh, self.alpha, self.nu, self.dt, bcs);
+            stokes.convection_scheme = self.convection_scheme;
+            stokes
+                .step_ns_forced_bc(&ux, &uy, t_new, bcs, &bx, &by)
+                .expect("gale-gpu: GpuDualSplitting BC step failed")
+        } else {
+            let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt);
+            stokes.convection_scheme = self.convection_scheme;
+            stokes
+                .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
+                .expect("gale-gpu: GpuDualSplitting step failed")
+        };
         {
             let v = state.fields.by_id_mut(self.velocity);
             v.component_mut(0).copy_from_slice(&nux);

@@ -336,11 +336,13 @@ struct MeshArrays {
 }
 
 /// Flatten a mesh's metrics and SIPG face metadata (penalty `tau` from `alpha`),
-/// matching the host-side assembly in the original `gpu_poisson_*` bins. When
-/// `neumann_all` is set, every boundary face is marked Neumann (`NEU`, natural BC ⇒
-/// no operator contribution) instead of the default Dirichlet SIPG (`BND`) — this is
-/// the pure-Neumann pressure-Poisson of the dual-splitting scheme.
-fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_all: bool) -> MeshArrays {
+/// matching the host-side assembly in the original `gpu_poisson_*` bins. A boundary
+/// face whose tag is in `neumann_tags` is marked Neumann (`NEU`, natural BC ⇒ no
+/// operator contribution); all other boundary faces stay Dirichlet SIPG (`BND`). So
+/// `&[]` is all-Dirichlet (velocity Helmholtz) and `&mesh.boundary_tags()` is the
+/// pure-Neumann pressure-Poisson; a partial set is the per-region (inflow/outflow)
+/// case where outflow tags are Dirichlet (`p=0`) and the rest Neumann.
+fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32]) -> MeshArrays {
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
@@ -375,7 +377,7 @@ fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_all: bool) -> MeshArrays {
                 Neighbor::Boundary { .. } => alpha * p1 * p1 / h[e],
                 Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => unreachable!(),
             };
-            let is_boundary = matches!(nb, Neighbor::Boundary { .. });
+            let neumann_boundary = matches!(nb, Neighbor::Boundary { tag } if neumann_tags.contains(tag));
             for a in 0..n1u {
                 let idx = (e * 4 + t) * n1u + a;
                 fvl[idx] = face.nodes[a] as u32;
@@ -385,8 +387,8 @@ fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_all: bool) -> MeshArrays {
                 if let Neighbor::Interior { elem: re, edge: redge, perm } = nb {
                     let rf = &mesh.elements[*re].faces[*redge as usize];
                     fnbr[idx] = (*re * nn + rf.nodes[perm[a]]) as u32;
-                } else if is_boundary && neumann_all {
-                    fnbr[idx] = NEU; // natural BC: kernel skips this face
+                } else if neumann_boundary {
+                    fnbr[idx] = NEU; // natural BC: kernel skips this face (else stays BND)
                 }
             }
         }
@@ -424,7 +426,7 @@ pub fn poisson_apply(
     u: &[f64],
     alpha: f64,
 ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    let ma = flatten_mesh(mesh, alpha, false);
+    let ma = flatten_mesh(mesh, alpha, &[]);
     assert_eq!(u.len(), ma.ndof, "state length must be n_elements·n_nodes");
 
     let ctx = CudaContext::new(0)?;
@@ -480,7 +482,7 @@ pub fn poisson_cg_solve(
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    cg_solve_impl(mesh, b, alpha, 0.0, tol, maxit)
+    cg_solve_impl(mesh, b, alpha, 0.0, &[], tol, maxit)
 }
 
 /// Solve the SIPG **Helmholtz** system `(λM + A)·u = b` by conjugate gradient on the
@@ -496,7 +498,26 @@ pub fn helmholtz_cg_solve(
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    cg_solve_impl(mesh, b, alpha, reaction, tol, maxit)
+    cg_solve_impl(mesh, b, alpha, reaction, &[], tol, maxit)
+}
+
+/// Tag-aware CG for `(reaction·M + A)·x = b` on the GPU: boundary tags in
+/// `neumann_tags` are natural (Neumann), the rest Dirichlet SIPG — the per-region
+/// (inflow/outflow/wall) boundary path. The operator is non-singular as long as at
+/// least one boundary is Dirichlet, so this is the *non-deflated* solve used for both
+/// the viscous-velocity Helmholtz (`neumann_tags` = outflow) and the pressure-Poisson
+/// when an outflow pins it (`reaction = 0`, `neumann_tags` = everything except outflow).
+/// Mirrors `gale::dg::Poisson::with_bc(mesh, alpha, reaction, neumann_tags).cg`.
+pub fn helmholtz_cg_solve_tags(
+    mesh: &Mesh2d,
+    b: &[f64],
+    alpha: f64,
+    reaction: f64,
+    neumann_tags: &[u32],
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg_solve_impl(mesh, b, alpha, reaction, neumann_tags, tol, maxit)
 }
 
 /// Unpreconditioned CG for `(reaction·M + A)·x = b` on the GPU. `reaction = 0` is the
@@ -506,10 +527,11 @@ fn cg_solve_impl(
     b: &[f64],
     alpha: f64,
     reaction: f64,
+    neumann_tags: &[u32],
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    let ma = flatten_mesh(mesh, alpha, false);
+    let ma = flatten_mesh(mesh, alpha, neumann_tags);
     let ndof = ma.ndof;
     assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
 
@@ -603,7 +625,7 @@ pub fn pressure_cg_solve(
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    let ma = flatten_mesh(mesh, alpha, true); // pure-Neumann boundaries
+    let ma = flatten_mesh(mesh, alpha, &mesh.boundary_tags()); // pure-Neumann boundaries
     let ndof = ma.ndof;
     assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
 
@@ -738,7 +760,7 @@ pub fn poisson_pcg_solve(
 
     for l in 0..nlev {
         let m = mg.mesh(l);
-        let ma = flatten_mesh(m, mg.alpha, false);
+        let ma = flatten_mesh(m, mg.alpha, &[]);
         n1v.push(ma.n1);
         nev.push(ma.ne as u32);
         ndofv.push(ma.ndof);
