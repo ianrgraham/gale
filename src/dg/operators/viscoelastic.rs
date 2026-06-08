@@ -16,8 +16,95 @@
 //! High-`Wi` robustness (the log-conformation reformulation that keeps `C` SPD) is
 //! a follow-on; the direct form here is stable at moderate `Wi`.
 
-use super::mesh::Mesh2d;
+use super::face::Edge;
+use super::mesh::{Mesh2d, Neighbor};
 use super::stokes::Stokes;
+
+/// Inflow boundary data for the conformation transport: at boundary nodes whose tag is
+/// in `tags` **and** where flow enters (`u·n < 0`), the upwind external trace is the
+/// constant conformation `c = [Cxx, Cxy, Cyy]` (the incoming polymer state — e.g.
+/// `[1, 0, 1]` for relaxed fluid). Boundaries not listed (walls, outflow) are
+/// transparent (the field advects out / is set by the interior). Spatially- or
+/// temporally-varying inflow is a follow-up.
+#[derive(Clone, Debug)]
+pub struct ConformationInflow {
+    pub tags: Vec<u32>,
+    pub c: [f64; 3],
+}
+
+impl ConformationInflow {
+    /// Prescribe the incoming conformation `c = [Cxx, Cxy, Cyy]` on boundary `tags`.
+    pub fn new(tags: Vec<u32>, c: [f64; 3]) -> Self {
+        Self { tags, c }
+    }
+
+    /// Relaxed (equilibrium, `C = I`) fluid entering on the given `tags`.
+    pub fn equilibrium(tags: Vec<u32>) -> Self {
+        Self { tags, c: [1.0, 0.0, 1.0] }
+    }
+}
+
+/// Upwind DG **surface lift** for the advection of a 3-component (symmetric-tensor)
+/// field `φ` by the divergence-free velocity `(ux, uy)`. Returns the correction to ADD
+/// to the collocation volume term `−(u·∇)φ`, upgrading it to full upwind DG transport
+/// with inter-element coupling — the collocation term alone is element-local and does
+/// not transport `φ` across element faces.
+///
+/// Strong form: `φ̇ = −∇·F + M⁻¹∮ v (F·n − F*·n)`, `F = uφ`. The volume term `−∇·F`
+/// (incompressible ⇒ `−(u·∇)φ`) is the existing collocation term; this returns the
+/// lift `M⁻¹∮ v (u·n)(φ⁻ − φ*)`, which at a collocated GLL face node `i` is
+/// `(sw_i/jw_i)(u·n)_i (φ⁻_i − φ*_i)`. It is nonzero only at **inflow** nodes
+/// (`u·n < 0`), with `φ*` the upwind trace: the neighbour across an interior face, the
+/// `bdry` datum at a boundary inflow node (in `φ`'s own variable — `C` for the direct
+/// form, `Ψ = log C` for log-conformation), or transparent (`φ⁻`, no correction) where
+/// `bdry` returns `None`. Non-conforming faces are not handled (viscoelastic AMR is a
+/// follow-up); they contribute no correction.
+///
+/// Public so the GPU conformation advance (`gale_gpu`) can add this cheap O(N) surface
+/// correction host-side to its device-computed collocation volume term — the standard
+/// "expensive solves on device, cheap element-local assembly on host" split.
+pub fn upwind_advection_lift(
+    mesh: &Mesh2d,
+    field: &[Vec<f64>; 3],
+    ux: &[f64],
+    uy: &[f64],
+    bdry: impl Fn(u32) -> Option<[f64; 3]>,
+) -> [Vec<f64>; 3] {
+    let nn = mesh.refq.n_nodes();
+    let n = mesh.n_elements() * nn;
+    let mut out = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+    for (e, el) in mesh.elements.iter().enumerate() {
+        for edge in Edge::ALL {
+            let face = &el.faces[edge as usize];
+            let nb = &el.neighbors[edge as usize];
+            for a in 0..face.nodes.len() {
+                let vl = face.nodes[a];
+                let g = e * nn + vl;
+                let un = ux[g] * face.nx[a] + uy[g] * face.ny[a];
+                if un >= 0.0 {
+                    continue; // outflow node: upwind = interior ⇒ no correction
+                }
+                // Inflow node: external (upwind) trace φ*.
+                let ext: [f64; 3] = match nb {
+                    Neighbor::Interior { elem: re, edge: redge, perm } => {
+                        let rf = &mesh.elements[*re].faces[*redge as usize];
+                        let vr = *re * nn + rf.nodes[perm[a]];
+                        [field[0][vr], field[1][vr], field[2][vr]]
+                    }
+                    Neighbor::Boundary { tag } => {
+                        bdry(*tag).unwrap_or([field[0][g], field[1][g], field[2][g]])
+                    }
+                    _ => [field[0][g], field[1][g], field[2][g]], // NC: no correction
+                };
+                let fac = face.sw[a] * un / el.geom.jw[vl];
+                for comp in 0..3 {
+                    out[comp][g] += fac * (field[comp][g] - ext[comp]);
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Oldroyd-B conformation-tensor transport on a DG mesh (velocity prescribed).
 pub struct OldroydB<'m> {
@@ -26,11 +113,20 @@ pub struct OldroydB<'m> {
     pub lambda: f64,
     /// Polymer viscosity `η_p` (used only for the stress map).
     pub eta_p: f64,
+    /// Optional conformation inflow boundary data (the incoming polymer state at an
+    /// inlet). `None` ⇒ all boundaries transparent.
+    pub inflow: Option<ConformationInflow>,
 }
 
 impl<'m> OldroydB<'m> {
     pub fn new(mesh: &'m Mesh2d, lambda: f64, eta_p: f64) -> Self {
-        Self { mesh, lambda, eta_p }
+        Self { mesh, lambda, eta_p, inflow: None }
+    }
+
+    /// Set the conformation inflow boundary data (builder style).
+    pub fn with_inflow(mut self, inflow: ConformationInflow) -> Self {
+        self.inflow = Some(inflow);
+        self
     }
 
     fn ndof(&self) -> usize {
@@ -89,6 +185,16 @@ impl<'m> OldroydB<'m> {
                 out[0][g] = -adv_xx + s_xx + r_xx;
                 out[1][g] = -adv_xy + s_xy + r_xy;
                 out[2][g] = -adv_yy + s_yy + r_yy;
+            }
+        }
+        // Upwind DG surface lift — couples advection across element faces (the volume
+        // term above is element-local) and injects the inflow conformation directly.
+        let lift = upwind_advection_lift(self.mesh, c, ux, uy, |tag| {
+            self.inflow.as_ref().filter(|i| i.tags.contains(&tag)).map(|i| i.c)
+        });
+        for comp in 0..3 {
+            for g in 0..n {
+                out[comp][g] += lift[comp][g];
             }
         }
         out
@@ -278,11 +384,20 @@ pub struct LogConfOldroydB<'m> {
     pub mesh: &'m Mesh2d,
     pub lambda: f64,
     pub eta_p: f64,
+    /// Optional conformation inflow boundary data (specified as the conformation `C`;
+    /// converted to `Ψ = log C` internally). `None` ⇒ all boundaries transparent.
+    pub inflow: Option<ConformationInflow>,
 }
 
 impl<'m> LogConfOldroydB<'m> {
     pub fn new(mesh: &'m Mesh2d, lambda: f64, eta_p: f64) -> Self {
-        Self { mesh, lambda, eta_p }
+        Self { mesh, lambda, eta_p, inflow: None }
+    }
+
+    /// Set the conformation inflow boundary data (builder style).
+    pub fn with_inflow(mut self, inflow: ConformationInflow) -> Self {
+        self.inflow = Some(inflow);
+        self
     }
 
     fn ndof(&self) -> usize {
@@ -399,6 +514,19 @@ impl<'m> LogConfOldroydB<'m> {
                 out[0][g] = -adv_xx + rot_xx + 2.0 * bxx + relax_xx;
                 out[1][g] = -adv_xy + rot_xy + 2.0 * bxy + relax_xy;
                 out[2][g] = -adv_yy + rot_yy + 2.0 * byy + relax_yy;
+            }
+        }
+        // Upwind DG surface lift for the −(u·∇)Ψ transport. Inflow is specified as the
+        // conformation C; the upwind trace is in the Ψ variable, so convert Ψ = log C.
+        let lift = upwind_advection_lift(self.mesh, psi, ux, uy, |tag| {
+            self.inflow
+                .as_ref()
+                .filter(|i| i.tags.contains(&tag))
+                .map(|i| sym_apply(i.c[0], i.c[1], i.c[2], f64::ln))
+        });
+        for comp in 0..3 {
+            for g in 0..n {
+                out[comp][g] += lift[comp][g];
             }
         }
         out
@@ -677,6 +805,67 @@ mod tests {
         }
         eprintln!("log-conf channel: max|u−U|={uerr:.3e} (Umax={:.4})", u_exact(0.5));
         assert!(uerr < 5e-3, "log-conf coupling: velocity not the η₀ parabola: {uerr}");
+    }
+
+    #[test]
+    fn upwind_advection_transports_across_elements() {
+        // Pure x-advection of a smooth conformation bump by uniform flow u=(1,0) on a
+        // PERIODIC mesh: ∇u=0 (no stretching), λ huge (negligible relaxation). The exact
+        // solution Cxx(x,t) = 1 + ½sin(2π(x−t)) advects across element faces and around
+        // the periodic seam — which the element-local collocation term ALONE cannot do.
+        // This is the test that the upwind surface lift actually transports across faces.
+        use std::f64::consts::PI;
+        let p = 4;
+        let mesh = Mesh2d::rectangular_periodic(p, 6, 1, [0.0, 1.0], [0.0, 0.25]);
+        let ob = OldroydB::new(&mesh, 1e6, 1.0);
+        let nn = mesh.refq.n_nodes();
+        let u = vec![1.0; mesh.n_elements() * nn];
+        let v = vec![0.0; mesh.n_elements() * nn];
+        let c0 = nodal(&mesh, |x, _| 1.0 + 0.5 * (2.0 * PI * x).sin());
+        let mut c = [c0.clone(), vec![0.0; c0.len()], vec![1.0; c0.len()]];
+        let dt = 1e-3_f64;
+        let t_end = 0.5_f64;
+        for _ in 0..(t_end / dt).round() as usize {
+            c = ob.step_ssp_rk3(&c, &u, &v, dt);
+        }
+        let exact = nodal(&mesh, |x, _| 1.0 + 0.5 * (2.0 * PI * (x - t_end)).sin());
+        let err = c[0].iter().zip(&exact).fold(0.0f64, |a, (x, y)| a.max((x - y).abs()));
+        eprintln!("periodic conformation advection: max|Cxx − exact| = {err:.3e}");
+        assert!(err < 5e-3, "upwind advection not transporting across elements: {err}");
+    }
+
+    #[test]
+    fn conformation_inflow_fills_domain() {
+        // Stretched fluid C_in = [2,0,1] enters at the west inlet (tag 3) under uniform
+        // flow u=(1,0); no stretching (∇u=0), negligible relaxation (λ huge). The inflow
+        // datum must be carried downstream across every element to fill the domain —
+        // steady state C = C_in everywhere. Without the inflow flux the interior stays I.
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 6, 2, [0.0, 3.0], [0.0, 1.0]);
+        let c_in = [2.0, 0.0, 1.0];
+        let ob = OldroydB::new(&mesh, 1e6, 1.0).with_inflow(ConformationInflow::new(vec![3], c_in));
+        let nn = mesh.refq.n_nodes();
+        let u = vec![1.0; mesh.n_elements() * nn];
+        let v = vec![0.0; mesh.n_elements() * nn];
+        let mut c = ob.identity(); // start relaxed, C = I
+        let dt = 2e-3_f64;
+        for _ in 0..(12.0 / dt).round() as usize {
+            c = ob.step_ssp_rk3(&c, &u, &v, dt); // ~4 flow-throughs (L=3, U=1)
+        }
+        // Downstream of the inlet element, the domain is filled with C_in.
+        let mut err = 0.0f64;
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                if el.geom.x[k] > 0.6 {
+                    let g = e * nn + k;
+                    for comp in 0..3 {
+                        err = err.max((c[comp][g] - c_in[comp]).abs());
+                    }
+                }
+            }
+        }
+        eprintln!("conformation inflow fill: downstream max|C − C_in| = {err:.3e}");
+        assert!(err < 5e-3, "inflow conformation not carried downstream: {err}");
     }
 
     #[test]
