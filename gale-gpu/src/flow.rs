@@ -44,12 +44,16 @@ pub struct GpuStokes<'m> {
     alpha: f64,
     /// Pressure-Poisson assembly (pure Neumann, singular).
     pressure: Poisson<'m>,
-    /// Velocity Helmholtz assembly `(λM + A)` (Dirichlet).
-    velocity: Poisson<'m>,
+    /// Velocity Helmholtz assembly `(λM + A)`, one per component (differ only in their
+    /// Neumann-tag set, for symmetry/slip faces; identical otherwise).
+    velocity_x: Poisson<'m>,
+    velocity_y: Poisson<'m>,
     /// Whether any boundary is an outflow (pressure pinned ⇒ non-deflated solve).
     has_outflow: bool,
-    /// Outflow boundary tags (velocity-Neumann faces for the GPU Helmholtz solve).
-    outflow_tags: Vec<u32>,
+    /// Per-component velocity-Neumann tags for the GPU Helmholtz solve (outflow +
+    /// symmetry-tangential faces).
+    velx_neumann: Vec<u32>,
+    vely_neumann: Vec<u32>,
     /// Pressure-Poisson Neumann tags (everything except outflow) for the GPU solve.
     pres_neumann_tags: Vec<u32>,
     tol: f64,
@@ -69,9 +73,11 @@ impl<'m> GpuStokes<'m> {
             convection_scheme: ConvectionScheme::Nodal,
             alpha,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
-            velocity: Poisson::with_reaction(mesh, alpha, lambda),
+            velocity_x: Poisson::with_reaction(mesh, alpha, lambda),
+            velocity_y: Poisson::with_reaction(mesh, alpha, lambda),
             has_outflow: false,
-            outflow_tags: Vec::new(),
+            velx_neumann: Vec::new(),
+            vely_neumann: Vec::new(),
             pres_neumann_tags: mesh.boundary_tags(),
             tol: 1e-10,
             maxit: 20000,
@@ -85,12 +91,9 @@ impl<'m> GpuStokes<'m> {
     /// the deflated solve be replaced by a plain CG. Use the `*_bc` step methods.
     pub fn with_bcs(mesh: &'m Mesh2d, alpha: f64, nu: f64, dt: f64, bcs: &BoundaryConditions) -> Self {
         let lambda = 1.0 / (nu * dt);
-        let outflow = bcs.outflow_tags(mesh);
-        let pres_neumann: Vec<u32> = mesh
-            .boundary_tags()
-            .into_iter()
-            .filter(|t| !outflow.contains(t))
-            .collect();
+        let velx_neumann = bcs.velocity_neumann_tags(mesh, 0);
+        let vely_neumann = bcs.velocity_neumann_tags(mesh, 1);
+        let pres_neumann = bcs.pressure_neumann_tags(mesh);
         Self {
             mesh,
             nu,
@@ -98,9 +101,11 @@ impl<'m> GpuStokes<'m> {
             convection_scheme: ConvectionScheme::Nodal,
             alpha,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, pres_neumann.clone()),
-            velocity: Poisson::with_bc(mesh, alpha, lambda, outflow.clone()),
-            has_outflow: !outflow.is_empty(),
-            outflow_tags: outflow,
+            velocity_x: Poisson::with_bc(mesh, alpha, lambda, velx_neumann.clone()),
+            velocity_y: Poisson::with_bc(mesh, alpha, lambda, vely_neumann.clone()),
+            has_outflow: bcs.has_outflow(mesh),
+            velx_neumann,
+            vely_neumann,
             pres_neumann_tags: pres_neumann,
             tol: 1e-10,
             maxit: 20000,
@@ -284,8 +289,8 @@ impl<'m> GpuStokes<'m> {
         // Stage 3 — viscous Helmholtz per component: (λM + A) uⁿ⁺¹ = λM û̂ + Dirichlet.
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
-        let bx = self.velocity.rhs(&fxv, |x, y| bc_u(x, y, t));
-        let by = self.velocity.rhs(&fyv, |x, y| bc_v(x, y, t));
+        let bx = self.velocity_x.rhs(&fxv, |x, y| bc_u(x, y, t));
+        let by = self.velocity_y.rhs(&fyv, |x, y| bc_v(x, y, t));
         let (uxn, _) = if nc {
             poisson_nc_cg_solve(mesh, &bx, self.alpha, lambda, self.tol, self.maxit)?
         } else {
@@ -396,16 +401,16 @@ impl<'m> GpuStokes<'m> {
         // Stage 3 — viscous Helmholtz per component, outflow tags = velocity-Neumann.
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
-        let bx = self.velocity.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
-        let by = self.velocity.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
-        let (uxn, _) = helmholtz_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.outflow_tags, self.tol, self.maxit)?;
-        let (uyn, _) = helmholtz_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.outflow_tags, self.tol, self.maxit)?;
+        let bx = self.velocity_x.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
+        let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
+        let (uxn, _) = helmholtz_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?;
+        let (uyn, _) = helmholtz_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.vely_neumann, self.tol, self.maxit)?;
         Ok((uxn, uyn))
     }
 
     /// Velocity-field L2 norm (uses the velocity operator's mass).
     pub fn l2_norm(&self, v: &[f64]) -> f64 {
-        self.velocity.l2_norm(v)
+        self.velocity_x.l2_norm(v)
     }
 }
 

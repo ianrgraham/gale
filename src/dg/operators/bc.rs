@@ -34,6 +34,11 @@ pub enum FlowBc {
     Velocity(Box<dyn Fn(f64, f64, f64) -> (f64, f64)>),
     /// Traction-free outflow: natural (Neumann) velocity, pressure pinned to `0`.
     Outflow,
+    /// Symmetry plane / free-slip wall: no penetration (`u·n = 0`, Dirichlet on the
+    /// **normal** component) + traction-free tangentially (Neumann on the **tangential**
+    /// components); pressure Neumann. Assumes an axis-aligned boundary (the per-tag
+    /// normal is read from a representative face).
+    Symmetry,
 }
 
 impl FlowBc {
@@ -47,10 +52,11 @@ impl FlowBc {
     }
 
     /// The velocity Dirichlet data this region imposes at `(x, y, t)`. Zero where the
-    /// region is not a velocity-Dirichlet one (`Outflow`), where the value is unused.
+    /// region is not a velocity-Dirichlet one (`Outflow`/`Symmetry`), where the value is
+    /// either unused or the no-penetration `0`.
     fn dirichlet(&self, x: f64, y: f64, t: f64) -> (f64, f64) {
         match self {
-            FlowBc::NoSlip | FlowBc::Outflow => (0.0, 0.0),
+            FlowBc::NoSlip | FlowBc::Outflow | FlowBc::Symmetry => (0.0, 0.0),
             FlowBc::Velocity(f) => f(x, y, t),
         }
     }
@@ -102,5 +108,31 @@ impl BoundaryConditions {
     /// Whether any boundary tag present in `mesh` is an outflow.
     pub fn has_outflow(&self, mesh: &Mesh2d) -> bool {
         mesh.boundary_tags().iter().any(|&t| self.get(t).is_outflow())
+    }
+
+    /// Neumann tags for the **pressure**-Poisson: everything except outflow (where the
+    /// pressure is pinned Dirichlet `p=0`). Walls / inflow / symmetry are all Neumann.
+    pub fn pressure_neumann_tags(&self, mesh: &Mesh2d) -> Vec<u32> {
+        mesh.boundary_tags()
+            .into_iter()
+            .filter(|&t| !self.get(t).is_outflow())
+            .collect()
+    }
+
+    /// Neumann tags for the **velocity** Helmholtz solve of component `comp` (0=x, 1=y,
+    /// 2=z): outflow tags (always natural), plus symmetry tags where this component is
+    /// *tangential* — i.e. the symmetry face's normal is along a different axis. At a
+    /// symmetry face the normal component stays Dirichlet (`u·n = 0`); the others are
+    /// Neumann. The per-tag normal axis is read from a representative face via
+    /// [`Mesh2d::boundary_tag_normal_axis`].
+    pub fn velocity_neumann_tags(&self, mesh: &Mesh2d, comp: usize) -> Vec<u32> {
+        mesh.boundary_tags()
+            .into_iter()
+            .filter(|&t| match self.get(t) {
+                FlowBc::Outflow => true,
+                FlowBc::Symmetry => mesh.boundary_tag_normal_axis(t) != Some(comp),
+                _ => false,
+            })
+            .collect()
     }
 }

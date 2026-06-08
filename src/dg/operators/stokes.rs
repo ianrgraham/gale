@@ -33,8 +33,11 @@ pub struct Stokes<'m> {
     pub convection_scheme: ConvectionScheme,
     /// Pressure-Poisson operator (pure Neumann, singular).
     pressure: Poisson<'m>,
-    /// Velocity Helmholtz operator `(1/(νΔt))M + A` (Dirichlet).
-    velocity: Poisson<'m>,
+    /// Velocity Helmholtz operators `(1/(νΔt))M + A`, one per component. They differ
+    /// only in their Neumann-tag set, which matters for symmetry/slip faces (the normal
+    /// component is Dirichlet, the tangential ones Neumann); identical otherwise.
+    velocity_x: Poisson<'m>,
+    velocity_y: Poisson<'m>,
     /// Whether any boundary is an outflow (pressure pinned ⇒ non-singular pressure
     /// system ⇒ plain CG instead of the deflated CG).
     has_outflow: bool,
@@ -55,7 +58,8 @@ impl<'m> Stokes<'m> {
             dt,
             convection_scheme: ConvectionScheme::Nodal,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
-            velocity: Poisson::with_reaction(mesh, alpha, lambda),
+            velocity_x: Poisson::with_reaction(mesh, alpha, lambda),
+            velocity_y: Poisson::with_reaction(mesh, alpha, lambda),
             has_outflow: false,
             tol: 1e-10,
             maxit: 20000,
@@ -71,20 +75,15 @@ impl<'m> Stokes<'m> {
     /// [`step_ns_forced_bc`](Self::step_ns_forced_bc)) with this constructor.
     pub fn with_bcs(mesh: &'m Mesh2d, alpha: f64, nu: f64, dt: f64, bcs: &BoundaryConditions) -> Self {
         let lambda = 1.0 / (nu * dt);
-        let outflow = bcs.outflow_tags(mesh);
-        let pres_neumann: Vec<u32> = mesh
-            .boundary_tags()
-            .into_iter()
-            .filter(|t| !outflow.contains(t))
-            .collect();
         Self {
             mesh,
             nu,
             dt,
             convection_scheme: ConvectionScheme::Nodal,
-            pressure: Poisson::with_bc(mesh, alpha, 0.0, pres_neumann),
-            velocity: Poisson::with_bc(mesh, alpha, lambda, outflow.clone()),
-            has_outflow: !outflow.is_empty(),
+            pressure: Poisson::with_bc(mesh, alpha, 0.0, bcs.pressure_neumann_tags(mesh)),
+            velocity_x: Poisson::with_bc(mesh, alpha, lambda, bcs.velocity_neumann_tags(mesh, 0)),
+            velocity_y: Poisson::with_bc(mesh, alpha, lambda, bcs.velocity_neumann_tags(mesh, 1)),
+            has_outflow: bcs.has_outflow(mesh),
             tol: 1e-10,
             maxit: 20000,
         }
@@ -333,16 +332,16 @@ impl<'m> Stokes<'m> {
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         // Per-tag Dirichlet velocity data; outflow tags are Neumann (natural, flux 0).
-        let bx = self.velocity.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
-        let by = self.velocity.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
-        let (uxn, _, _) = self.velocity.cg(&bx, self.tol, self.maxit);
-        let (uyn, _, _) = self.velocity.cg(&by, self.tol, self.maxit);
+        let bx = self.velocity_x.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
+        let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
+        let (uxn, _, _) = self.velocity_x.cg(&bx, self.tol, self.maxit);
+        let (uyn, _, _) = self.velocity_y.cg(&by, self.tol, self.maxit);
         (uxn, uyn)
     }
 
     /// Velocity-field L2 error norm (uses the velocity operator's mass).
     pub fn l2_norm(&self, v: &[f64]) -> f64 {
-        self.velocity.l2_norm(v)
+        self.velocity_x.l2_norm(v)
     }
 }
 
@@ -534,6 +533,42 @@ mod tests {
         eprintln!("uniform-flow outflow: rel u err = {err_u:.3e}, |v| = {err_v:.3e}");
         assert!(err_u < 1e-6, "uniform flow not preserved (outflow reflecting?): {err_u}");
         assert!(err_v < 1e-6, "spurious cross-flow at outflow: {err_v}");
+    }
+
+    #[test]
+    fn free_slip_walls_preserve_uniform_flow() {
+        // Free-slip (symmetry) top/bottom walls (tags 0,2) on a periodic-x channel.
+        // Uniform flow u=(1,0) satisfies no-penetration (u_y=0) and traction-free
+        // tangential (∂u_x/∂n=0), so it must be preserved — whereas no-slip walls would
+        // force u_x→0 at the walls. Validates the per-component symmetry routing
+        // (normal component Dirichlet, tangential Neumann).
+        use crate::dg::bc::{BoundaryConditions, FlowBc};
+        let nu = 1.0;
+        let p = 4;
+        let mesh = Mesh2d::channel_x(p, 4, 3, [0.0, 2.0], [0.0, 1.0]);
+        let bcs = BoundaryConditions::no_slip()
+            .set(0, FlowBc::Symmetry)
+            .set(2, FlowBc::Symmetry);
+        let dt = 0.05;
+        let st = Stokes::with_bcs(&mesh, 5.0, nu, dt, &bcs);
+        let nn = mesh.refq.n_nodes();
+        let mut ux = vec![1.0; mesh.n_elements() * nn];
+        let mut uy = vec![0.0; mesh.n_elements() * nn];
+        let zero = |_: f64, _: f64, _: f64| 0.0;
+        let mut t = 0.0;
+        for _ in 0..20 {
+            t += dt;
+            let (nx, ny) = st.step_bc(&ux, &uy, t, &bcs, zero, zero);
+            ux = nx;
+            uy = ny;
+        }
+        let one = vec![1.0; ux.len()];
+        let eu: Vec<f64> = ux.iter().map(|v| v - 1.0).collect();
+        let err_u = st.l2_norm(&eu) / st.l2_norm(&one);
+        let err_v = st.l2_norm(&uy);
+        eprintln!("free-slip channel: rel u err = {err_u:.3e}, |v| = {err_v:.3e}");
+        assert!(err_u < 1e-6, "slip walls did not preserve uniform flow: {err_u}");
+        assert!(err_v < 1e-6, "spurious normal velocity at slip wall: {err_v}");
     }
 
     #[test]

@@ -83,6 +83,22 @@ impl Mesh2d {
         tags
     }
 
+    /// The axis of the (assumed axis-aligned) outward normal of boundary `tag`'s faces,
+    /// read from the first face carrying that tag: `0` for an x-normal, `1` for a
+    /// y-normal. Used to route symmetry/slip BCs per velocity component. Returns `None`
+    /// if no face carries the tag.
+    pub fn boundary_tag_normal_axis(&self, tag: u32) -> Option<usize> {
+        for el in &self.elements {
+            for (e, nb) in el.neighbors.iter().enumerate() {
+                if matches!(nb, Neighbor::Boundary { tag: t } if *t == tag) {
+                    let f = &el.faces[e];
+                    return Some(if f.nx[0].abs() >= f.ny[0].abs() { 0 } else { 1 });
+                }
+            }
+        }
+        None
+    }
+
     /// Build a Cartesian `nx × ny` quad mesh over `[x0,x1] × [y0,y1]` at order `p`.
     pub fn rectangular(order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2]) -> Self {
         assert!(nx >= 1 && ny >= 1 && order >= 1);
