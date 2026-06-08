@@ -11,6 +11,7 @@
 //! See `docs/implicit-solver-strategy.md` §1,§3. Velocity components are stored as
 //! two scalar nodal fields in the global `e·nn + k` layout.
 
+use super::bc::BoundaryConditions;
 use super::hyperbolic::{Hyperbolic, IncompressibleConvection, VolumeForm};
 use super::mesh::Mesh2d;
 use super::poisson::Poisson;
@@ -34,11 +35,18 @@ pub struct Stokes<'m> {
     pressure: Poisson<'m>,
     /// Velocity Helmholtz operator `(1/(νΔt))M + A` (Dirichlet).
     velocity: Poisson<'m>,
+    /// Whether any boundary is an outflow (pressure pinned ⇒ non-singular pressure
+    /// system ⇒ plain CG instead of the deflated CG).
+    has_outflow: bool,
     tol: f64,
     maxit: usize,
 }
 
 impl<'m> Stokes<'m> {
+    /// Closed-box solver: all boundaries are velocity-Dirichlet (the data comes from
+    /// the `bc_u`/`bc_v` closures passed to [`step`](Self::step)) and the pressure is
+    /// pure-Neumann (deflated). For per-region inflow/outflow/wall conditions use
+    /// [`with_bcs`](Self::with_bcs).
     pub fn new(mesh: &'m Mesh2d, alpha: f64, nu: f64, dt: f64) -> Self {
         let lambda = 1.0 / (nu * dt);
         Self {
@@ -46,8 +54,37 @@ impl<'m> Stokes<'m> {
             nu,
             dt,
             convection_scheme: ConvectionScheme::Nodal,
-            pressure: Poisson::with_bc(mesh, alpha, 0.0, vec![0, 1, 2, 3]),
+            pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
             velocity: Poisson::with_reaction(mesh, alpha, lambda),
+            has_outflow: false,
+            tol: 1e-10,
+            maxit: 20000,
+        }
+    }
+
+    /// Solver with **per-region** boundary conditions: each boundary tag is routed,
+    /// via `bcs`, to the right velocity/pressure operator settings (see
+    /// [`BoundaryConditions`]). No-slip/inflow tags are velocity-Dirichlet +
+    /// pressure-Neumann; outflow tags are velocity-Neumann + pressure-Dirichlet
+    /// (`p = 0`), which also pins the pressure so the deflated solve isn't needed.
+    /// Use the `*_bc` step methods ([`step_bc`](Self::step_bc),
+    /// [`step_ns_forced_bc`](Self::step_ns_forced_bc)) with this constructor.
+    pub fn with_bcs(mesh: &'m Mesh2d, alpha: f64, nu: f64, dt: f64, bcs: &BoundaryConditions) -> Self {
+        let lambda = 1.0 / (nu * dt);
+        let outflow = bcs.outflow_tags(mesh);
+        let pres_neumann: Vec<u32> = mesh
+            .boundary_tags()
+            .into_iter()
+            .filter(|t| !outflow.contains(t))
+            .collect();
+        Self {
+            mesh,
+            nu,
+            dt,
+            convection_scheme: ConvectionScheme::Nodal,
+            pressure: Poisson::with_bc(mesh, alpha, 0.0, pres_neumann),
+            velocity: Poisson::with_bc(mesh, alpha, lambda, outflow.clone()),
+            has_outflow: !outflow.is_empty(),
             tol: 1e-10,
             maxit: 20000,
         }
@@ -102,7 +139,7 @@ impl<'m> Stokes<'m> {
             }
         }
         let _ = lambda;
-        self.project_and_diffuse(uhx, uhy, t, bc_u, bc_v)
+        self.project_and_diffuse(uhx, uhy, |_, x, y| (bc_u(x, y, t), bc_v(x, y, t)))
     }
 
     /// One incompressible **Navier–Stokes** step: like [`step`], but the explicit
@@ -170,7 +207,67 @@ impl<'m> Stokes<'m> {
             uhx[i] += dt * (force_x[i] - cx[i]);
             uhy[i] += dt * (force_y[i] - cy[i]);
         }
-        self.project_and_diffuse(uhx, uhy, t, bc_u, bc_v)
+        self.project_and_diffuse(uhx, uhy, |_, x, y| (bc_u(x, y, t), bc_v(x, y, t)))
+    }
+
+    /// BC-aware **Stokes** step (no convection) — the [`with_bcs`](Self::with_bcs)
+    /// companion to [`step`](Self::step). Per-region velocity data (no-slip / inflow /
+    /// outflow) comes from `bcs`; `fx`/`fy` are the analytic body force.
+    pub fn step_bc(
+        &self,
+        ux: &[f64],
+        uy: &[f64],
+        t: f64,
+        bcs: &BoundaryConditions,
+        fx: impl Fn(f64, f64, f64) -> f64,
+        fy: impl Fn(f64, f64, f64) -> f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mesh = self.mesh;
+        let nn = mesh.refq.n_nodes();
+        let dt = self.dt;
+        let mut uhx = ux.to_vec();
+        let mut uhy = uy.to_vec();
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let (x, y) = (el.geom.x[k], el.geom.y[k]);
+                uhx[e * nn + k] += dt * fx(x, y, t);
+                uhy[e * nn + k] += dt * fy(x, y, t);
+            }
+        }
+        self.project_and_diffuse(uhx, uhy, |tag, x, y| bcs.dirichlet(tag, x, y, t))
+    }
+
+    /// BC-aware **Navier–Stokes** step with a precomputed nodal body force — the
+    /// [`with_bcs`](Self::with_bcs) companion to [`step_ns_forced`](Self::step_ns_forced)
+    /// (e.g. for the viscoelastic `∇·τ_p` coupling). Per-region velocity data comes
+    /// from `bcs`.
+    ///
+    /// v1 supports [`ConvectionScheme::Nodal`] (element-local, needs no boundary
+    /// state). The split-form path is asserted off here because its Rusanov interface
+    /// flux needs a per-tag boundary state and the convection-operator BC hook is
+    /// tag-agnostic — wiring that is a follow-up.
+    pub fn step_ns_forced_bc(
+        &self,
+        ux: &[f64],
+        uy: &[f64],
+        t: f64,
+        bcs: &BoundaryConditions,
+        force_x: &[f64],
+        force_y: &[f64],
+    ) -> (Vec<f64>, Vec<f64>) {
+        assert!(
+            matches!(self.convection_scheme, ConvectionScheme::Nodal),
+            "per-region BCs with split-form convection are not yet supported"
+        );
+        let dt = self.dt;
+        let (cx, cy) = self.convection(ux, uy);
+        let mut uhx = ux.to_vec();
+        let mut uhy = uy.to_vec();
+        for i in 0..self.ndof() {
+            uhx[i] += dt * (force_x[i] - cx[i]);
+            uhy[i] += dt * (force_y[i] - cy[i]);
+        }
+        self.project_and_diffuse(uhx, uhy, |tag, x, y| bcs.dirichlet(tag, x, y, t))
     }
 
     /// Nodal (collocation) advective convection `((u·∇)u, (u·∇)v)`.
@@ -200,9 +297,7 @@ impl<'m> Stokes<'m> {
         &self,
         mut uhx: Vec<f64>,
         mut uhy: Vec<f64>,
-        t: f64,
-        bc_u: impl Fn(f64, f64, f64) -> f64,
-        bc_v: impl Fn(f64, f64, f64) -> f64,
+        vel_dir: impl Fn(u32, f64, f64) -> (f64, f64),
     ) -> (Vec<f64>, Vec<f64>) {
         let mesh = self.mesh;
         let refq = &mesh.refq;
@@ -214,8 +309,17 @@ impl<'m> Stokes<'m> {
         // Solver convention: A ≈ −∇², so −∇²p = −(1/Δt)∇·û gives ∇²p = (1/Δt)∇·û.
         let div = self.divergence(&uhx, &uhy);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
+        // Pressure data is homogeneous either way: Neumann flux 0 on walls/inflow,
+        // Dirichlet p=0 on outflow. An outflow pins the constant ⇒ plain CG; with no
+        // outflow the system is singular ⇒ deflated CG (constant nullspace removed).
         let bp = self.pressure.rhs_mixed(&fp, |_, _| 0.0, |_, _| 0.0);
-        let (p, _it) = self.pressure.cg_deflated(&bp, self.tol, self.maxit);
+        let p = if self.has_outflow {
+            let (p, _, _) = self.pressure.cg(&bp, self.tol, self.maxit);
+            p
+        } else {
+            let (p, _it) = self.pressure.cg_deflated(&bp, self.tol, self.maxit);
+            p
+        };
         for (e, el) in mesh.elements.iter().enumerate() {
             let gpx = el.geom.grad_x(refq, &p[e * nn..(e + 1) * nn]);
             let gpy = el.geom.grad_y(refq, &p[e * nn..(e + 1) * nn]);
@@ -228,8 +332,9 @@ impl<'m> Stokes<'m> {
         // Stage 3 — viscous Helmholtz per component: (λM + A) uⁿ⁺¹ = λM û̂ + Dirichlet.
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
-        let bx = self.velocity.rhs(&fxv, |x, y| bc_u(x, y, t));
-        let by = self.velocity.rhs(&fyv, |x, y| bc_v(x, y, t));
+        // Per-tag Dirichlet velocity data; outflow tags are Neumann (natural, flux 0).
+        let bx = self.velocity.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
+        let by = self.velocity.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
         let (uxn, _, _) = self.velocity.cg(&bx, self.tol, self.maxit);
         let (uyn, _, _) = self.velocity.cg(&by, self.tol, self.maxit);
         (uxn, uyn)
@@ -391,6 +496,44 @@ mod tests {
         let rate = (errs[0] / errs[1]).log2();
         assert!(rate > 0.7, "temporal rate {rate} too low (errs {errs:?})");
         assert!(errs[2] < 5e-3, "final error {} too large", errs[2]);
+    }
+
+    #[test]
+    fn uniform_flow_through_outflow() {
+        // Per-region BCs: uniform inflow (west, tag 3) + matching moving walls
+        // (bottom/top, tags 0/2) + traction-free outflow (east, tag 1). u = (1,0),
+        // v = 0, p = 0 is the exact steady state (harmonic, divergence-free, zero
+        // pressure), so it must pass through unchanged — the key check that the outflow
+        // is genuinely natural (a reflecting/Dirichlet-0 outflow would distort it).
+        use crate::dg::bc::{BoundaryConditions, FlowBc};
+        let nu = 1.0;
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 5, 3, [0.0, 2.0], [0.0, 1.0]);
+        let bcs = BoundaryConditions::no_slip()
+            .set(3, FlowBc::velocity(|_, _, _| (1.0, 0.0)))
+            .set(0, FlowBc::velocity(|_, _, _| (1.0, 0.0)))
+            .set(2, FlowBc::velocity(|_, _, _| (1.0, 0.0)))
+            .set(1, FlowBc::Outflow);
+        let dt = 0.05;
+        let st = Stokes::with_bcs(&mesh, 5.0, nu, dt, &bcs);
+        let nn = mesh.refq.n_nodes();
+        let mut ux = vec![1.0; mesh.n_elements() * nn];
+        let mut uy = vec![0.0; mesh.n_elements() * nn];
+        let zero = |_: f64, _: f64, _: f64| 0.0;
+        let mut t = 0.0;
+        for _ in 0..20 {
+            t += dt;
+            let (nx, ny) = st.step_bc(&ux, &uy, t, &bcs, zero, zero);
+            ux = nx;
+            uy = ny;
+        }
+        let one = vec![1.0; ux.len()];
+        let eu: Vec<f64> = ux.iter().map(|v| v - 1.0).collect();
+        let err_u = st.l2_norm(&eu) / st.l2_norm(&one);
+        let err_v = st.l2_norm(&uy);
+        eprintln!("uniform-flow outflow: rel u err = {err_u:.3e}, |v| = {err_v:.3e}");
+        assert!(err_u < 1e-6, "uniform flow not preserved (outflow reflecting?): {err_u}");
+        assert!(err_v < 1e-6, "spurious cross-flow at outflow: {err_v}");
     }
 
     #[test]

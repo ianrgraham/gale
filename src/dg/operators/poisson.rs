@@ -299,6 +299,18 @@ impl<'m> Poisson<'m> {
         g: impl Fn(f64, f64) -> f64,
         q: impl Fn(f64, f64) -> f64,
     ) -> Vec<f64> {
+        self.rhs_tagged(f, |_, x, y| g(x, y), |_, x, y| q(x, y))
+    }
+
+    /// Like [`rhs_mixed`](Self::rhs_mixed) but the Dirichlet value `g(tag, x, y)` and
+    /// Neumann flux `q(tag, x, y)` may depend on the boundary tag — the data side of
+    /// per-region boundary conditions (operator-side dispatch is via `neumann_tags`).
+    pub fn rhs_tagged(
+        &self,
+        f: &[f64],
+        g: impl Fn(u32, f64, f64) -> f64,
+        q: impl Fn(u32, f64, f64) -> f64,
+    ) -> Vec<f64> {
         let m = self.mesh;
         let refq = &m.refq;
         let nn = refq.n_nodes();
@@ -320,7 +332,7 @@ impl<'m> Poisson<'m> {
                     // Neumann flux: + ∮ q v ds (at the face nodes).
                     for a in 0..face.nodes.len() {
                         let v = face.nodes[a];
-                        b[e * nn + v] += face.sw[a] * q(el.geom.x[v], el.geom.y[v]);
+                        b[e * nn + v] += face.sw[a] * q(tag, el.geom.x[v], el.geom.y[v]);
                     }
                 } else {
                     // Dirichlet data: −∮(∇v·n)g + ∮ τ g v.
@@ -330,7 +342,7 @@ impl<'m> Poisson<'m> {
                     for a in 0..face.nodes.len() {
                         let v = face.nodes[a];
                         let (nx, ny, sw) = (face.nx[a], face.ny[a], face.sw[a]);
-                        let gv = g(el.geom.x[v], el.geom.y[v]);
+                        let gv = g(tag, el.geom.x[v], el.geom.y[v]);
                         b[e * nn + v] += tau * sw * gv;
                         hx[v] += sw * gv * nx;
                         hy[v] += sw * gv * ny;
@@ -647,5 +659,31 @@ mod tests {
         let e = a.l2_norm(&err);
         eprintln!("non-conforming Poisson MMS L2 error = {e:.3e}");
         assert!(e < 1e-4, "non-conforming MMS error too large: {e}");
+    }
+
+    #[test]
+    fn mixed_dirichlet_neumann_by_region() {
+        // Per-region BC dispatch via `rhs_tagged`: u = x² + y² (∇²u = 4 ⇒ f = −∇²u = −4)
+        // on [0,1]², with Dirichlet data on west/east (tags 3,1) and Neumann flux on
+        // south/north (tags 0,2). The degree-2 exact solution is recovered to round-off,
+        // proving both the operator's per-tag dispatch and the tagged RHS data.
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+        let exact = |x: f64, y: f64| x * x + y * y;
+        let a = Poisson::with_bc(&mesh, 5.0, 0.0, vec![0, 2]); // Neumann: south, north
+        let f = nodal(&mesh, |_, _| -4.0);
+        // Dirichlet g = exact (used only on tags 1,3). Neumann flux q = ∂u/∂n:
+        // south n=(0,−1) ⇒ −∂u/∂y = −2y (= 0 at y=0); north n=(0,1) ⇒ ∂u/∂y = 2y (= 2 at y=1).
+        let b = a.rhs_tagged(
+            &f,
+            |_tag, x, y| exact(x, y),
+            |tag, _x, y| if tag == 2 { 2.0 * y } else { -2.0 * y },
+        );
+        let (uh, _it, _res) = a.cg(&b, 1e-12, 20000);
+        let ue = nodal(&mesh, exact);
+        let err: Vec<f64> = uh.iter().zip(&ue).map(|(a, b)| a - b).collect();
+        let e = a.l2_norm(&err);
+        eprintln!("mixed Dirichlet/Neumann-by-region Poisson L2 error = {e:.3e}");
+        assert!(e < 1e-10, "per-region BC dispatch inaccurate: {e}");
     }
 }

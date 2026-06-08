@@ -65,6 +65,24 @@ impl Mesh2d {
         self.elements.iter().flat_map(|e| e.geom.jw.iter()).sum()
     }
 
+    /// The distinct boundary-face tags present in the mesh, sorted. Used to map a
+    /// [`BoundaryConditions`](super::bc::BoundaryConditions) registry onto the
+    /// elliptic operators (which tags are Neumann vs Dirichlet).
+    pub fn boundary_tags(&self) -> Vec<u32> {
+        let mut tags: Vec<u32> = self
+            .elements
+            .iter()
+            .flat_map(|el| el.neighbors.iter())
+            .filter_map(|n| match n {
+                Neighbor::Boundary { tag } => Some(*tag),
+                _ => None,
+            })
+            .collect();
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+
     /// Build a Cartesian `nx × ny` quad mesh over `[x0,x1] × [y0,y1]` at order `p`.
     pub fn rectangular(order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2]) -> Self {
         assert!(nx >= 1 && ny >= 1 && order >= 1);

@@ -14,6 +14,7 @@
 
 use super::field::FieldId;
 use super::state::State;
+use crate::dg::bc::BoundaryConditions;
 use crate::dg::dgmesh::DgMesh;
 use crate::dg::mesh::Mesh2d;
 use crate::dg::mesh3d::Mesh3d;
@@ -316,6 +317,9 @@ pub struct DualSplitting {
     velocity: FieldId,
     bc_u: Box<dyn Fn(f64, f64, f64) -> f64>,
     bc_v: Box<dyn Fn(f64, f64, f64) -> f64>,
+    /// Per-region boundary conditions. `Some` ⇒ the [`Stokes::with_bcs`] path
+    /// (inflow/outflow/walls); `None` ⇒ the legacy `bc_u`/`bc_v` all-Dirichlet path.
+    bcs: Option<BoundaryConditions>,
     body_force: BodyForce,
 }
 
@@ -330,6 +334,7 @@ impl DualSplitting {
             velocity,
             bc_u: Box::new(|_, _, _| 0.0),
             bc_v: Box::new(|_, _, _| 0.0),
+            bcs: None,
             body_force: Box::new(|s: &State, _t: f64| {
                 let n = s.ndof();
                 (vec![0.0; n], vec![0.0; n])
@@ -346,6 +351,14 @@ impl DualSplitting {
     ) -> Self {
         self.bc_u = Box::new(bc_u);
         self.bc_v = Box::new(bc_v);
+        self
+    }
+
+    /// Set **per-region** boundary conditions (inflow / outflow / walls by tag),
+    /// overriding the single global [`boundary`](Self::boundary) closure. Routes the
+    /// flow step through [`Stokes::with_bcs`].
+    pub fn boundary_conditions(mut self, bcs: BoundaryConditions) -> Self {
+        self.bcs = Some(bcs);
         self
     }
 
@@ -367,14 +380,18 @@ impl StateIntegrator for DualSplitting {
 
     fn step(&self, state: &mut State, hook: &dyn StateStageHook) {
         let t_new = state.time.t + self.dt;
-        let stokes = Stokes::new(&state.mesh, self.alpha, self.nu, self.dt);
         let (ux, uy) = {
             let v = state.fields.by_id(self.velocity);
             (v.component(0).to_vec(), v.component(1).to_vec())
         };
         let (bx, by) = (self.body_force)(state, t_new);
-        let (nux, nuy) =
-            stokes.step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by);
+        let (nux, nuy) = if let Some(bcs) = &self.bcs {
+            let stokes = Stokes::with_bcs(&state.mesh, self.alpha, self.nu, self.dt, bcs);
+            stokes.step_ns_forced_bc(&ux, &uy, t_new, bcs, &bx, &by)
+        } else {
+            let stokes = Stokes::new(&state.mesh, self.alpha, self.nu, self.dt);
+            stokes.step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
+        };
         {
             let v = state.fields.by_id_mut(self.velocity);
             v.component_mut(0).copy_from_slice(&nux);

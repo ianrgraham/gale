@@ -52,6 +52,8 @@ pub mod poisson;
 pub mod poisson3d;
 #[path = "operators/stokes.rs"]
 pub mod stokes;
+#[path = "operators/bc.rs"]
+pub mod bc;
 #[path = "operators/stokes3d.rs"]
 pub mod stokes3d;
 #[path = "operators/viscoelastic.rs"]
@@ -85,6 +87,7 @@ pub use amr::{
     SmoothnessIndicator,
 };
 pub use amr3d::{RefineHex, SmoothnessIndicator3d};
+pub use bc::{BoundaryConditions, FlowBc};
 pub use dgmesh::DgMesh;
 pub use distributed::{distributed_advection_rhs, halo_exchange, partition_blocks};
 pub use face::{quad_faces, Edge, FaceData};
