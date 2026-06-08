@@ -8,7 +8,88 @@
 //! intrinsics that the 2D log-conf GPU port had to avoid (so the same routine ports
 //! to the GPU later; see `docs/3d-strategy.md` §8).
 
-use super::mesh3d::Mesh3d;
+use super::face3d::Face;
+use super::mesh3d::{Mesh3d, Neighbor3};
+
+/// Inflow boundary data for the 3D conformation transport (6-component symmetric
+/// tensor `[Cxx, Cxy, Cxz, Cyy, Cyz, Czz]`). 3D analogue of
+/// [`ConformationInflow`](super::viscoelastic::ConformationInflow): at boundary nodes
+/// whose tag is in `tags` and where flow enters (`u·n < 0`), the upwind trace is the
+/// constant conformation `c`. Other boundaries are transparent.
+#[derive(Clone, Debug)]
+pub struct ConformationInflow3d {
+    pub tags: Vec<u32>,
+    pub c: [f64; 6],
+}
+
+impl ConformationInflow3d {
+    /// Prescribe the incoming conformation `c` on boundary `tags`.
+    pub fn new(tags: Vec<u32>, c: [f64; 6]) -> Self {
+        Self { tags, c }
+    }
+
+    /// Relaxed (equilibrium, `C = I`) fluid entering on the given `tags`.
+    pub fn equilibrium(tags: Vec<u32>) -> Self {
+        Self { tags, c: [1.0, 0.0, 0.0, 1.0, 0.0, 1.0] }
+    }
+}
+
+/// Matrix logarithm of an SPD 3×3 conformation `[Cxx,Cxy,Cxz,Cyy,Cyz,Czz]`, returning
+/// `Ψ = log C` (6 components). Converts a conformation inflow datum into the
+/// log-conformation variable for the upwind trace (host-side, incl. the GPU log path).
+pub fn log_conformation3(c: [f64; 6]) -> [f64; 6] {
+    sym_apply3(c, f64::ln)
+}
+
+/// Upwind DG **surface lift** for the advection of a 6-component (symmetric-tensor)
+/// field `φ` by the divergence-free velocity `(ux,uy,uz)` on a hex mesh — the 3D
+/// analogue of [`upwind_advection_lift`](super::viscoelastic::upwind_advection_lift).
+/// Returns the correction to ADD to the collocation volume term `−(u·∇)φ` (which is
+/// element-local and does not transport `φ` across hex faces). At a face node it is
+/// `(sw/jw)(u·n)(φ⁻ − φ*)`, nonzero only at inflow nodes (`u·n < 0`), with `φ*` the
+/// neighbour trace across interior faces, the `bdry` datum at boundary inflow nodes
+/// (in `φ`'s own variable), or transparent otherwise. (3D meshes are conforming-only.)
+pub fn upwind_advection_lift3(
+    mesh: &Mesh3d,
+    field: &[Vec<f64>; 6],
+    ux: &[f64],
+    uy: &[f64],
+    uz: &[f64],
+    bdry: impl Fn(u32) -> Option<[f64; 6]>,
+) -> [Vec<f64>; 6] {
+    let nn = mesh.refh.n_nodes();
+    let n = mesh.n_elements() * nn;
+    let mut out: [Vec<f64>; 6] = std::array::from_fn(|_| vec![0.0; n]);
+    for (e, el) in mesh.elements.iter().enumerate() {
+        for face_e in Face::ALL {
+            let face = &el.faces[face_e as usize];
+            let nb = &el.neighbors[face_e as usize];
+            for a in 0..face.nodes.len() {
+                let vl = face.nodes[a];
+                let g = e * nn + vl;
+                let un = ux[g] * face.nx[a] + uy[g] * face.ny[a] + uz[g] * face.nz[a];
+                if un >= 0.0 {
+                    continue; // outflow node ⇒ no correction
+                }
+                let ext: [f64; 6] = match nb {
+                    Neighbor3::Interior { elem: re, face: rface, perm } => {
+                        let rf = &mesh.elements[*re].faces[*rface as usize];
+                        let vr = *re * nn + rf.nodes[perm[a]];
+                        std::array::from_fn(|v| field[v][vr])
+                    }
+                    Neighbor3::Boundary { tag } => {
+                        bdry(*tag).unwrap_or(std::array::from_fn(|v| field[v][g]))
+                    }
+                };
+                let fac = face.sw[a] * un / el.geom.jw[vl];
+                for comp in 0..6 {
+                    out[comp][g] += fac * (field[comp][g] - ext[comp]);
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Symmetric-3×3 eigendecomposition by cyclic Jacobi. Input is the 6 upper entries
 /// `[xx, xy, xz, yy, yz, zz]`; returns eigenvalues `λ` and the eigenvector matrix
@@ -96,11 +177,19 @@ pub struct OldroydB3d<'m> {
     pub mesh: &'m Mesh3d,
     pub lambda: f64,
     pub eta_p: f64,
+    /// Optional conformation inflow boundary data. `None` ⇒ transparent boundaries.
+    pub inflow: Option<ConformationInflow3d>,
 }
 
 impl<'m> OldroydB3d<'m> {
     pub fn new(mesh: &'m Mesh3d, lambda: f64, eta_p: f64) -> Self {
-        Self { mesh, lambda, eta_p }
+        Self { mesh, lambda, eta_p, inflow: None }
+    }
+
+    /// Set the conformation inflow boundary data (builder style).
+    pub fn with_inflow(mut self, inflow: ConformationInflow3d) -> Self {
+        self.inflow = Some(inflow);
+        self
     }
     fn ndof(&self) -> usize {
         self.mesh.n_elements() * self.mesh.refh.n_nodes()
@@ -176,6 +265,15 @@ impl<'m> OldroydB3d<'m> {
                 out[o][g] = -adv + stretch + relax;
             }
         }
+        // Upwind DG surface lift — inter-element transport + inflow injection.
+        let lift = upwind_advection_lift3(self.mesh, c, ux, uy, uz, |tag| {
+            self.inflow.as_ref().filter(|i| i.tags.contains(&tag)).map(|i| i.c)
+        });
+        for o in 0..6 {
+            for g in 0..n {
+                out[o][g] += lift[o][g];
+            }
+        }
         out
     }
 
@@ -246,11 +344,19 @@ pub struct LogConfOldroydB3d<'m> {
     pub mesh: &'m Mesh3d,
     pub lambda: f64,
     pub eta_p: f64,
+    /// Optional conformation inflow data (specified as `C`; converted to `Ψ = log C`).
+    pub inflow: Option<ConformationInflow3d>,
 }
 
 impl<'m> LogConfOldroydB3d<'m> {
     pub fn new(mesh: &'m Mesh3d, lambda: f64, eta_p: f64) -> Self {
-        Self { mesh, lambda, eta_p }
+        Self { mesh, lambda, eta_p, inflow: None }
+    }
+
+    /// Set the conformation inflow boundary data (builder style).
+    pub fn with_inflow(mut self, inflow: ConformationInflow3d) -> Self {
+        self.inflow = Some(inflow);
+        self
     }
     fn ndof(&self) -> usize {
         self.mesh.n_elements() * self.mesh.refh.n_nodes()
@@ -348,6 +454,15 @@ impl<'m> LogConfOldroydB3d<'m> {
                 let adv = ux[g] * pg[o].0[g] + uy[g] * pg[o].1[g] + uz[g] * pg[o].2[g];
                 let relax = inv_lambda * (em[o] - eye[o]);
                 out[o][g] = -adv + rot + 2.0 * bmat[i][j] + relax;
+            }
+        }
+        // Upwind DG surface lift for −(u·∇)Ψ; inflow C_in enters as Ψ_in = log C_in.
+        let lift = upwind_advection_lift3(self.mesh, psi, ux, uy, uz, |tag| {
+            self.inflow.as_ref().filter(|i| i.tags.contains(&tag)).map(|i| log_conformation3(i.c))
+        });
+        for o in 0..6 {
+            for g in 0..n {
+                out[o][g] += lift[o][g];
             }
         }
         out
@@ -485,5 +600,64 @@ mod tests {
         let cm = expand(&std::array::from_fn(|v| c[v][g]));
         let (lam, _) = sym_eig3([cm[0][0], cm[0][1], cm[0][2], cm[1][1], cm[1][2], cm[2][2]]);
         assert!(lam.iter().all(|&l| l > 0.0), "C not SPD: {lam:?}");
+    }
+
+    #[test]
+    fn upwind_advection_transports_across_elements_3d() {
+        // 3D analogue: pure x-advection of a smooth bump by u=(1,0,0) on a periodic hex
+        // mesh; the upwind surface lift carries it across hex faces + the periodic seam.
+        use std::f64::consts::PI;
+        let mesh = Mesh3d::rectangular_periodic(3, 4, 1, 1, [0.0, 1.0], [0.0, 0.25], [0.0, 0.25]);
+        let ob = OldroydB3d::new(&mesh, 1e6, 1.0);
+        let nd = ob.ndof();
+        let u = vec![1.0; nd];
+        let z = vec![0.0; nd];
+        let c0 = nodal(&mesh, |x, _, _| 1.0 + 0.5 * (2.0 * PI * x).sin());
+        let mut c: [Vec<f64>; 6] =
+            [c0.clone(), vec![0.0; nd], vec![0.0; nd], vec![1.0; nd], vec![0.0; nd], vec![1.0; nd]];
+        let dt = 1e-3_f64;
+        let t_end = 0.5_f64;
+        for _ in 0..(t_end / dt).round() as usize {
+            c = ob.step_ssp_rk3(&c, &u, &z, &z, dt);
+        }
+        let exact = nodal(&mesh, |x, _, _| 1.0 + 0.5 * (2.0 * PI * (x - t_end)).sin());
+        let err = c[0].iter().zip(&exact).fold(0.0f64, |a, (x, y)| a.max((x - y).abs()));
+        eprintln!("3D periodic conformation advection: max|Cxx − exact| = {err:.3e}");
+        // Transport-correctness bound: element-local collocation would leave the bump
+        // stuck (error ~0.5, the sine amplitude); the upwind lift advects it across
+        // faces, leaving only upwind dissipation (~7e-3 at p=3, 4 elements).
+        assert!(err < 2e-2, "3D upwind advection not transporting across elements: {err}");
+    }
+
+    #[test]
+    fn conformation_inflow_fills_domain_3d() {
+        // 3D analogue: stretched fluid enters at the WEST inlet (Face::ALL index 4 ⇒
+        // tag 4) under uniform flow u=(1,0,0); carried downstream to fill the domain.
+        let mesh = Mesh3d::rectangular(3, 4, 1, 1, [0.0, 2.0], [0.0, 1.0], [0.0, 1.0]);
+        let c_in = [2.0, 0.5, 0.3, 1.0, 0.0, 1.0];
+        let ob =
+            OldroydB3d::new(&mesh, 1e6, 1.0).with_inflow(ConformationInflow3d::new(vec![4], c_in));
+        let nn = mesh.refh.n_nodes();
+        let nd = ob.ndof();
+        let u = vec![1.0; nd];
+        let z = vec![0.0; nd];
+        let mut c = ob.identity();
+        let dt = 4e-3_f64;
+        for _ in 0..(8.0 / dt).round() as usize {
+            c = ob.step_ssp_rk3(&c, &u, &z, &z, dt); // ~4 flow-throughs (L=2, U=1)
+        }
+        let mut err = 0.0f64;
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                if el.geom.x[k] > 0.6 {
+                    let g = e * nn + k;
+                    for o in 0..6 {
+                        err = err.max((c[o][g] - c_in[o]).abs());
+                    }
+                }
+            }
+        }
+        eprintln!("3D conformation inflow fill: downstream max|C − C_in| = {err:.3e}");
+        assert!(err < 5e-3, "3D inflow conformation not carried downstream: {err}");
     }
 }

@@ -282,7 +282,9 @@ impl gale::sim::StateIntegrator<Mesh3d> for GpuDualSplitting3d {
 
 // ===== 3D viscoelastic coupling (Oldroyd-B) ======================================
 
-use gale::dg::{LogConfOldroydB3d, OldroydB3d};
+use gale::dg::{
+    log_conformation3, upwind_advection_lift3, ConformationInflow3d, LogConfOldroydB3d, OldroydB3d,
+};
 use gale::sim::ViscoModel;
 
 fn axpy6(a: &[Vec<f64>; 6], k: &[Vec<f64>; 6], s: f64) -> [Vec<f64>; 6] {
@@ -304,13 +306,27 @@ fn oldroyd3d_advance_gpu(
     uz: &[f64],
     dt: f64,
     lambda: f64,
+    inflow: Option<&ConformationInflow3d>,
 ) -> Result<[Vec<f64>; 6], Box<dyn std::error::Error>> {
-    let k0 = crate::oldroyd3d_conf_rhs(mesh, c, ux, uy, uz, lambda)?;
+    // Full rhs = GPU device kernel (collocation volume) + host upwind surface lift.
+    let rhs = |cc: &[Vec<f64>; 6]| -> Result<[Vec<f64>; 6], Box<dyn std::error::Error>> {
+        let mut k = crate::oldroyd3d_conf_rhs(mesh, cc, ux, uy, uz, lambda)?;
+        let lift = upwind_advection_lift3(mesh, cc, ux, uy, uz, |tag| {
+            inflow.filter(|i| i.tags.contains(&tag)).map(|i| i.c)
+        });
+        for o in 0..6 {
+            for g in 0..k[o].len() {
+                k[o][g] += lift[o][g];
+            }
+        }
+        Ok(k)
+    };
+    let k0 = rhs(c)?;
     let u1 = axpy6(c, &k0, dt);
-    let k1 = crate::oldroyd3d_conf_rhs(mesh, &u1, ux, uy, uz, lambda)?;
+    let k1 = rhs(&u1)?;
     let u2a = axpy6(&u1, &k1, dt);
     let u2 = combine6(c, 0.75, &u2a, 0.25);
-    let k2 = crate::oldroyd3d_conf_rhs(mesh, &u2, ux, uy, uz, lambda)?;
+    let k2 = rhs(&u2)?;
     let u3a = axpy6(&u2, &k2, dt);
     Ok(combine6(c, 1.0 / 3.0, &u3a, 2.0 / 3.0))
 }
@@ -318,6 +334,7 @@ fn oldroyd3d_advance_gpu(
 /// One SSP-RK3 step of the 3D log-conformation transport with a fixed velocity,
 /// evaluating the rhs on the **GPU** ([`crate::logconf3d_psi_rhs`]). Mirrors
 /// `gale::dg::LogConfOldroydB3d::step_ssp_rk3`.
+#[allow(clippy::too_many_arguments)]
 fn logconf3d_advance_gpu(
     mesh: &Mesh3d,
     lc: &LogConfOldroydB3d,
@@ -326,13 +343,27 @@ fn logconf3d_advance_gpu(
     uy: &[f64],
     uz: &[f64],
     dt: f64,
+    inflow: Option<&ConformationInflow3d>,
 ) -> Result<[Vec<f64>; 6], Box<dyn std::error::Error>> {
-    let k0 = crate::logconf3d_psi_rhs(mesh, lc, psi, ux, uy, uz)?;
+    // Full rhs = GPU device kernel + host upwind lift (inflow C_in enters as log C_in).
+    let rhs = |pp: &[Vec<f64>; 6]| -> Result<[Vec<f64>; 6], Box<dyn std::error::Error>> {
+        let mut k = crate::logconf3d_psi_rhs(mesh, lc, pp, ux, uy, uz)?;
+        let lift = upwind_advection_lift3(mesh, pp, ux, uy, uz, |tag| {
+            inflow.filter(|i| i.tags.contains(&tag)).map(|i| log_conformation3(i.c))
+        });
+        for o in 0..6 {
+            for g in 0..k[o].len() {
+                k[o][g] += lift[o][g];
+            }
+        }
+        Ok(k)
+    };
+    let k0 = rhs(psi)?;
     let u1 = axpy6(psi, &k0, dt);
-    let k1 = crate::logconf3d_psi_rhs(mesh, lc, &u1, ux, uy, uz)?;
+    let k1 = rhs(&u1)?;
     let u2a = axpy6(&u1, &k1, dt);
     let u2 = combine6(psi, 0.75, &u2a, 0.25);
-    let k2 = crate::logconf3d_psi_rhs(mesh, lc, &u2, ux, uy, uz)?;
+    let k2 = rhs(&u2)?;
     let u3a = axpy6(&u2, &k2, dt);
     Ok(combine6(psi, 1.0 / 3.0, &u3a, 2.0 / 3.0))
 }
@@ -360,6 +391,8 @@ pub struct GpuViscoelasticDualSplitting3d {
     fx: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
     fy: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
     fz: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
+    /// Optional conformation inflow boundary data (incoming polymer state at an inlet).
+    inflow: Option<ConformationInflow3d>,
 }
 
 impl GpuViscoelasticDualSplitting3d {
@@ -389,6 +422,7 @@ impl GpuViscoelasticDualSplitting3d {
             fx: Box::new(|_, _, _, _| 0.0),
             fy: Box::new(|_, _, _, _| 0.0),
             fz: Box::new(|_, _, _, _| 0.0),
+            inflow: None,
         }
     }
 
@@ -401,6 +435,12 @@ impl GpuViscoelasticDualSplitting3d {
         self.bc_u = Box::new(bc_u);
         self.bc_v = Box::new(bc_v);
         self.bc_w = Box::new(bc_w);
+        self
+    }
+
+    /// Set the conformation inflow boundary data (incoming polymer state at an inlet).
+    pub fn conformation_inflow(mut self, inflow: ConformationInflow3d) -> Self {
+        self.inflow = Some(inflow);
         self
     }
 
@@ -465,11 +505,11 @@ impl gale::sim::StateIntegrator<Mesh3d> for GpuViscoelasticDualSplitting3d {
                 .expect("gale-gpu: 3D viscoelastic velocity step failed");
             let nc = match self.model {
                 ViscoModel::OldroydB => {
-                    oldroyd3d_advance_gpu(&state.mesh, &c, &nux, &nuy, &nuz, self.dt, self.lambda)
+                    oldroyd3d_advance_gpu(&state.mesh, &c, &nux, &nuy, &nuz, self.dt, self.lambda, self.inflow.as_ref())
                 }
                 ViscoModel::LogConf => {
                     let lc = LogConfOldroydB3d::new(&state.mesh, self.lambda, self.eta_p);
-                    logconf3d_advance_gpu(&state.mesh, &lc, &c, &nux, &nuy, &nuz, self.dt)
+                    logconf3d_advance_gpu(&state.mesh, &lc, &c, &nux, &nuy, &nuz, self.dt, self.inflow.as_ref())
                 }
             }
             .expect("gale-gpu: 3D viscoelastic conformation advance failed");

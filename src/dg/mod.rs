@@ -117,4 +117,7 @@ pub use viscoelastic::{
     log_conformation, upwind_advection_lift, ConformationInflow, ConstitutiveModel,
     LogConfOldroydB, OldroydB, ViscoelasticFlow,
 };
-pub use viscoelastic3d::{sym_apply3, sym_eig3, LogConfOldroydB3d, OldroydB3d};
+pub use viscoelastic3d::{
+    log_conformation3, sym_apply3, sym_eig3, upwind_advection_lift3, ConformationInflow3d,
+    LogConfOldroydB3d, OldroydB3d,
+};

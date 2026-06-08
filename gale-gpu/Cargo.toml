@@ -144,6 +144,11 @@ path = "src/bin/flow_bc_check.rs"
 name = "ve-bc-check"
 path = "src/bin/ve_bc_check.rs"
 
+# Validates GPU 3D conformation inflow (upwind transport on hexes) vs CPU.
+[[bin]]
+name = "ve3d-bc-check"
+path = "src/bin/ve3d_bc_check.rs"
+
 # Validates the 3D GPU SIPG elliptic foundation (operator + helmholtz + pressure).
 [[bin]]
 name = "poisson3d-check"
