@@ -20,7 +20,9 @@ use crate::dg::mesh::Mesh2d;
 use crate::dg::mesh3d::Mesh3d;
 use crate::dg::stokes::Stokes;
 use crate::dg::stokes3d::Stokes3d;
-use crate::dg::viscoelastic::{ConstitutiveModel, LogConfOldroydB, OldroydB, ViscoelasticFlow};
+use crate::dg::viscoelastic::{
+    ConformationInflow, ConstitutiveModel, LogConfOldroydB, OldroydB, ViscoelasticFlow,
+};
 use std::collections::BTreeMap;
 
 /// A bundle of per-field values keyed by [`FieldId`] — used for both the evolving
@@ -440,6 +442,9 @@ pub struct ViscoelasticDualSplitting {
     bc_v: Box<dyn Fn(f64, f64, f64) -> f64>,
     fx: Box<dyn Fn(f64, f64, f64) -> f64>,
     fy: Box<dyn Fn(f64, f64, f64) -> f64>,
+    /// Optional conformation inflow boundary data (the incoming polymer state at an
+    /// inlet); pins the upwind trace in the conformation transport.
+    inflow: Option<ConformationInflow>,
 }
 
 impl ViscoelasticDualSplitting {
@@ -470,6 +475,7 @@ impl ViscoelasticDualSplitting {
             bc_v: Box::new(|_, _, _| 0.0),
             fx: Box::new(|_, _, _| 0.0),
             fy: Box::new(|_, _, _| 0.0),
+            inflow: None,
         }
     }
 
@@ -481,6 +487,13 @@ impl ViscoelasticDualSplitting {
     ) -> Self {
         self.bc_u = Box::new(bc_u);
         self.bc_v = Box::new(bc_v);
+        self
+    }
+
+    /// Set the conformation inflow boundary data (the incoming polymer state at an
+    /// inlet), pinning the upwind trace there in the conformation transport.
+    pub fn conformation_inflow(mut self, inflow: ConformationInflow) -> Self {
+        self.inflow = Some(inflow);
         self
     }
 
@@ -530,12 +543,18 @@ impl StateIntegrator for ViscoelasticDualSplitting {
             };
             match self.model {
                 ViscoModel::OldroydB => {
-                    let m = OldroydB::new(&state.mesh, self.lambda, self.eta_p);
+                    let mut m = OldroydB::new(&state.mesh, self.lambda, self.eta_p);
+                    if let Some(inf) = &self.inflow {
+                        m = m.with_inflow(inf.clone());
+                    }
                     let ve = ViscoelasticFlow::with_model(&state.mesh, self.eta_s, self.dt, self.alpha, m);
                     ve.step(&ux, &uy, &c, t_new, &self.bc_u, &self.bc_v, &self.fx, &self.fy)
                 }
                 ViscoModel::LogConf => {
-                    let m = LogConfOldroydB::new(&state.mesh, self.lambda, self.eta_p);
+                    let mut m = LogConfOldroydB::new(&state.mesh, self.lambda, self.eta_p);
+                    if let Some(inf) = &self.inflow {
+                        m = m.with_inflow(inf.clone());
+                    }
                     let ve = ViscoelasticFlow::with_model(&state.mesh, self.eta_s, self.dt, self.alpha, m);
                     ve.step(&ux, &uy, &c, t_new, &self.bc_u, &self.bc_v, &self.fx, &self.fy)
                 }

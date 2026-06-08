@@ -368,6 +368,14 @@ fn sym_eig(a: f64, b: f64, d: f64) -> (f64, f64, f64, f64) {
     (mu1, mu2, theta.cos(), theta.sin())
 }
 
+/// Matrix logarithm of a symmetric-positive-definite 2×2 conformation `[Cxx,Cxy,Cyy]`,
+/// returning `Ψ = log C` as `[Ψxx,Ψxy,Ψyy]`. Used to convert a conformation inflow
+/// datum into the log-conformation variable for the upwind trace (host-side, including
+/// the GPU log-conf path).
+pub fn log_conformation(c: [f64; 3]) -> [f64; 3] {
+    sym_apply(c[0], c[1], c[2], f64::ln)
+}
+
 /// Apply a scalar function to a symmetric 2×2 matrix via its eigendecomposition;
 /// returns `[xx, xy, yy]` of `R diag(f(μ₁), f(μ₂)) Rᵀ`.
 fn sym_apply(a: f64, b: f64, d: f64, f: impl Fn(f64) -> f64) -> [f64; 3] {
