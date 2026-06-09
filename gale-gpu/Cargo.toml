@@ -286,3 +286,8 @@ path = "src/bin/multigpu3d_check.rs"
 [[bin]]
 name = "probe-signum"
 path = "src/bin/probe_signum.rs"
+
+# Probe: where CG iterations go per dual-splitting solve (pressure vs velocity) — MG targeting.
+[[bin]]
+name = "cg-iter-probe"
+path = "src/bin/cg_iter_probe.rs"
