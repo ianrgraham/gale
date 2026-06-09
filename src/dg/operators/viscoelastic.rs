@@ -1942,6 +1942,139 @@ mod tests {
         }
     }
 
+    /// Unscaled relative-entropy functional ∫Φ, Φ = tr C − ln det C − d (d=2), quadrature-weighted.
+    fn phi_total(mesh: &Mesh2d, c: &[Vec<f64>; 3]) -> f64 {
+        let nn = mesh.refq.n_nodes();
+        let mut t = 0.0;
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let g = e * nn + k;
+                let det = c[0][g] * c[2][g] - c[1][g] * c[1][g];
+                t += el.geom.jw[k] * (c[0][g] + c[2][g] - det.ln() - 2.0);
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn free_energy_measurement_report() {
+        // ── M1: pure advection (periodic, ∇u=0, relaxation ~off) — ∫Φ should be CONSERVED
+        // (transport only). Drift measures whether gale's conformation advection is
+        // free-energy-(entropy-)stable: a DECREASE = dissipative/safe (upwind), an INCREASE =
+        // spurious free-energy production (the dangerous failure the research warns of).
+        {
+            let p = 4;
+            let mesh = Mesh2d::rectangular_periodic(p, 8, 1, [0.0, 1.0], [0.0, 0.125]);
+            let nn = mesh.refq.n_nodes();
+            let ndof = mesh.n_elements() * nn;
+            let ob = OldroydB::new(&mesh, 1e6, 1.0); // λ huge ⇒ relaxation negligible
+            let mut c = [vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]];
+            let tau = 2.0 * std::f64::consts::PI;
+            for (e, el) in mesh.elements.iter().enumerate() {
+                for k in 0..nn {
+                    let (x, g) = (el.geom.x[k], e * nn + k);
+                    c[0][g] = 2.0 + 0.8 * (tau * x).sin();
+                    c[1][g] = 0.2 * (tau * x).cos();
+                    c[2][g] = 1.5;
+                }
+            }
+            let (ux, uy) = (vec![1.0; ndof], vec![0.0; ndof]);
+            let phi0 = phi_total(&mesh, &c);
+            let dt = 0.001;
+            for _ in 0..200 {
+                c = ob.step_ssp_rk3(&c, &ux, &uy, dt);
+            }
+            let phi1 = phi_total(&mesh, &c);
+            println!(
+                "[M1 pure advection] ∫Φ {phi0:.6} → {phi1:.6}  drift {:+.3e} ({:+.3}%) over 1/5 period",
+                phi1 - phi0,
+                100.0 * (phi1 - phi0) / phi0.abs()
+            );
+            assert!(phi1.is_finite());
+            // Stability bar: advection must not SPURIOUSLY PRODUCE free energy (small + tolerance).
+            assert!(phi1 - phi0 <= 1e-3 * phi0.abs(), "advection spuriously increased ∫Φ");
+        }
+
+        // ── M2: steady shear via the IMEX/ARK scheme — run to STEADY (t≫λ) and check ∫F plateaus
+        // at the analytic value with no spurious drift/overshoot. Uniform shear ⇒ spatially uniform
+        // ⇒ a single element suffices. Wi=5 ⇒ Cxx=1+2Wi²=51, Cxy=5, Cyy=1, so the analytic
+        // F = (η_p/2λ)(tr C − ln det C − 2) = ½(52 − ln 26 − 2) ≈ 23.37 (×|domain|).
+        {
+            let p = 4;
+            let mesh = Mesh2d::rectangular(p, 1, 1, [0.0, 1.0], [0.0, 1.0]);
+            let (eta_p, lambda, gdot) = (1.0, 1.0, 5.0);
+            let lc = LogConfOldroydB::new(&mesh, lambda, eta_p);
+            let ux = nodal(&mesh, |_, y| gdot * y);
+            let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+            let mut psi = lc.identity();
+            let dt = 0.005;
+            let mut f_prev = 0.0;
+            let mut late_df = 0.0;
+            for n in 0..4000 {
+                // to t = 20 = 20λ (fully steady)
+                psi = lc.step_ark2_imex(&psi, &ux, &uy, dt);
+                let f = free_energy_total(&mesh, &lc.conformation(&psi), eta_p, lambda);
+                if n >= 3990 {
+                    late_df = f - f_prev;
+                }
+                f_prev = f;
+            }
+            let wi = (lambda * gdot) as f64;
+            let cxx = 1.0 + 2.0 * wi * wi;
+            let f_exact = 0.5 * ((cxx + 1.0) - (cxx * 1.0 - wi * wi).ln() - 2.0); // ×|domain|=1
+            println!(
+                "[M2 steady shear]  ∫F → {f_prev:.4} (analytic {f_exact:.4});  late ΔF/step {late_df:+.3e} (plateau ⇒ ~0)"
+            );
+            assert!(late_df.abs() < 1e-6, "∫F did not plateau: late ΔF = {late_df}");
+            assert!((f_prev - f_exact).abs() < 1e-2 * f_exact, "∫F off analytic steady: {f_prev} vs {f_exact}");
+        }
+
+        // ── M3: Jensen-bias magnitude on a developed high-Wi field (the conservation tension).
+        {
+            let p = 4;
+            let mesh = Mesh2d::rectangular(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+            let (eta_p, lambda, gdot) = (1.0, 1.0, 8.0);
+            let lc = LogConfOldroydB::new(&mesh, lambda, eta_p);
+            let ux = nodal(&mesh, |_, y| gdot * 4.0 * y * (1.0 - y)); // non-uniform ⇒ spatial variation
+            let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+            let mut psi = lc.identity();
+            for _ in 0..1500 {
+                psi = lc.step_ark2_imex(&psi, &ux, &uy, 0.002);
+            }
+            let nn = mesh.refq.n_nodes();
+            let c = lc.conformation(&psi);
+            let (mut max_bias, mut sum_bias, mut sum_phi) = (0.0f64, 0.0, 0.0);
+            for (e, el) in mesh.elements.iter().enumerate() {
+                let (mut ws, mut mp, mut mphi) = (0.0, [0.0; 3], 0.0);
+                for k in 0..nn {
+                    let (w, g) = (el.geom.jw[k], e * nn + k);
+                    ws += w;
+                    for v in 0..3 {
+                        mp[v] += w * psi[v][g];
+                    }
+                    let det = c[0][g] * c[2][g] - c[1][g] * c[1][g];
+                    mphi += w * (c[0][g] + c[2][g] - det.ln() - 2.0);
+                }
+                mphi /= ws; // <Φ(C)> over the element
+                for v in 0..3 {
+                    mp[v] /= ws;
+                }
+                let clm = sym_apply(mp[0], mp[1], mp[2], f64::exp); // C at log-mean Ψ
+                let phi_lm = clm[0] + clm[2] - (clm[0] * clm[2] - clm[1] * clm[1]).ln() - 2.0;
+                let bias = mphi - phi_lm; // ≥ 0 by Jensen
+                max_bias = max_bias.max(bias);
+                sum_bias += bias;
+                sum_phi += mphi;
+            }
+            let ne = mesh.n_elements() as f64;
+            println!(
+                "[M3 Jensen bias]   <Φ(C)>−Φ(exp<Ψ>): max {max_bias:.3e}, mean {:.3e}; relative to <Φ> ≈ {:.3}%",
+                sum_bias / ne,
+                100.0 * sum_bias / sum_phi
+            );
+        }
+    }
+
     #[test]
     fn free_energy_zero_at_identity_and_nonnegative() {
         let p = 3;

@@ -74,10 +74,24 @@ coupling defect appears (Peng Prop 2.1).
   Ranocha scalar root-find returning `γ` with `eval(γ) = eta_old + γ·prod` near `γ=1`, for any convex
   functional. Reusable; tested against the quadratic closed form and a `γ≈1` no-op case.
 
-## 5. Roadmap (gated on the dependency)
+## 5. Roadmap
 
-1. **Measure first.** Run the diagnostic on a high-Wi shear/transport case and the IMEX path — is `F`
-   spuriously increasing? How big is the Jensen bias? *Don't enforce what isn't broken* (caveat 1).
+1. ✅ **Measured (2026-06-09) — and the answer is: free-energy stability is NOT broken.**
+   `free_energy_measurement_report` (test) ran three diagnostics:
+   - **M1 — pure advection** (periodic, ∇u=0, relaxation off): `∫Φ` drift `−1.8e-8` over 1/5 period. gale's
+     conformation transport is **free-energy-conservative** — it does *not* spuriously produce free energy
+     (the feared spatial-entropy incompatibility does not manifest; upwind is mildly dissipative/safe).
+   - **M2 — steady shear** via the IMEX/ARK scheme (Wi=5): `∫F → 23.3710`, **exactly the analytic 23.3710**,
+     late `ΔF/step = +4e-9` — a clean plateau. The time integration adds **no** spurious free-energy drift.
+   - **M3 — Jensen bias** on a developed high-Wi field: `⟨Φ(C)⟩ − Φ(exp⟨Ψ⟩) ≈ 18%` of `⟨Φ⟩` — **large**.
+
+   **Verdict from the measurement:** the *stability/compatibility* the enforcement machinery (relaxation-RK,
+   entropy-stable spatial operator) would buy is **already present** — gale's scheme is free-energy-stable
+   (M1+M2). So **do NOT build the enforcement** ("don't enforce what isn't broken"). The one genuine
+   free-energy effect that shows up is the **Jensen bias (~18%)** — but that is *inherent to log-conformation*
+   (Ψ-mean vs physical-C-mean; Hameduddin–Zaki), an accuracy/interpretation concern for high-Wi statistics,
+   **not a stability bug**, and it is *not* fixed by relaxation-RK or Peng's entropy-budget limiter either.
+   The **diagnostic was worth building** (it surfaced the bias and confirmed stability); the enforcement is not.
 2. **If time-integration leakage is the issue:** wire `relaxation_gamma` into the conformation stepper
    (production estimate `e = dt Σ b_i ⟨F'(C_i), k_i⟩` from the RK stages) — enforces `F` non-increase at the
    time level. Cheap, composes with ARK.
@@ -88,11 +102,17 @@ coupling defect appears (Peng Prop 2.1).
    need the entropy-stable operator; complements the diagnostic.
 5. FENE-P / Giesekus free-energy analogues (their nonlinear spring/destruction terms change the functional).
 
-## 6. Verdict
+## 6. Verdict (post-measurement)
 
-Free-energy compatibility is a **real, necessary** structure property gale should at least *track*. The
-**diagnostic is unambiguously worth building** (done). **Full enforcement is gated** on an entropy-stable
-spatial operator gale lacks — so the honest path is *measure → relaxation-RK for time leakage → Peng limiter
-→ (research) entropy-stable operator*, not a single drop-in limiter. Sources: Peng 2606.04005; BLM
-0801.2248; Barrett–Boyaval 0907.4066; Ranocha 1905.09129; Kang–Constantinescu 2108.08908; Hameduddin–Zaki
-1902.07790.
+**Measurement settled it: STOP — gale's scheme is already free-energy-stable.** The free-energy diagnostic
+showed (M1) the conformation transport conserves `∫Φ` (drift `~1e-8`) and (M2) the IMEX/ARK scheme reaches
+the analytic steady `∫F` with no drift — so the enforcement machinery (relaxation-RK + the entropy-stable
+spatial operator dependency) would fix something that **isn't broken**. The one real effect is the **Jensen
+bias (~18%)**, inherent to log-conformation and an accuracy/interpretation concern, not a stability bug —
+and not addressed by the enforcement mechanisms anyway. **Keep the diagnostic** (`free_energy_*`, the
+measurement test) as a structure-preservation guard; **don't build the enforcement.** The
+`relaxation_gamma` primitive stays as a tested, reusable building block should a future entropy-needing
+functional arise. (FENE-P/Giesekus free-energy analogues unmeasured — likely the same picture.)
+
+Sources: Peng 2606.04005; BLM 0801.2248; Barrett–Boyaval 0907.4066; Ranocha 1905.09129; Kang–Constantinescu
+2108.08908; Hameduddin–Zaki 1902.07790.
