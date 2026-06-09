@@ -1007,6 +1007,99 @@ impl crate::sim::integrate::StageHook for ConformationBoundLimiter {
     }
 }
 
+/// **Quadratic-knapsack optimal blending** (Christner–Chan, arXiv:2507.14488). Given per-node
+/// weights `w_i > 0`, deviations-from-mean `δ_i` (with `Σ w_i δ_i = 0`), and admissibility caps
+/// `cap_i ∈ [0,1]` (the largest blend keeping node `i` in-bounds), returns the per-node
+/// `θ_i ∈ [0, cap_i]` minimizing the added diffusion `Σ ½ w_i (1−θ_i)²` (i.e. staying closest to
+/// the high-order `θ=1`) subject to the single conservation constraint `Σ w_i δ_i θ_i = 0`.
+/// KKT ⇒ `θ_i(μ) = clamp(1 − μ δ_i, 0, cap_i)`; the multiplier `μ` is the unique root of the
+/// monotone `F(μ) = Σ w_i δ_i θ_i(μ)`, found by bisection. The uniform Zhang–Shu `θ = min cap_i`
+/// is a *feasible* point of the same program, so this is never more dissipative — and strictly
+/// less when the non-capped nodes' deviations vary. Single-scalar-constraint case (research §9);
+/// the full SPD-cone tensor case is multi-constraint (the open frontier — see the plan).
+fn knapsack_theta(weights: &[f64], devs: &[f64], caps: &[f64]) -> Vec<f64> {
+    let n = weights.len();
+    let theta = |mu: f64| -> Vec<f64> {
+        (0..n).map(|i| (1.0 - mu * devs[i]).clamp(0.0, caps[i])).collect()
+    };
+    let f = |mu: f64| -> f64 {
+        (0..n).map(|i| weights[i] * devs[i] * (1.0 - mu * devs[i]).clamp(0.0, caps[i])).sum()
+    };
+    let f0 = f(0.0);
+    if f0.abs() < 1e-300 {
+        return theta(0.0); // caps already conservative (no limiting, or balanced)
+    }
+    // F(μ) is monotone non-increasing. Bracket the sign change, then bisect.
+    let (mut lo, mut hi);
+    if f0 > 0.0 {
+        lo = 0.0;
+        hi = 1.0;
+        while f(hi) > 0.0 && hi < 1e12 {
+            hi *= 2.0;
+        }
+    } else {
+        hi = 0.0;
+        lo = -1.0;
+        while f(lo) < 0.0 && lo > -1e12 {
+            lo *= 2.0;
+        }
+    }
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        if f(mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    theta(0.5 * (lo + hi))
+}
+
+/// Bound-preserving limiter for a **scalar** field `u` to `[lo, hi]`, using the
+/// quadratic-knapsack optimal per-node blending ([`knapsack_theta`]) — conservative (cell mean
+/// preserved), high-order where the bound is slack, and **less dissipative than the uniform
+/// Zhang–Shu `min θ`**. Directly usable for any bounded transported scalar (e.g. a continuum
+/// concentration / volume-fraction `φ`). The conformation-*tensor* analogue is multi-constraint
+/// (3 conserved components) — the open frontier; `limit_conformation_bounds` stays on uniform `θ`.
+pub fn limit_scalar_bounds(mesh: &Mesh2d, u: &mut [f64], lo: f64, hi: f64) {
+    let nn = mesh.refq.n_nodes();
+    for (e, el) in mesh.elements.iter().enumerate() {
+        let base = e * nn;
+        let (mut wsum, mut m) = (0.0, 0.0);
+        for k in 0..nn {
+            let w = el.geom.jw[k];
+            wsum += w;
+            m += w * u[base + k];
+        }
+        m /= wsum;
+        if m < lo || m > hi {
+            continue; // mean inadmissible — nothing safe to limit toward
+        }
+        let w: Vec<f64> = (0..nn).map(|k| el.geom.jw[k]).collect();
+        let dev: Vec<f64> = (0..nn).map(|k| u[base + k] - m).collect();
+        let caps: Vec<f64> = (0..nn)
+            .map(|k| {
+                let d = dev[k];
+                let mut c = 1.0f64;
+                if m + d > hi && d > 0.0 {
+                    c = c.min((hi - m) / d);
+                }
+                if m + d < lo && d < 0.0 {
+                    c = c.min((lo - m) / d);
+                }
+                c.clamp(0.0, 1.0)
+            })
+            .collect();
+        if caps.iter().all(|&c| c >= 1.0) {
+            continue; // all nodes in-bounds
+        }
+        let theta = knapsack_theta(&w, &dev, &caps);
+        for k in 0..nn {
+            u[base + k] = m + theta[k] * dev[k];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1571,6 +1664,73 @@ mod tests {
         }
         assert!(worst_plain < eps, "premise: plain stepper should lose SPD (min det = {worst_plain})");
         assert!(worst_bounded >= eps * (1.0 - 1e-6), "bounded stepper kept SPD (min det = {worst_bounded})");
+    }
+
+    #[test]
+    fn knapsack_theta_optimal_conservative_less_dissipative() {
+        // Hand case with varying non-capped deviations: the knapsack θ must conserve
+        // (Σ w·δ·θ = 0), respect the box [0, cap_i], and have strictly less added diffusion
+        // Σ½w(1−θ)² than the uniform Zhang–Shu θ = min(cap) (a feasible point of the same QP).
+        let w = vec![1.0, 1.0, 1.0, 1.0];
+        let dev = vec![1.5, -1.0, -0.3, -0.2]; // Σ w·δ = 0
+        let caps = vec![0.3, 1.0, 1.0, 1.0]; // node 0 caps low
+        let theta = knapsack_theta(&w, &dev, &caps);
+        let cons: f64 = (0..4).map(|i| w[i] * dev[i] * theta[i]).sum();
+        assert!(cons.abs() < 1e-10, "not conservative: {cons}");
+        for i in 0..4 {
+            assert!(theta[i] >= -1e-12 && theta[i] <= caps[i] + 1e-12, "θ[{i}]={} out of box", theta[i]);
+        }
+        let j = |t: &[f64]| -> f64 { (0..4).map(|i| 0.5 * w[i] * (1.0 - t[i]).powi(2)).sum() };
+        let uniform = vec![0.3; 4];
+        assert!(j(&theta) <= j(&uniform) + 1e-12, "knapsack not optimal vs uniform");
+        assert!(j(&theta) < j(&uniform) - 1e-6, "knapsack should strictly beat uniform here");
+    }
+
+    #[test]
+    fn knapsack_scalar_limiter_bounds_and_conserves() {
+        // A scalar field overshooting [0,1] at some nodes (admissible mean): the knapsack
+        // limiter pulls every node into [0,1] while preserving the cell mean exactly.
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 1, 1, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let mut u = vec![0.5; ndof];
+        u[0] = 1.4; // overshoot > 1
+        u[1] = -0.2; // undershoot < 0
+        let el = &mesh.elements[0];
+        let mean = |u: &[f64]| -> f64 {
+            let (mut ws, mut s) = (0.0, 0.0);
+            for k in 0..nn {
+                ws += el.geom.jw[k];
+                s += el.geom.jw[k] * u[k];
+            }
+            s / ws
+        };
+        let m0 = mean(&u);
+        limit_scalar_bounds(&mesh, &mut u, 0.0, 1.0);
+        for (i, &v) in u.iter().enumerate() {
+            assert!(v >= -1e-12 && v <= 1.0 + 1e-12, "node {i} out of [0,1]: {v}");
+        }
+        assert!((mean(&u) - m0).abs() < 1e-12, "mean not conserved");
+    }
+
+    #[test]
+    fn knapsack_scalar_limiter_leaves_admissible_unchanged() {
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let mut u = vec![0.0; ndof];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                u[e * nn + k] = 0.5 + 0.2 * (el.geom.x[k] - 0.5); // smooth, in (0.3, 0.7)
+            }
+        }
+        let orig = u.clone();
+        limit_scalar_bounds(&mesh, &mut u, 0.0, 1.0);
+        for i in 0..ndof {
+            assert!((u[i] - orig[i]).abs() < 1e-15, "admissible scalar altered at {i}");
+        }
     }
 
     #[test]

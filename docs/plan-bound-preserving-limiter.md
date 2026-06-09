@@ -40,10 +40,17 @@ SPD for a symmetric 2×2), plus `tr C ≤ b` (FENE). Zhang–Shu / Christner–C
    `bounded_stepper_keeps_spd_where_plain_fails`: advecting a steep `Cxy` front (under-resolved high-order
    transport overshoots `|Cxy|>1` ⇒ `det<0`) loses SPD in `step_ssp_rk3` but stays `det≥ε` in the bounded
    stepper. (Still TODO: the same for the GPU direct-form advance, and the log-conf path.)
-2. **Knapsack-optimal θ (research §6, Christner–Chan).** The current `min`-over-constraints `θ` is the
-   simple robust Zhang–Shu choice; the **quadratic-knapsack** limiter finds the least-dissipative `θ`
-   satisfying all constraints jointly (a 1-D root-find on one Lagrange multiplier — cheap, GPU-amenable).
-   Upgrade for less smearing.
+2. **Knapsack-optimal θ (research §6, Christner–Chan).** ✅ **Primitive + scalar application done
+   (2026-06-09).** `knapsack_theta(weights, devs, caps)` solves the quadratic knapsack
+   `min Σ½w(1−θ)² s.t. Σ w·δ·θ = 0, 0 ≤ θ ≤ cap` via the single-multiplier `θ_i(μ)=clamp(1−μδ_i,0,cap_i)`
+   + a monotone 1-D bisection on `μ` — never more dissipative than uniform `min θ`, strictly less when
+   non-capped deviations vary (tested). `limit_scalar_bounds(mesh, u, lo, hi)` applies it to a **scalar**
+   field (conservative, less smearing) — directly usable for a bounded transported scalar (concentration
+   `φ`). **Caveat / open frontier:** single-multiplier is exact only for *one* conserved scalar; the
+   conformation *tensor* has 3 conservation constraints (3 multipliers) — the genuinely-hard multi-constraint
+   case the research §9 flags as open. So `limit_conformation_bounds` stays on uniform `θ` (correct, fully
+   tensor-conservative); the knapsack primitive is the building block for the eventual subcell/multi-constraint
+   tensor limiter.
 3. **Log-conformation variant.** In `Ψ`-space, `C = exp(Ψ)` is SPD *by construction* — so the SPD limiter
    is moot there; only the FENE bound `tr exp(Ψ) ≤ b` can be violated (nonlinear in `Ψ`). A log-conf
    limiter would scale `Ψ` toward its mean to satisfy the scalar trace surrogate.
