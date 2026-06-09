@@ -90,7 +90,7 @@ mod kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn operator3d(
         d: &[f64], u: &[f64], gx: &[f64], gy: &[f64], gz: &[f64], met: &[f64], jw: &[f64], n1: u32,
-        face_vl: &[u32], fmet: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64,
+        _face_vl: &[u32], fmet: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64,
         mut out: DisjointSlice<f64>,
     ) {
         static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
@@ -112,45 +112,59 @@ mod kernels {
             P[NN_MAX + m] = met[mo + 3] * wx + met[mo + 4] * wy + met[mo + 5] * wz;
             P[2 * NN_MAX + m] = met[mo + 6] * wx + met[mo + 7] * wy + met[mo + 8] * wz;
         }
-        // Face contribution by **gather** (race-free, fully parallel; see the 2D operator):
-        // thread `m` scans the element's 6·n2 face entries for the ones at its node
-        // (`face_vl == m`; hex corners match on three faces), accumulating the SIPG
-        // consistency/penalty `rf` and symmetry-lift `hx,hy,hz` into registers — no shared
-        // `RF/H`, no races. `face_vl == m` ⇒ the interior trace is `gx[b]`/`gy[b]`/`gz[b]`.
+        // Face contribution by **direct membership** (race-free; the 3D analogue of the 2D
+        // operator). A hex node m=(ii,jj,kk) lies on at most 3 of the 6 faces (an element
+        // corner). Its in-face position `a` follows the tensor face-node convention (see
+        // `hex_faces`): Bottom/Top run over (i,j) ⇒ a=ii+jj·n1; South/North over (i,k) ⇒
+        // a=ii+kk·n1; West/East over (j,k) ⇒ a=jj+kk·n1. So we visit only the ≤3 faces this
+        // node is on — no scan over all 6·n2 entries. The bit-for-bit operator validator
+        // confirms the convention. `face_vl[idx] == m` ⇒ interior trace `g{x,y,z}[b]`.
+        let ii = m % n1;
+        let jj = (m / n1) % n1;
+        let kk = m / n2;
         let mut rf = 0.0f64;
         let mut hx = 0.0f64;
         let mut hy = 0.0f64;
         let mut hz = 0.0f64;
         let mut t = 0usize;
         while t < 6 {
-            let tau = face_tau[e * 6 + t];
-            let mut a = 0usize;
-            while a < n2 {
+            let (on, a) = if t == 0 {
+                (kk == 0, ii + jj * n1) // Bottom
+            } else if t == 1 {
+                (kk == n1 - 1, ii + jj * n1) // Top
+            } else if t == 2 {
+                (jj == 0, ii + kk * n1) // South
+            } else if t == 3 {
+                (jj == n1 - 1, ii + kk * n1) // North
+            } else if t == 4 {
+                (ii == 0, jj + kk * n1) // West
+            } else {
+                (ii == n1 - 1, jj + kk * n1) // East
+            };
+            if on {
                 let idx = (e * 6 + t) * n2 + a;
-                if face_vl[idx] as usize == m {
-                    let nbr = face_nbr[idx];
-                    if nbr != NEU {
-                        let fo = idx * 4;
-                        let nx = fmet[fo];
-                        let ny = fmet[fo + 1];
-                        let nz = fmet[fo + 2];
-                        let sw = fmet[fo + 3];
-                        let dun_e = nx * gx[b] + ny * gy[b] + nz * gz[b];
-                        let ug = u[b];
-                        let (avg, jump, gfac) = if nbr == BND {
-                            (dun_e, ug, 1.0) // Dirichlet
-                        } else {
-                            let ng = nbr as usize;
-                            (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng] + nz * gz[ng]), ug - u[ng], 0.5)
-                        };
-                        let gg = gfac * sw * jump;
-                        rf += -sw * avg + tau * sw * jump;
-                        hx += gg * nx;
-                        hy += gg * ny;
-                        hz += gg * nz;
-                    }
+                let nbr = face_nbr[idx];
+                if nbr != NEU {
+                    let tau = face_tau[e * 6 + t];
+                    let fo = idx * 4;
+                    let nx = fmet[fo];
+                    let ny = fmet[fo + 1];
+                    let nz = fmet[fo + 2];
+                    let sw = fmet[fo + 3];
+                    let dun_e = nx * gx[b] + ny * gy[b] + nz * gz[b];
+                    let ug = u[b];
+                    let (avg, jump, gfac) = if nbr == BND {
+                        (dun_e, ug, 1.0) // Dirichlet
+                    } else {
+                        let ng = nbr as usize;
+                        (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng] + nz * gz[ng]), ug - u[ng], 0.5)
+                    };
+                    let gg = gfac * sw * jump;
+                    rf += -sw * avg + tau * sw * jump;
+                    hx += gg * nx;
+                    hy += gg * ny;
+                    hz += gg * nz;
                 }
-                a += 1;
             }
             t += 1;
         }

@@ -83,7 +83,7 @@ mod kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn operator(
         d: &[f64], u: &[f64], gx: &[f64], gy: &[f64], rx: &[f64], ry: &[f64], sx: &[f64],
-        sy: &[f64], jw: &[f64], n1: u32, face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
+        sy: &[f64], jw: &[f64], n1: u32, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
         face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<f64>,
     ) {
         static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
@@ -107,36 +107,48 @@ mod kernels {
         // consistency/penalty `rf` and the symmetry-lift `hx,hy` into registers — so no
         // shared `RF/HX/HY` and no inter-thread races (each node written by one thread).
         // Since `face_vl == m`, the interior trace is `gx[b]`/`gy[b]`/`u[b]`.
+        // Node m = (ii, jj) lies on at most 2 of the 4 faces (it's an element corner at
+        // most). Its face position `a` follows the tensor face-node convention (see
+        // `quad_faces`): South/North run along i (a=ii), East/West along j (a=jj). So we
+        // visit only the ≤2 faces this node is on — no scan over all 4·n1 entries. The
+        // bit-for-bit operator validator confirms the convention. `face_vl[idx] == m`.
+        let ii = m % n1;
+        let jj = m / n1;
         let mut rf = 0.0f64;
         let mut hx = 0.0f64;
         let mut hy = 0.0f64;
         let mut t = 0usize;
         while t < 4 {
-            let tau = face_tau[e * 4 + t];
-            let mut a = 0usize;
-            while a < n1 {
+            let (on, a) = if t == 0 {
+                (jj == 0, ii) // South
+            } else if t == 1 {
+                (ii == n1 - 1, jj) // East
+            } else if t == 2 {
+                (jj == n1 - 1, ii) // North
+            } else {
+                (ii == 0, jj) // West
+            };
+            if on {
                 let idx = (e * 4 + t) * n1 + a;
-                if face_vl[idx] as usize == m {
-                    let nbr = face_nbr[idx];
-                    if nbr != NEU {
-                        let nx = face_nx[idx];
-                        let ny = face_ny[idx];
-                        let sw = face_sw[idx];
-                        let dun_e = nx * gx[b] + ny * gy[b];
-                        let ug = u[b];
-                        let (avg, jump, gfac) = if nbr == BND {
-                            (dun_e, ug, 1.0)
-                        } else {
-                            let ng = nbr as usize;
-                            (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
-                        };
-                        let g = gfac * sw * jump;
-                        rf += -sw * avg + tau * sw * jump;
-                        hx += g * nx;
-                        hy += g * ny;
-                    }
+                let nbr = face_nbr[idx];
+                if nbr != NEU {
+                    let tau = face_tau[e * 4 + t];
+                    let nx = face_nx[idx];
+                    let ny = face_ny[idx];
+                    let sw = face_sw[idx];
+                    let dun_e = nx * gx[b] + ny * gy[b];
+                    let ug = u[b];
+                    let (avg, jump, gfac) = if nbr == BND {
+                        (dun_e, ug, 1.0)
+                    } else {
+                        let ng = nbr as usize;
+                        (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
+                    };
+                    let g = gfac * sw * jump;
+                    rf += -sw * avg + tau * sw * jump;
+                    hx += g * nx;
+                    hy += g * ny;
                 }
-                a += 1;
             }
             t += 1;
         }
