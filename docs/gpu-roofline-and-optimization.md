@@ -148,10 +148,13 @@ dot and are updated alongside P4.)
   `GpuPoisson3d` (3D), each `solve(b, reaction, neumann_tags, deflate, …)` covering all
   three flow solves; validated bit-for-bit vs the one-shot solvers (`poisson-handle-check`,
   `poisson3d-handle-check`) and **7.7× faster per solve** under amortization (≈13 vs ≈99
-  ms/solve). **Remaining:** wire the handles through the flow integrators
-  (`GpuStokes`/`GpuDualSplitting`/viscoelastic, 2D + 3D) so the sim loop holds one across
-  timesteps — removes ~0.9 s/step. Conforming meshes only; NC stays on the one-shot mortar
-  path.
+  ms/solve). **Wired through the integrators (done, 2D + 3D):** `GpuStokes`/`GpuStokes3d`
+  gained `with_handle`; `project_and_diffuse*` route the 3 solves through it. The
+  integrators (`GpuDualSplitting`/`GpuViscoelasticDualSplitting` + 3D) hold a
+  `RefCell<Option<GpuPoisson(3d)>>`, lazily built on step 1 and reused across all timesteps,
+  so a sim pays the ~0.3 s setup **once total**, not 3×/step (~0.9 s/step removed). 2D NC
+  meshes stay on the one-shot mortar path. Full 2D+3D flow/VE/IBM/BC suite passes (ve-check
+  log-conf bound widened to 3e-4 — the libdevice + reduction-order precision floor).
 - **Phase 5 — revisit P5 (multi-element-per-block matvec)** only if the re-measured roofline
   shows the matvec is still the ceiling at the orders we actually run.
 
