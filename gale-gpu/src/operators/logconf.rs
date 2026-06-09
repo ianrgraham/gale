@@ -281,6 +281,98 @@ mod kernels {
             *o = s0 * s0 * psi1 + c0 * c0 * psi2;
         }
     }
+
+    /// `tr exp(Ψ)` for a symmetric 2×2 `Ψ=[a,b,d]` (atan2-free eigenvalues `tr±rad`).
+    fn tr_exp2(a: f64, b: f64, d: f64) -> f64 {
+        let tr = 0.5 * (a + d);
+        let diff = a - d;
+        let rad = (0.25 * diff * diff + b * b).sqrt();
+        (tr + rad).exp() + (tr - rad).exp()
+    }
+
+    /// Log-conformation **FENE-P trace-bound limiter** (Phase 4 GPU port). One block per
+    /// element, one thread per node. Computes the quadrature-weighted cell mean `Ψ̄` (each
+    /// thread reduces the shared arrays — `nn` small, no power-of-2 dependence), the per-node
+    /// `θ` keeping `tr exp(Ψ̄+θΔ) ≤ b` (bisection on the convex `g(θ)`), the element-wide
+    /// `θ = min`, then applies `Ψ ← Ψ̄ + θ(Ψ−Ψ̄)`. Mirrors `gale::dg::limit_logconf_trace_bound`.
+    #[kernel]
+    pub fn limit_logconf_trace(
+        pxx: &[f64], pxy: &[f64], pyy: &[f64], jw: &[f64],
+        b_max: f64, n1: u32,
+        mut oxx: DisjointSlice<f64>, mut oxy: DisjointSlice<f64>, mut oyy: DisjointSlice<f64>,
+    ) {
+        static mut PXX: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        static mut PXY: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        static mut PYY: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        static mut TH: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        let nn = (n1 as usize) * (n1 as usize);
+        let e = thread::blockIdx_x() as usize;
+        let m = thread::threadIdx_x() as usize;
+        let b = e * nn + m;
+        unsafe {
+            PXX[m] = pxx[b];
+            PXY[m] = pxy[b];
+            PYY[m] = pyy[b];
+            WS[m] = jw[b];
+        }
+        thread::sync_threads();
+        // Quadrature-weighted cell mean (redundant per-thread reduction over shared).
+        let (mut wsum, mut mxx, mut mxy, mut myy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut j = 0usize;
+        while j < nn {
+            let w = unsafe { WS[j] };
+            wsum += w;
+            unsafe {
+                mxx += w * PXX[j];
+                mxy += w * PXY[j];
+                myy += w * PYY[j];
+            }
+            j += 1;
+        }
+        mxx /= wsum;
+        mxy /= wsum;
+        myy /= wsum;
+        // Per-node θ (this thread's node). Skip if the mean is itself over the bound.
+        let (dxx, dxy, dyy) =
+            (unsafe { PXX[m] } - mxx, unsafe { PXY[m] } - mxy, unsafe { PYY[m] } - myy);
+        let mut th = 1.0f64;
+        if tr_exp2(mxx, mxy, myy) <= b_max && tr_exp2(mxx + dxx, mxy + dxy, myy + dyy) > b_max {
+            let (mut lo, mut hi) = (0.0f64, 1.0f64);
+            let mut it = 0usize;
+            while it < 60 {
+                let mid = 0.5 * (lo + hi);
+                if tr_exp2(mxx + mid * dxx, mxy + mid * dxy, myy + mid * dyy) <= b_max {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+                it += 1;
+            }
+            th = lo;
+        }
+        unsafe { TH[m] = th; }
+        thread::sync_threads();
+        // Element θ = min over nodes (redundant per-thread reduction).
+        let mut theta = 1.0f64;
+        let mut j2 = 0usize;
+        while j2 < nn {
+            let t = unsafe { TH[j2] };
+            if t < theta {
+                theta = t;
+            }
+            j2 += 1;
+        }
+        if let Some(o) = oxx.get_mut(thread::index_1d()) {
+            *o = mxx + theta * (unsafe { PXX[m] } - mxx);
+        }
+        if let Some(o) = oxy.get_mut(thread::index_1d()) {
+            *o = mxy + theta * (unsafe { PXY[m] } - mxy);
+        }
+        if let Some(o) = oyy.get_mut(thread::index_1d()) {
+            *o = myy + theta * (unsafe { PYY[m] } - myy);
+        }
+    }
 }
 
 /// Compute the log-conformation (Fattal–Kupferman) Ψ time-derivative `∂ₜΨ` on the
@@ -386,6 +478,51 @@ pub fn logconf_implicit_relax(
     module.implicit_relax(
         &stream, cfg, &bxx_d, &bxy_d, &byy_d,
         gamma, lc.lambda.recip(), lc.mobility, lc.extensibility, n1 as u32,
+        &mut oxx, &mut oxy, &mut oyy,
+    )?;
+    Ok([oxx.to_host_vec(&stream)?, oxy.to_host_vec(&stream)?, oyy.to_host_vec(&stream)?])
+}
+
+/// GPU log-conformation FENE-P trace-bound limiter (Phase 4): enforce `tr exp(Ψ) ≤ b_max` on the
+/// log-conformation field, returning the limited `[Ψxx, Ψxy, Ψyy]`. Host wrapper around
+/// [`kernels::limit_logconf_trace`] (one block per element). Matches the CPU oracle
+/// `gale::dg::limit_logconf_trace_bound`. SPD is preserved for free (`C = exp(Ψ)`).
+pub fn logconf_limit_trace(
+    mesh: &Mesh2d,
+    psi: &[Vec<f64>; 3],
+    b_max: f64,
+) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
+    let nn = mesh.refq.n_nodes();
+    let ne = mesh.n_elements();
+    let ndof = ne * nn;
+    let n1 = mesh.order + 1;
+    for c in psi {
+        assert_eq!(c.len(), ndof, "Ψ component length must be n_elements·n_nodes");
+    }
+    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
+
+    let mut jw = vec![0.0; ndof];
+    for (e, el) in mesh.elements.iter().enumerate() {
+        for k in 0..nn {
+            jw[e * nn + k] = el.geom.jw[k];
+        }
+    }
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let pxx_d = up(&psi[0])?;
+    let pxy_d = up(&psi[1])?;
+    let pyy_d = up(&psi[2])?;
+    let jw_d = up(&jw)?;
+    let mut oxx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut oxy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut oyy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+
+    let module = kernels::load(&ctx)?;
+    let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
+    module.limit_logconf_trace(
+        &stream, cfg, &pxx_d, &pxy_d, &pyy_d, &jw_d, b_max, n1 as u32,
         &mut oxx, &mut oxy, &mut oyy,
     )?;
     Ok([oxx.to_host_vec(&stream)?, oxy.to_host_vec(&stream)?, oyy.to_host_vec(&stream)?])

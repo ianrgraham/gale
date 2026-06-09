@@ -261,6 +261,12 @@ path = "src/bin/imex_relax_check.rs"
 name = "imex-ark-check"
 path = "src/bin/imex_ark_check.rs"
 
+# Validates the GPU log-conf FENE-P trace-bound limiter (gale_gpu::logconf_limit_trace)
+# vs the CPU oracle limit_logconf_trace_bound + tr C <= b.
+[[bin]]
+name = "limiter-check"
+path = "src/bin/limiter_check.rs"
+
 # Validates gale_gpu::multigpu_advection_2d (distributed, 2-device P2P) vs CPU.
 [[bin]]
 name = "multigpu-check"

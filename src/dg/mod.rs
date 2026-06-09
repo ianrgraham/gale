@@ -114,8 +114,9 @@ pub use quad::Reference2dQuad;
 pub use reference::Reference1d;
 pub use stokes::{ConvectionScheme, Stokes};
 pub use viscoelastic::{
-    log_conformation, upwind_advection_lift, ConformationInflow, ConstitutiveModel,
-    LogConfOldroydB, OldroydB, ViscoelasticFlow,
+    limit_conformation_bounds, limit_logconf_trace_bound, limit_scalar_bounds, log_conformation,
+    upwind_advection_lift, ConformationBoundLimiter, ConformationInflow, ConstitutiveModel,
+    LogConfOldroydB, LogConfTraceLimiter, OldroydB, ViscoelasticFlow,
 };
 pub use viscoelastic3d::{
     log_conformation3, sym_apply3, sym_eig3, upwind_advection_lift3, ConformationInflow3d,

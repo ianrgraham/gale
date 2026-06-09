@@ -60,8 +60,15 @@ SPD for a symmetric 2×2), plus `tr C ≤ b` (FENE). Zhang–Shu / Christner–C
    `b=∞`. Tests: `logconf_limiter_enforces_trace_bound_and_keeps_spd` (tr C ≤ b, SPD, Ψ-mean conserved),
    `logconf_limiter_leaves_admissible_unchanged`. Note: in the FENE-P *IMEX* path the implicit solve already
    bounds the step's *final* `tr C`; this limiter covers the *transport/explicit* overshoot (and non-IMEX paths).
-4. **GPU port.** The limiter is element-local (one block per element, a reduction for the mean + per-node
-   `θ` + a min-reduction) — fits the established `gale-gpu` kernel pattern.
+4. ✅ **GPU port (2026-06-09) — the log-conf trace limiter.** `gale-gpu` kernel `limit_logconf_trace`
+   (one block/element): each thread reduces the shared arrays for the quadrature-weighted cell mean
+   (redundant per-thread sum — no power-of-2 dependence, `nn≤81`), computes its node's `θ` by the convex
+   bisection, then a per-thread min-reduction gives the element `θ`, and applies. Host wrapper
+   `gale_gpu::logconf_limit_trace`; bin `limiter-check`: **max|gpu−cpu|/|Ψ| = 2.5e-17**, `tr C ≤ b` on the
+   Titan V (sm_70). (Architecture note: the limiter is cheap element-local work, so in the *host-orchestrated*
+   GPU driver — where the field is already host-side between kernel stages — calling the **CPU** limiter adds
+   no transfer and is equally valid; the device kernel is for an eventual GPU-resident stepper. The
+   direct-form `limit_conformation_bounds` and the scalar knapsack are not yet ported — same pattern.)
 5. **AMR / mortar interaction.** Verify the limiter composes with 2:1 non-conforming interfaces (the
    research's modified entropy-stable mortar) and IBM forcing — the cell-mean admissibility assumption
    needs checking across hanging-node faces.
