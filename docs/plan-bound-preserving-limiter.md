@@ -86,7 +86,29 @@ SPD for a symmetric 2×2), plus `tr C ≤ b` (FENE). Zhang–Shu / Christner–C
      elements whose mean is already inadmissible (the `continue` in the code), degrading to a no-op rather
      than producing garbage. Same on conforming and non-conforming meshes.
 
-## 5. Scope note
+## 5. Multi-constraint tensor knapsack — VERDICT (verified research, 2026-06-09)
+
+A focused verified deep-research pass (`docs/research-entropy-stable-methods.md` §12, run wf_ac3d8a2d-011,
+21/25 confirmed) settled the open frontier. **Do NOT build the coupled multi-multiplier QP** over the
+3 (2D)/6 (3D) tensor-component conservation constraints:
+- The cheap single-μ knapsack is **structurally specific to one scalar constraint**; `M` equalities give an
+  `M`-multiplier QP with no single-variable root-find — no closed-form extension.
+- **Every** production multi-constraint BP-DG scheme (Guermond–Kuzmin, Pazner, Vilar, Lin–Chan) avoids the
+  coupled QP — they enforce constraints **sequentially, taking the min coefficient.** gale's current
+  **uniform-min-θ over {det, tr_lo, tr_hi} already IS that endorsed pattern** → the current limiter is the
+  right robust baseline.
+- The **only** genuine less-dissipative upgrade is **subcell flux-blending** (per-subcell θ; conservation
+  free by telescoping, component-wise on a tensor flux). But the **SPD-cone blending-factor selection is
+  itself unverified/open** (no cheap concrete SPD-cone flux-FCT algorithm exists in the literature), and
+  it's a substantial subcell-FV reframe.
+- On gale's **log-conformation path (the GPU path), SPD limiting is largely moot** — `C=exp(Ψ)` is SPD by
+  construction; the relevant bounds are the FENE trace (already limited) and free-energy/entropy
+  compatibility (a *different* constraint, Peng 2606.04005).
+
+**Recommendation: stop at the current limiter suite.** Treat subcell-flux-blending SPD limiting as a
+future *research* project (the genuine open frontier), not a near-term build.
+
+## 6. Scope note
 
 This is a **viscoelastic-(and-bounded-scalar-transport) tool**, not a flow-solver tool — the incompressible
 velocity has no bound to limit (research §11). It pairs with the IMEX implicit solve (relaxation bound) and

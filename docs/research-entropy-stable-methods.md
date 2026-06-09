@@ -331,3 +331,53 @@ target or two.
 > (Zhu/Pan/He), CMAME S004578250500157X (Lee–Xu/Riccati FEM). Prior pass:
 > arXiv:1604.06618, 2507.08115, 1712.10234, 2008.12044, 1905.09129; Springer
 > 978-3-030-60610-7_3; Jain & Moin 2022.
+
+---
+
+## 12. Multi-constraint SPD tensor limiting — VERIFIED follow-up (2026-06-09, run wf_ac3d8a2d-011)
+
+The specific algorithmic question for gale's bound-preserving limiter (`docs/plan-bound-preserving-limiter.md`):
+how to build a **conservation-respecting, cheap, element-local, MULTI-constraint** limiter for the SPD
+conformation tensor. 21/25 claims verified. **Verdict: do NOT build the coupled multi-multiplier QP.**
+
+- ✅ **The cheap single-μ knapsack is structurally specific to ONE scalar constraint** (Christner–Chan
+  2507.14488; continuous-quadratic-knapsack canonical form 2603.15910 = diagonal QP + box + *exactly one*
+  linear equality → the 1-D dual root-find). `M` simultaneous conservation equalities ⇒ an `M`-multiplier
+  KKT/QP with no single-variable root-find. No closed-form extension. (3-0)
+- ✅ **Production multi-constraint BP-DG schemes AVOID the coupled QP** — they enforce constraints
+  **sequentially**, taking the most-restrictive (min) per-constraint limiter coefficient: Guermond–Kuzmin
+  convex limiting (density→velocity→energy→positivity, min), Pazner 2004.08503 (subcell FCT), Lin–Chan
+  DGSEM 2306.12663 (bounds as per-subcell upper bounds + one entropy *inequality*, greedy knapsack). (3-0)
+  **→ gale's current uniform-min-θ over {det, tr_lo, tr_hi} IS exactly this endorsed sequential pattern.**
+- ✅ **Flux-level blending makes conservation FREE for ANY θ** (Vilar 2407.16815 / JCP S0021999124007836;
+  Lin–Chan 2306.12663 Thm 3.1; Pazner): `F̃ = F^FV + θ(F^H − F^FV)` telescopes, so subcell/cell means are
+  conserved for any blend — *component-wise on a tensor flux ⇒ all tensor components conserved for free.*
+  This decouples conservation from admissibility. (3-0) **This is the only worthwhile "less-dissipative"
+  upgrade route (per-subcell θ vs per-element θ).**
+- ✅ **A genuine eigenvalue-cone limiter exists** (Amiri–Barrenechea–Pryer 2601.04839, Jan 2026):
+  diagonalize + clip eigenvalues to `[ε,κ]` per node (`λ_min≥ε` directly, not det/tr surrogates), as a
+  variational inequality solved by node-decoupled projection. **BUT it is a continuous CIP FEM with NO
+  cell-mean conservation** — the inverse of gale's need. (3-0)
+- ⚠️ **High-Wi reframing** (Peng 2606.04005, May 2026, single preprint, 2-1): with log-conformation /
+  sqrt reconstruction **SPD is preserved by construction and is NOT the binding constraint** — discrete
+  **free-energy / entropy compatibility** is. A single per-cell θ along a *log path* conserves the
+  zero log-moment (Ψ-mean) automatically, but by Jensen the *physical* `C=exp(Ψ)` mean is then NOT
+  conserved. Suggests the elaborate SPD-cone limiter may be **largely redundant on gale's log-conf path**.
+- ❌ **Refuted:** "matrix-log guarantees SPD so no limiter needed" (0-3, naive); "convex-property-preserving
+  flux machinery automatically certifies the SPD cone" (1-2 — free conservation does NOT imply free SPD
+  admissibility; the blend must still be chosen to keep the bar state in the cone, and **no cheap concrete
+  SPD-cone flux-FCT algorithm was located**).
+
+**Net for gale.** (1) The coupled multi-multiplier QP is the wrong target — *every* production scheme
+avoids it. (2) gale's **current uniform-min-θ tensor limiter is the right robust baseline** — it already
+*is* the endorsed sequential-min-coefficient method. (3) The only genuine upgrade is **subcell
+flux-blending** (per-subcell θ, conservation free by telescoping) — but the **SPD-cone blending-factor
+selection is itself the unverified open frontier**, and it's a substantial subcell-FV reframe. (4) On the
+**log-conformation path (gale's GPU path), SPD limiting is largely moot** — SPD is free; only the FENE
+trace bound (already limited) and free-energy compatibility matter. **Recommendation: stop at the current
+limiter; treat subcell-flux-blending SPD limiting as a future research project, not a near-term build.**
+
+> Sources: Christner–Chan 2507.14488; CQK 2603.15910; Vilar 2407.16815 (= JCP S0021999124007836);
+> Lin–Chan 2306.12663; Pazner 2004.08503; Guermond–Kuzmin CMAME S0045782519306966; Amiri–Barrenechea–Pryer
+> 2601.04839; Peng 2606.04005; Kuzmin MCL + DGSEM ext (CAMC 2023 10.1007/s42967-023-00321-6), realizability
+> MCL 2509.07689.
