@@ -343,12 +343,19 @@ impl<'m> GpuStokes<'m> {
         force_x: &[f64],
         force_y: &[f64],
     ) -> StepResult {
-        assert!(
-            matches!(self.convection_scheme, ConvectionScheme::Nodal),
-            "per-region BCs with split-form convection are not yet supported"
-        );
+        let mesh = self.mesh;
         let dt = self.dt;
-        let (cx, cy) = self.convection(ux, uy);
+        // Convection is cheap O(N), assembled on the host (as for the closed-box path).
+        // Split-form feeds the operator a per-region ghost state via Hyperbolic::rhs_ghost.
+        let (cx, cy) = match self.convection_scheme {
+            ConvectionScheme::Nodal => self.convection(ux, uy),
+            ConvectionScheme::SplitFormDg => {
+                let op = Hyperbolic::with_options(mesh, IncompressibleConvection, VolumeForm::SplitForm, true);
+                let state = vec![ux.to_vec(), uy.to_vec()];
+                let r = op.rhs_ghost(&state, t, &bcs.convection_ghost());
+                (r[0].iter().map(|v| -v).collect(), r[1].iter().map(|v| -v).collect())
+            }
+        };
         let mut uhx = ux.to_vec();
         let mut uhy = uy.to_vec();
         for i in 0..self.ndof() {

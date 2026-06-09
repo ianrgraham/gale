@@ -241,10 +241,12 @@ impl<'m> Stokes<'m> {
     /// (e.g. for the viscoelastic `∇·τ_p` coupling). Per-region velocity data comes
     /// from `bcs`.
     ///
-    /// v1 supports [`ConvectionScheme::Nodal`] (element-local, needs no boundary
-    /// state). The split-form path is asserted off here because its Rusanov interface
-    /// flux needs a per-tag boundary state and the convection-operator BC hook is
-    /// tag-agnostic — wiring that is a follow-up.
+    /// Supports both [`ConvectionScheme::Nodal`] (element-local) and
+    /// [`ConvectionScheme::SplitFormDg`]. The split-form path feeds the convection
+    /// operator a **per-region** ghost state via [`Hyperbolic::rhs_ghost`]: Dirichlet at
+    /// inflow/no-slip (`up = u_s`), transparent at outflow (`up = um`), and a reflected
+    /// slip wall at symmetry (`up = um − 2(um·n)n`, so the convective momentum flux through
+    /// the wall is purely normal — no spurious tangential drag).
     pub fn step_ns_forced_bc(
         &self,
         ux: &[f64],
@@ -254,12 +256,17 @@ impl<'m> Stokes<'m> {
         force_x: &[f64],
         force_y: &[f64],
     ) -> (Vec<f64>, Vec<f64>) {
-        assert!(
-            matches!(self.convection_scheme, ConvectionScheme::Nodal),
-            "per-region BCs with split-form convection are not yet supported"
-        );
+        let mesh = self.mesh;
         let dt = self.dt;
-        let (cx, cy) = self.convection(ux, uy);
+        let (cx, cy) = match self.convection_scheme {
+            ConvectionScheme::Nodal => self.convection(ux, uy),
+            ConvectionScheme::SplitFormDg => {
+                let op = Hyperbolic::with_options(mesh, IncompressibleConvection, VolumeForm::SplitForm, true);
+                let state = vec![ux.to_vec(), uy.to_vec()];
+                let r = op.rhs_ghost(&state, t, &bcs.convection_ghost());
+                (r[0].iter().map(|v| -v).collect(), r[1].iter().map(|v| -v).collect())
+            }
+        };
         let mut uhx = ux.to_vec();
         let mut uhy = uy.to_vec();
         for i in 0..self.ndof() {
@@ -569,6 +576,45 @@ mod tests {
         eprintln!("free-slip channel: rel u err = {err_u:.3e}, |v| = {err_v:.3e}");
         assert!(err_u < 1e-6, "slip walls did not preserve uniform flow: {err_u}");
         assert!(err_v < 1e-6, "spurious normal velocity at slip wall: {err_v}");
+    }
+
+    #[test]
+    fn split_form_convection_with_per_region_bcs_preserves_uniform_flow() {
+        // Split-form (entropy-stable) convection + per-region BCs together: west inlet
+        // (tag 3) u=(1,0), east outflow (tag 1), free-slip top/bottom (tags 0,2). Uniform
+        // flow u=(1,0) is the exact steady state — preserving it exercises every branch of
+        // the convection ghost (Dirichlet inflow, transparent outflow, reflected slip wall)
+        // through Hyperbolic::rhs_ghost. A tag-agnostic ghost (e.g. Dirichlet everywhere)
+        // would reflect at the outflow and distort the flow.
+        use crate::dg::bc::{BoundaryConditions, FlowBc};
+        let nu = 1.0;
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 5, 3, [0.0, 2.0], [0.0, 1.0]);
+        let bcs = BoundaryConditions::no_slip()
+            .set(3, FlowBc::velocity(|_, _, _| (1.0, 0.0)))
+            .set(1, FlowBc::Outflow)
+            .set(0, FlowBc::Symmetry)
+            .set(2, FlowBc::Symmetry);
+        let dt = 0.05;
+        let mut st = Stokes::with_bcs(&mesh, 5.0, nu, dt, &bcs);
+        st.convection_scheme = ConvectionScheme::SplitFormDg;
+        let nd = mesh.n_elements() * mesh.refq.n_nodes();
+        let (mut ux, mut uy) = (vec![1.0; nd], vec![0.0; nd]);
+        let z = vec![0.0; nd];
+        let mut t = 0.0;
+        for _ in 0..20 {
+            t += dt;
+            let (nx, ny) = st.step_ns_forced_bc(&ux, &uy, t, &bcs, &z, &z);
+            ux = nx;
+            uy = ny;
+        }
+        let one = vec![1.0; nd];
+        let eu: Vec<f64> = ux.iter().map(|v| v - 1.0).collect();
+        let err_u = st.l2_norm(&eu) / st.l2_norm(&one);
+        let err_v = st.l2_norm(&uy);
+        eprintln!("split-form + per-region BCs: rel u err = {err_u:.3e}, |v| = {err_v:.3e}");
+        assert!(err_u < 1e-6, "split-form convection BCs did not preserve uniform flow: {err_u}");
+        assert!(err_v < 1e-6, "spurious cross-flow under split-form convection BCs: {err_v}");
     }
 
     #[test]

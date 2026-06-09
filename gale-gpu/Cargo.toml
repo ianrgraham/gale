@@ -144,6 +144,11 @@ path = "src/bin/flow_bc_check.rs"
 name = "flow3d-bc-check"
 path = "src/bin/flow3d_bc_check.rs"
 
+# Validates GPU split-form convection + per-region BCs (inflow/outflow/symmetry) vs CPU.
+[[bin]]
+name = "flow-split-bc-check"
+path = "src/bin/flow_split_bc_check.rs"
+
 # Validates GPU conformation inflow (upwind transport + inlet injection) vs CPU.
 [[bin]]
 name = "ve-bc-check"

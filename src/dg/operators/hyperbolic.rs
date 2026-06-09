@@ -239,9 +239,29 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
         t: f64,
         bc: &impl Fn(f64, f64, f64, &mut [f64]),
     ) -> Vec<Vec<f64>> {
+        // The simple position/time-only hook is a tag/normal/interior-agnostic ghost:
+        // it just writes the prescribed exterior state (Dirichlet).
+        let ghost = |_tag: u32, x: f64, y: f64, t: f64, _nx: f64, _ny: f64, _um: &[f64], up: &mut [f64]| {
+            bc(x, y, t, up)
+        };
+        self.rhs_ghost(state, t, &ghost)
+    }
+
+    /// Like [`rhs`](Self::rhs) but with a **tag/normal/interior-aware** ghost hook
+    /// `ghost(tag, x, y, t, nx, ny, um, up)`: the boundary `tag`, node position, outward
+    /// normal `(nx, ny)`, and interior trace `um` are passed in so the caller can build
+    /// per-region exterior states — Dirichlet inflow (`up = u_s`), transparent outflow
+    /// (`up = um`), or a reflected slip wall (`up = um − 2(um·n)n`). This is the
+    /// convection side of per-region [`BoundaryConditions`](super::bc::BoundaryConditions).
+    pub fn rhs_ghost(
+        &self,
+        state: &[Vec<f64>],
+        t: f64,
+        ghost: &impl Fn(u32, f64, f64, f64, f64, f64, &[f64], &mut [f64]),
+    ) -> Vec<Vec<f64>> {
         match self.form {
-            VolumeForm::Weak => self.rhs_weak(state, t, bc),
-            VolumeForm::SplitForm => self.rhs_split(state, t, bc),
+            VolumeForm::Weak => self.rhs_weak(state, t, ghost),
+            VolumeForm::SplitForm => self.rhs_split(state, t, ghost),
         }
     }
 
@@ -269,7 +289,7 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
         &self,
         state: &[Vec<f64>],
         t: f64,
-        bc: &impl Fn(f64, f64, f64, &mut [f64]),
+        ghost: &impl Fn(u32, f64, f64, f64, f64, f64, &[f64], &mut [f64]),
     ) -> Vec<Vec<f64>> {
         let mesh = self.mesh;
         let refq = &mesh.refq;
@@ -347,7 +367,7 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
                                 }
                             }
                         }
-                        Neighbor::Boundary { .. } => {
+                        Neighbor::Boundary { tag } => {
                             let g = &mesh.elements[e].geom;
                             for ai in 0..face.nodes.len() {
                                 let vl = face.nodes[ai];
@@ -355,7 +375,7 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
                                 for v in 0..nv {
                                     um[v] = state[v][e * nn + vl];
                                 }
-                                bc(g.x[vl], g.y[vl], t, &mut up);
+                                ghost(tag, g.x[vl], g.y[vl], t, nx, ny, &um, &mut up);
                                 self.rusanov(&um, &up, nx, ny, &mut fstar);
                                 for v in 0..nv {
                                     res[v][e * nn + vl] -= sw * fstar[v];
@@ -434,7 +454,7 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
         &self,
         state: &[Vec<f64>],
         t: f64,
-        bc: &impl Fn(f64, f64, f64, &mut [f64]),
+        ghost: &impl Fn(u32, f64, f64, f64, f64, f64, &[f64], &mut [f64]),
     ) -> Vec<Vec<f64>> {
         let mesh = self.mesh;
         let refq = &mesh.refq;
@@ -531,7 +551,10 @@ impl<'m, L: ConservationLaw> Hyperbolic<'m, L> {
                                         sp[v] = state[v][*re * nn + rnode];
                                     }
                                 }
-                                _ => bc(g.x[vl], g.y[vl], t, &mut sp),
+                                Neighbor::Boundary { tag } => {
+                                    ghost(*tag, g.x[vl], g.y[vl], t, nx, ny, &sm, &mut sp)
+                                }
+                                _ => unreachable!("outer match restricts to Interior | Boundary"),
                             }
                             self.law.flux(&sm, &mut fxm, &mut fym);
                             self.law.flux(&sp, &mut fxp, &mut fyp);

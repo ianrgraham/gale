@@ -97,6 +97,31 @@ impl BoundaryConditions {
         self.get(tag).dirichlet(x, y, t)
     }
 
+    /// Per-region exterior (ghost) state for the **split-form convection** interface flux,
+    /// `ghost(tag, x, y, t, nx, ny, um, up)` (see [`Hyperbolic::rhs_ghost`](crate::dg::hyperbolic::Hyperbolic::rhs_ghost)).
+    /// Inflow/no-slip ⇒ Dirichlet `up = u_s`; outflow ⇒ transparent `up = um`; symmetry ⇒
+    /// reflected slip wall `up = um − 2(um·n)n` (the convective momentum flux through the
+    /// wall is then purely normal — no spurious tangential drag). Shared by the CPU and GPU
+    /// per-region NS steps.
+    pub fn convection_ghost(&self) -> impl Fn(u32, f64, f64, f64, f64, f64, &[f64], &mut [f64]) + '_ {
+        move |tag, x, y, t, nx, ny, um: &[f64], up: &mut [f64]| match self.get(tag) {
+            FlowBc::Outflow => {
+                up[0] = um[0];
+                up[1] = um[1];
+            }
+            FlowBc::Symmetry => {
+                let un = um[0] * nx + um[1] * ny;
+                up[0] = um[0] - 2.0 * un * nx;
+                up[1] = um[1] - 2.0 * un * ny;
+            }
+            _ => {
+                let (u, v) = self.dirichlet(tag, x, y, t);
+                up[0] = u;
+                up[1] = v;
+            }
+        }
+    }
+
     /// Mesh boundary tags that are outflows (velocity-Neumann / pressure-Dirichlet),
     /// sorted.
     pub fn outflow_tags(&self, mesh: &Mesh2d) -> Vec<u32> {
