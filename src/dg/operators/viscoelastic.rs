@@ -1844,6 +1844,49 @@ mod tests {
     }
 
     #[test]
+    fn limiter_is_element_local_on_nonconforming_mesh() {
+        // The limiter uses only per-element data (cell mean + θ, no neighbour/mortar), so on a
+        // 2:1 non-conforming (AMR) mesh it enforces the bound and conserves *each* element's mean
+        // exactly as on a conforming mesh — no mortar interaction, including on the refined cells.
+        let p = 4;
+        let mesh = Mesh2d::cartesian_refined(p, 3, 3, [0.0, 1.0], [0.0, 1.0], &[(1, 1)]); // centre refined
+        let nn = mesh.refq.n_nodes();
+        let ne = mesh.n_elements();
+        let ndof = ne * nn;
+        // C = I, with a non-SPD node 0 in every element (each element's mean stays SPD).
+        let mut c = [vec![1.0; ndof], vec![0.0; ndof], vec![1.0; ndof]];
+        for e in 0..ne {
+            c[1][e * nn] = 2.0; // Cxy = 2 ⇒ det = 1 − 4 < 0
+        }
+        let elem_mean = |c: &[Vec<f64>; 3], e: usize, comp: usize| -> f64 {
+            let el = &mesh.elements[e];
+            let (mut ws, mut s) = (0.0, 0.0);
+            for k in 0..nn {
+                ws += el.geom.jw[k];
+                s += el.geom.jw[k] * c[comp][e * nn + k];
+            }
+            s / ws
+        };
+        let m0: Vec<[f64; 3]> =
+            (0..ne).map(|e| [elem_mean(&c, e, 0), elem_mean(&c, e, 1), elem_mean(&c, e, 2)]).collect();
+        let eps = 1e-8;
+        limit_conformation_bounds(&mesh, &mut c, eps, f64::INFINITY);
+        for i in 0..ndof {
+            let det = c[0][i] * c[2][i] - c[1][i] * c[1][i];
+            // det is driven to ≈ ε (to ~machine-eps recomposition rounding) and stays SPD.
+            assert!(det >= eps * (1.0 - 1e-6) && c[0][i] + c[2][i] > 0.0, "node {i} not SPD: det={det}");
+        }
+        for e in 0..ne {
+            for comp in 0..3 {
+                assert!(
+                    (elem_mean(&c, e, comp) - m0[e][comp]).abs() < 1e-12,
+                    "element {e} comp {comp} mean drifted (broken conservation on NC mesh)"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn logconf_limiter_leaves_admissible_unchanged() {
         let p = 3;
         let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);

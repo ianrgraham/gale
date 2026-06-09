@@ -69,9 +69,22 @@ SPD for a symmetric 2×2), plus `tr C ≤ b` (FENE). Zhang–Shu / Christner–C
    GPU driver — where the field is already host-side between kernel stages — calling the **CPU** limiter adds
    no transfer and is equally valid; the device kernel is for an eventual GPU-resident stepper. The
    direct-form `limit_conformation_bounds` and the scalar knapsack are not yet ported — same pattern.)
-5. **AMR / mortar interaction.** Verify the limiter composes with 2:1 non-conforming interfaces (the
-   research's modified entropy-stable mortar) and IBM forcing — the cell-mean admissibility assumption
-   needs checking across hanging-node faces.
+5. ✅ **AMR / IBM interaction audited (2026-06-09).** Findings:
+   - **AMR (2:1 non-conforming):** the limiter reads *only* per-element data (cell mean + node values of
+     that element) — no neighbour or mortar data — so it is **mesh-agnostic**. It conserves *each*
+     element's mean exactly (limiting is affine toward that element's own mean), so it cannot break the
+     mortar's inter-element flux conservation. Verified by `limiter_is_element_local_on_nonconforming_mesh`
+     (centre-refined mesh: bounds enforced + per-element mean conserved on the refined cells too). **No
+     AMR-specific interaction.**
+   - **IBM:** the penalization hooks (`PenalizationHook` / `Penalization3dHook`, `sim/ibm.rs`) act on the
+     **velocity** `FieldId` only — never the conformation. So the conformation limiter is **orthogonal** to
+     IBM; they are independent `StageHook`s. The conformation inside a solid advects with the penalized
+     (≈0) velocity and relaxes toward equilibrium, staying bounded.
+   - **The real (universal, not AMR-specific) caveat:** Zhang–Shu limiting requires the *cell mean* to be
+     admissible. For a scalar with a maximum principle that's guaranteed; for the conformation under
+     stretching it is **not** guaranteed in general — the limiter handles this by **gracefully skipping**
+     elements whose mean is already inadmissible (the `continue` in the code), degrading to a no-op rather
+     than producing garbage. Same on conforming and non-conforming meshes.
 
 ## 5. Scope note
 
