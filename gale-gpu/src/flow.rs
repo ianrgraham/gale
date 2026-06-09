@@ -15,7 +15,7 @@
 
 use crate::operators::poisson::{helmholtz_cg_solve, helmholtz_cg_solve_tags, pressure_cg_solve, GpuPoisson};
 use crate::operators::poisson_nc::{
-    helmholtz_nc_cg_solve_tags, poisson_nc_cg_solve, pressure_nc_cg_solve,
+    helmholtz_nc_cg_solve_tags, poisson_nc_cg_solve, pressure_nc_cg_solve, GpuPoissonNc,
 };
 use std::cell::RefCell;
 
@@ -45,6 +45,23 @@ fn ensure_poisson_handle(slot: &RefCell<Option<GpuPoisson>>, mesh: &Mesh2d, alph
         *cur = Some(GpuPoisson::new(mesh, alpha).expect("gale-gpu: GpuPoisson handle build failed"));
     }
 }
+
+/// Lazily (re)build the persistent **non-conforming** [`GpuPoissonNc`] handle in `slot`
+/// (the AMR companion to [`ensure_poisson_handle`]): built only when the mesh is
+/// non-conforming, cleared otherwise. So for any given mesh exactly one of the two handle
+/// slots is `Some`, and the step uses whichever matches. Rebuilt when the dof count
+/// changes (a remesh), so a steady adaptive mesh pays the NC setup once between remeshes.
+fn ensure_poisson_nc_handle(slot: &RefCell<Option<GpuPoissonNc>>, mesh: &Mesh2d, alpha: f64) {
+    let mut cur = slot.borrow_mut();
+    if !mesh_is_nonconforming(mesh) {
+        *cur = None;
+        return;
+    }
+    let ndof = mesh.n_elements() * mesh.refq.n_nodes();
+    if cur.as_ref().map_or(true, |h| h.ndof() != ndof) {
+        *cur = Some(GpuPoissonNc::new(mesh, alpha).expect("gale-gpu: GpuPoissonNc handle build failed"));
+    }
+}
 use gale::dg::{
     log_conformation, upwind_advection_lift, BoundaryConditions, ConformationInflow,
     ConstitutiveModel, ConvectionScheme, Hyperbolic, IncompressibleConvection, LogConfOldroydB,
@@ -68,6 +85,10 @@ pub struct GpuStokes<'m, 'p> {
     /// solve. Set via [`with_handle`](Self::with_handle); the owning integrator keeps the
     /// handle alive across timesteps. `None` ⇒ the one-shot solvers (legacy path).
     poisson: Option<&'p GpuPoisson>,
+    /// Optional persistent NC handle (P4 for AMR). Used when the mesh is non-conforming
+    /// (then `poisson` is `None`); `None` ⇒ the one-shot mortar solvers. Set via
+    /// [`with_nc_handle`](Self::with_nc_handle).
+    poisson_nc: Option<&'p GpuPoissonNc>,
     /// Pressure-Poisson assembly (pure Neumann, singular).
     pressure: Poisson<'m>,
     /// Velocity Helmholtz assembly `(λM + A)`, one per component (differ only in their
@@ -99,6 +120,7 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             convection_scheme: ConvectionScheme::Nodal,
             alpha,
             poisson: None,
+            poisson_nc: None,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
             velocity_x: Poisson::with_reaction(mesh, alpha, lambda),
             velocity_y: Poisson::with_reaction(mesh, alpha, lambda),
@@ -123,6 +145,14 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         self
     }
 
+    /// Route the three per-step elliptic solves through the persistent **non-conforming**
+    /// [`GpuPoissonNc`] `handle` (P4 for AMR) when the mesh has hanging nodes. Bit-identical
+    /// to the one-shot mortar solvers it replaces (validated by `poisson-nc-handle-check`).
+    pub fn with_nc_handle(mut self, handle: &'p GpuPoissonNc) -> Self {
+        self.poisson_nc = Some(handle);
+        self
+    }
+
     /// Solver with **per-region** boundary conditions — the GPU analogue of
     /// `gale::dg::Stokes::with_bcs`. Each boundary tag is routed via `bcs` to the right
     /// pair of operator settings (no-slip/inflow ⇒ velocity-Dirichlet + pressure-Neumann;
@@ -140,6 +170,7 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             convection_scheme: ConvectionScheme::Nodal,
             alpha,
             poisson: None,
+            poisson_nc: None,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, pres_neumann.clone()),
             velocity_x: Poisson::with_bc(mesh, alpha, lambda, velx_neumann.clone()),
             velocity_y: Poisson::with_bc(mesh, alpha, lambda, vely_neumann.clone()),
@@ -313,7 +344,11 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         let bp = self.pressure.rhs_mixed(&fp, |_, _| 0.0, |_, _| 0.0);
         let nc = mesh_is_nonconforming(mesh);
         let (p, _it) = if nc {
-            pressure_nc_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+            if let Some(h) = self.poisson_nc {
+                h.solve(&bp, 0.0, &self.pres_neumann_tags, true, self.tol, self.maxit)?
+            } else {
+                pressure_nc_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+            }
         } else if let Some(h) = self.poisson {
             // Pure-Neumann pressure, deflated (closed box ⇒ all tags Neumann, no outflow).
             h.solve(&bp, 0.0, &self.pres_neumann_tags, true, self.tol, self.maxit)?
@@ -334,21 +369,22 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let bx = self.velocity_x.rhs(&fxv, |x, y| bc_u(x, y, t));
         let by = self.velocity_y.rhs(&fyv, |x, y| bc_v(x, y, t));
-        let (uxn, _) = if nc {
-            poisson_nc_cg_solve(mesh, &bx, self.alpha, lambda, self.tol, self.maxit)?
-        } else if let Some(h) = self.poisson {
-            // All-Dirichlet velocity Helmholtz (closed box ⇒ empty Neumann-tag set).
-            h.solve(&bx, lambda, &self.velx_neumann, false, self.tol, self.maxit)?
-        } else {
-            helmholtz_cg_solve(mesh, &bx, self.alpha, lambda, self.tol, self.maxit)?
+        let solve_vel = |b: &[f64], neu: &[u32]| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+            Ok(if nc {
+                if let Some(h) = self.poisson_nc {
+                    h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
+                } else {
+                    poisson_nc_cg_solve(mesh, b, self.alpha, lambda, self.tol, self.maxit)?.0
+                }
+            } else if let Some(h) = self.poisson {
+                // All-Dirichlet velocity Helmholtz (closed box ⇒ empty Neumann-tag set).
+                h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
+            } else {
+                helmholtz_cg_solve(mesh, b, self.alpha, lambda, self.tol, self.maxit)?.0
+            })
         };
-        let (uyn, _) = if nc {
-            poisson_nc_cg_solve(mesh, &by, self.alpha, lambda, self.tol, self.maxit)?
-        } else if let Some(h) = self.poisson {
-            h.solve(&by, lambda, &self.vely_neumann, false, self.tol, self.maxit)?
-        } else {
-            helmholtz_cg_solve(mesh, &by, self.alpha, lambda, self.tol, self.maxit)?
-        };
+        let uxn = solve_vel(&bx, &self.velx_neumann)?;
+        let uyn = solve_vel(&by, &self.vely_neumann)?;
         Ok((uxn, uyn))
     }
 
@@ -446,6 +482,10 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
                 let h = self.poisson.unwrap();
                 h.solve(&bp, 0.0, &self.pres_neumann_tags, !self.has_outflow, self.tol, self.maxit)?
             }
+            (_, true) if self.poisson_nc.is_some() => {
+                let h = self.poisson_nc.unwrap();
+                h.solve(&bp, 0.0, &self.pres_neumann_tags, !self.has_outflow, self.tol, self.maxit)?
+            }
             (true, false) => helmholtz_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?,
             (true, true) => helmholtz_nc_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?,
             (false, false) => pressure_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?,
@@ -465,20 +505,21 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let bx = self.velocity_x.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
         let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
-        let (uxn, _) = if nc {
-            helmholtz_nc_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?
-        } else if let Some(h) = self.poisson {
-            h.solve(&bx, lambda, &self.velx_neumann, false, self.tol, self.maxit)?
-        } else {
-            helmholtz_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?
+        let solve_vel = |b: &[f64], neu: &[u32]| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+            Ok(if nc {
+                if let Some(h) = self.poisson_nc {
+                    h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
+                } else {
+                    helmholtz_nc_cg_solve_tags(mesh, b, self.alpha, lambda, neu, self.tol, self.maxit)?.0
+                }
+            } else if let Some(h) = self.poisson {
+                h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
+            } else {
+                helmholtz_cg_solve_tags(mesh, b, self.alpha, lambda, neu, self.tol, self.maxit)?.0
+            })
         };
-        let (uyn, _) = if nc {
-            helmholtz_nc_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.vely_neumann, self.tol, self.maxit)?
-        } else if let Some(h) = self.poisson {
-            h.solve(&by, lambda, &self.vely_neumann, false, self.tol, self.maxit)?
-        } else {
-            helmholtz_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.vely_neumann, self.tol, self.maxit)?
-        };
+        let uxn = solve_vel(&bx, &self.velx_neumann)?;
+        let uyn = solve_vel(&by, &self.vely_neumann)?;
         Ok((uxn, uyn))
     }
 
@@ -503,6 +544,7 @@ pub struct GpuStokesIntegrator {
     bc_v: Box<dyn Fn(f64, f64, f64) -> f64>,
     /// Persistent GPU Poisson handle (P4), lazily built and reused across timesteps.
     poisson: RefCell<Option<GpuPoisson>>,
+    poisson_nc: RefCell<Option<GpuPoissonNc>>,
 }
 
 impl GpuStokesIntegrator {
@@ -517,6 +559,7 @@ impl GpuStokesIntegrator {
             bc_u: Box::new(|_, _, _| 0.0),
             bc_v: Box::new(|_, _, _| 0.0),
             poisson: RefCell::new(None),
+            poisson_nc: RefCell::new(None),
         }
     }
 
@@ -540,10 +583,15 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
     fn step(&self, state: &mut gale::sim::State, hook: &dyn gale::sim::StateStageHook) {
         let t_new = state.time.t + self.dt;
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
+        ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
         let handle = self.poisson.borrow();
+        let nc_handle = self.poisson_nc.borrow();
         let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt);
         if let Some(h) = handle.as_ref() {
             stokes = stokes.with_handle(h);
+        }
+        if let Some(h) = nc_handle.as_ref() {
+            stokes = stokes.with_nc_handle(h);
         }
         let (ux, uy) = {
             let v = state.fields.by_id(self.velocity);
@@ -587,6 +635,7 @@ pub struct GpuDualSplitting {
     /// Persistent GPU Poisson handle (P4), lazily built on the first step and reused
     /// across timesteps. `RefCell` because `step` is `&self`; conforming meshes only.
     poisson: RefCell<Option<GpuPoisson>>,
+    poisson_nc: RefCell<Option<GpuPoissonNc>>,
 }
 
 impl GpuDualSplitting {
@@ -607,6 +656,7 @@ impl GpuDualSplitting {
                 (vec![0.0; n], vec![0.0; n])
             }),
             poisson: RefCell::new(None),
+            poisson_nc: RefCell::new(None),
         }
     }
 
@@ -659,12 +709,17 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
         };
         let (bx, by) = (self.body_force)(state, t_new);
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
+        ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
         let handle = self.poisson.borrow();
+        let nc_handle = self.poisson_nc.borrow();
         let (nux, nuy) = if let Some(bcs) = &self.bcs {
             let mut stokes = GpuStokes::with_bcs(&state.mesh, self.alpha, self.nu, self.dt, bcs);
             stokes.convection_scheme = self.convection_scheme;
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
+            }
+            if let Some(h) = nc_handle.as_ref() {
+                stokes = stokes.with_nc_handle(h);
             }
             stokes
                 .step_ns_forced_bc(&ux, &uy, t_new, bcs, &bx, &by)
@@ -674,6 +729,9 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             stokes.convection_scheme = self.convection_scheme;
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
+            }
+            if let Some(h) = nc_handle.as_ref() {
+                stokes = stokes.with_nc_handle(h);
             }
             stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
@@ -851,6 +909,7 @@ pub struct GpuViscoelasticDualSplitting {
     /// Persistent GPU Poisson handle (P4) for the momentum (velocity) solves, lazily built
     /// on the first step and reused across timesteps. Conforming meshes only.
     poisson: RefCell<Option<GpuPoisson>>,
+    poisson_nc: RefCell<Option<GpuPoissonNc>>,
 }
 
 impl GpuViscoelasticDualSplitting {
@@ -883,6 +942,7 @@ impl GpuViscoelasticDualSplitting {
             fy: Box::new(|_, _, _| 0.0),
             inflow: None,
             poisson: RefCell::new(None),
+            poisson_nc: RefCell::new(None),
         }
     }
 
@@ -969,10 +1029,15 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             // Momentum: GPU velocity using ∇·τ_p from the OLD conformation + drive.
             let (bx, by) = self.body_force(&state.mesh, &c, t_new);
             ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
+            ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
             let handle = self.poisson.borrow();
+            let nc_handle = self.poisson_nc.borrow();
             let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.eta_s, self.dt);
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
+            }
+            if let Some(h) = nc_handle.as_ref() {
+                stokes = stokes.with_nc_handle(h);
             }
             let (nux, nuy) = stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
