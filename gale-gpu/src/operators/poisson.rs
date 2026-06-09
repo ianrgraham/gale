@@ -26,6 +26,14 @@ const RED: usize = 256; // reduction block size
 const BND: u32 = u32::MAX; // sentinel: Dirichlet boundary face (SIPG consistency+penalty)
 const NEU: u32 = u32::MAX - 1; // sentinel: Neumann boundary face (natural BC ⇒ no contribution)
 
+/// Number of blocks for the multi-block `dot_partial` reduction: enough to stream the
+/// vector across all SMs (one block-partial each), capped so the host-side final sum of
+/// the partials stays trivial. `RED` threads per block. Volta has 80 SMs; 1024 blocks ×
+/// 256 threads saturates occupancy while summing only 1024 doubles on the host.
+fn dot_blocks(ndof: usize) -> usize {
+    ndof.div_ceil(RED).clamp(1, 1024)
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -80,9 +88,6 @@ mod kernels {
         static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         static mut PR: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         static mut PS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut RF: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut HX: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut HY: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         let n1 = n1 as usize;
         let nn = n1 * n1;
         let e = thread::blockIdx_x() as usize;
@@ -90,58 +95,53 @@ mod kernels {
         let b = e * nn + m;
         unsafe {
             DS[m] = d[m];
-            RF[m] = 0.0;
-            HX[m] = 0.0;
-            HY[m] = 0.0;
             let wx = jw[b] * gx[b];
             let wy = jw[b] * gy[b];
             PR[m] = rx[b] * wx + ry[b] * wy;
             PS[m] = sx[b] * wx + sy[b] * wy;
         }
-        thread::sync_threads();
-        if m == 0 {
-            let mut t = 0usize;
-            while t < 4 {
-                let tau = face_tau[e * 4 + t];
-                let mut a = 0usize;
-                while a < n1 {
-                    let idx = (e * 4 + t) * n1 + a;
-                    let vl = face_vl[idx] as usize;
-                    let nx = face_nx[idx];
-                    let ny = face_ny[idx];
-                    let sw = face_sw[idx];
+        // Face contribution by **gather** (race-free, fully parallel): thread `m` owns
+        // node `m`, scans the element's 4·n1 face entries for the ones at this node
+        // (`face_vl == m`; corners match on two faces), and accumulates the SIPG
+        // consistency/penalty `rf` and the symmetry-lift `hx,hy` into registers — so no
+        // shared `RF/HX/HY` and no inter-thread races (each node written by one thread).
+        // Since `face_vl == m`, the interior trace is `gx[b]`/`gy[b]`/`u[b]`.
+        let mut rf = 0.0f64;
+        let mut hx = 0.0f64;
+        let mut hy = 0.0f64;
+        let mut t = 0usize;
+        while t < 4 {
+            let tau = face_tau[e * 4 + t];
+            let mut a = 0usize;
+            while a < n1 {
+                let idx = (e * 4 + t) * n1 + a;
+                if face_vl[idx] as usize == m {
                     let nbr = face_nbr[idx];
-                    if nbr == NEU {
-                        // Neumann boundary: natural BC ⇒ the face contributes nothing
-                        // (no consistency, penalty, or lift). Homogeneous ∂u/∂n = 0.
-                        a += 1;
-                        continue;
+                    if nbr != NEU {
+                        let nx = face_nx[idx];
+                        let ny = face_ny[idx];
+                        let sw = face_sw[idx];
+                        let dun_e = nx * gx[b] + ny * gy[b];
+                        let ug = u[b];
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0)
+                        } else {
+                            let ng = nbr as usize;
+                            (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
+                        };
+                        let g = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * nx;
+                        hy += g * ny;
                     }
-                    let dun_e = nx * gx[e * nn + vl] + ny * gy[e * nn + vl];
-                    let ug = u[e * nn + vl];
-                    let (avg, jump, gfac) = if nbr == BND {
-                        (dun_e, ug, 1.0)
-                    } else {
-                        let ng = nbr as usize;
-                        (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
-                    };
-                    let g = gfac * sw * jump;
-                    unsafe {
-                        RF[vl] += -sw * avg + tau * sw * jump;
-                        HX[vl] += g * nx;
-                        HY[vl] += g * ny;
-                    }
-                    a += 1;
                 }
-                t += 1;
+                a += 1;
             }
+            t += 1;
         }
-        thread::sync_threads();
-        let hxm = unsafe { HX[m] };
-        let hym = unsafe { HY[m] };
         unsafe {
-            PR[m] -= rx[b] * hxm + ry[b] * hym;
-            PS[m] -= sx[b] * hxm + sy[b] * hym;
+            PR[m] -= rx[b] * hx + ry[b] * hy;
+            PS[m] -= sx[b] * hx + sy[b] * hy;
         }
         thread::sync_threads();
         let i = m % n1;
@@ -154,11 +154,10 @@ mod kernels {
             }
             k += 1;
         }
-        let rfm = unsafe { RF[m] };
         if let Some(o) = out.get_mut(thread::index_1d()) {
             // SIPG stiffness `A·u` plus the Helmholtz reaction `λ·M·u` (diagonal GLL
             // mass `M = diag(jw)`). `λ = 0` ⇒ pure Poisson, bit-identical to before.
-            *o = acc + rfm + lambda * jw[b] * u[b];
+            *o = acc + rf + lambda * jw[b] * u[b];
         }
     }
 
@@ -211,20 +210,26 @@ mod kernels {
         }
     }
 
+    /// Multi-block grid-stride dot product: each of `gridDim` blocks reduces its
+    /// strided slice of `a·b` into shared memory and writes one partial to
+    /// `partial[blockIdx]`. The host (or a second reduction) sums the `gridDim`
+    /// partials. With `gridDim = 1` this is the old single-block reduction (writes
+    /// `partial[0]`); with many blocks it streams `a`/`b` across all SMs at ~peak
+    /// bandwidth instead of saturating a single SM.
     #[kernel]
     pub fn dot_partial(a: &[f64], b: &[f64], n: u64, mut partial: DisjointSlice<f64>) {
         static mut SH: SharedArray<f64, RED> = SharedArray::UNINIT;
         let tid = thread::threadIdx_x() as usize;
-        let stride = thread::blockDim_x() as usize;
+        let gstride = (thread::gridDim_x() * thread::blockDim_x()) as usize;
         let mut acc = 0.0f64;
-        let mut i = tid;
+        let mut i = (thread::blockIdx_x() * thread::blockDim_x()) as usize + tid;
         while i < n as usize {
             acc += a[i] * b[i];
-            i += stride;
+            i += gstride;
         }
         unsafe { SH[tid] = acc; }
         thread::sync_threads();
-        let mut s = stride / 2;
+        let mut s = thread::blockDim_x() as usize / 2;
         while s > 0 {
             if tid < s {
                 unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
@@ -233,9 +238,7 @@ mod kernels {
             s /= 2;
         }
         if tid == 0 {
-            if let Some(o) = partial.get_mut(thread::index_1d()) {
-                *o = unsafe { SH[0] };
-            }
+            unsafe { *partial.get_unchecked_mut(thread::blockIdx_x() as usize) = SH[0]; }
         }
     }
 
@@ -560,7 +563,8 @@ fn cg_solve_impl(
     let mut ap = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let nb = dot_blocks(ndof);
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, nb)?;
 
     let module = kernels::load(&ctx)?;
     let cfg = LaunchConfig {
@@ -568,7 +572,7 @@ fn cg_solve_impl(
         block_dim: (ma.nn as u32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
     let n64 = ndof as u64;
@@ -576,7 +580,7 @@ fn cg_solve_impl(
     macro_rules! dot {
         ($a:expr, $b:expr) => {{
             module.dot_partial(&stream, red, $a, $b, n64, &mut partial)?;
-            partial.to_host_vec(&stream)?[0]
+            partial.to_host_vec(&stream)?.iter().sum::<f64>()
         }};
     }
     macro_rules! apply {
@@ -653,7 +657,8 @@ pub fn pressure_cg_solve(
     let mut ap = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let nb = dot_blocks(ndof);
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, nb)?;
     let ones = up(&vec![1.0f64; ndof])?;
 
     let module = kernels::load(&ctx)?;
@@ -662,7 +667,7 @@ pub fn pressure_cg_solve(
         block_dim: (ma.nn as u32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
     let n64 = ndof as u64;
@@ -671,7 +676,7 @@ pub fn pressure_cg_solve(
     macro_rules! dot {
         ($a:expr, $b:expr) => {{
             module.dot_partial(&stream, red, $a, $b, n64, &mut partial)?;
-            partial.to_host_vec(&stream)?[0]
+            partial.to_host_vec(&stream)?.iter().sum::<f64>()
         }};
     }
     // Remove the constant nullspace component: v ← v − mean(v) (arithmetic mean,
@@ -797,7 +802,6 @@ pub fn poisson_pcg_solve(
         .map(|l| LaunchConfig { grid_dim: (nev[l], 1, 1), block_dim: (n1v[l] * n1v[l], 1, 1), shared_mem_bytes: 0 })
         .collect();
     let vcfg: Vec<LaunchConfig> = ndofv.iter().map(|&n| LaunchConfig::for_num_elems(n as u32)).collect();
-    let redcfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
 
     // PCG vectors (finest level, separate from V-cycle scratch).
     let mut psol = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
@@ -806,14 +810,18 @@ pub fn poisson_pcg_solve(
     let pz = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
     let mut pap = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
     let rhs_dev = up(rhs)?;
-    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    // Multi-block reduction: partials sized for the finest level (the largest dot); each
+    // dot launches dot_blocks($n) blocks and the host sums that many partials.
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, dot_blocks(n0))?;
 
     let module = kernels::load(&ctx)?;
 
     macro_rules! dot {
         ($a:expr, $b:expr, $n:expr) => {{
+            let nbl = dot_blocks($n);
+            let redcfg = LaunchConfig { grid_dim: (nbl as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
             module.dot_partial(&stream, redcfg, $a, $b, $n as u64, &mut partial)?;
-            partial.to_host_vec(&stream)?[0]
+            partial.to_host_vec(&stream)?[..nbl].iter().sum::<f64>()
         }};
     }
     macro_rules! dcopy {
@@ -974,11 +982,12 @@ pub fn bench_poisson_kernels(
     let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut out = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let nb = dot_blocks(ndof);
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, nb)?;
 
     let module = kernels::load(&ctx)?;
     let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: 0 };
-    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
     let n64 = ndof as u64;

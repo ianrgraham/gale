@@ -69,6 +69,32 @@ stream overlap. The low-order rows are the clean signal.)
    would help low orders but complicates the shared-memory tiling; lower priority since
    higher orders already utilize well and P1/P2 dominate the iteration cost.
 
+## Phase 2 results — kernel wins (P1 + P3)
+
+Same 64×64 benchmark after the two kernel rewrites. **P1** = multi-block grid-stride
+`dot_partial` (one block-partial per SM-worth of blocks, host sums ≤1024 partials).
+**P3** = SIPG operator face term rewritten from a single-threaded scatter (`if m==0`) to
+a race-free per-node gather (each thread sums the faces its node lies on into registers;
+drops the `RF/HX/HY` shared arrays and 2 of 3 `sync_threads`).
+
+| kernel / metric        | p=4 before → after | p=6 before → after | p=8 before → after |
+|------------------------|--------------------|--------------------|--------------------|
+| `dot_partial` %BW      | 2.7% → **50.5%**   | 2.8% → **84.0%**   | 1.6% → **69.6%**   |
+| `dot_partial` µs/call  | 92.5 → **5.0**     | 178 → **5.9**      | 511 → **11.7**     |
+| `operator` %BW         | 22% → **27%**      | 28% → **37%**      | 29% → **42%**      |
+| `operator` µs/call     | 57.4 → **46.0**    | 86.7 → **66.3**    | 141 → **96.1**     |
+| **full CG solve wall** | 710 → **464 ms**   | 1591 → **680 ms**  | 3460 → **1024 ms** |
+| **CG speedup**         | **1.53×**          | **2.34×**          | **3.38×**          |
+
+`dot_partial` went from 1.6–2.8% to 50–84% of peak bandwidth (10–44× per call). The
+operator gather is a smaller win (still below `gradient`'s BW — the per-thread 4·n1 face
+scan adds redundant cached metadata reads and some divergence) but it is no longer
+serialized on one thread. Validated bit-for-bit: poisson-operator/cg-check, stokes-check,
+ns-check, flow-bc-check, flow-nc-bc-check all pass.
+
+**Now dominant: per-iteration host-sync overhead (P2)** — 41–91% of the iteration once the
+kernels are fast. That is the Phase 3 target.
+
 ## Plan
 
 - **Phase 1 — measurement (done).** `bench_poisson_kernels` + `roofline-poisson` bin +
