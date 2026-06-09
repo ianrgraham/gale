@@ -154,6 +154,11 @@ path = "src/bin/flow_split_bc_check.rs"
 name = "flow-nc-bc-check"
 path = "src/bin/flow_nc_bc_check.rs"
 
+# Roofline microbenchmark of the 2D GPU SIPG-Poisson kernels (CG bottleneck analysis).
+[[bin]]
+name = "roofline-poisson"
+path = "src/bin/roofline_poisson.rs"
+
 # Validates GPU conformation inflow (upwind transport + inlet injection) vs CPU.
 [[bin]]
 name = "ve-bc-check"

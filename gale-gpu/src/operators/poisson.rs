@@ -915,3 +915,124 @@ pub fn poisson_pcg_solve(
 
     Ok((psol.to_host_vec(&stream)?, iters))
 }
+
+// ===== Roofline microbenchmark ====================================================
+
+/// One kernel's measured average per-launch time (device-side, via CUDA events).
+#[derive(Clone, Debug)]
+pub struct KernelTime {
+    pub name: &'static str,
+    pub ms: f64,
+}
+
+/// Device-side timings of the 2D SIPG-Poisson kernels on a mesh, for roofline analysis.
+/// `gradient`/`operator` are the matvec pipeline (one block per element, `nn` threads);
+/// `axpy`/`xpby`/`dot` are the CG vector ops (the same launches the solve issues). Mesh
+/// dimensions are returned so the caller can do the byte/FLOP accounting.
+#[derive(Clone, Debug)]
+pub struct PoissonBench {
+    pub ne: usize,
+    pub nn: usize,
+    pub n1: u32,
+    pub ndof: usize,
+    pub kernels: Vec<KernelTime>,
+}
+
+/// Microbenchmark each 2D Poisson kernel in isolation: launch it `reps` times between
+/// CUDA timing events (after a 3-launch warmup) and report the per-launch average. The
+/// mesh metrics/face data are uploaded once. This isolates per-kernel device time from
+/// the per-solve host overhead (context/module setup, per-iteration sync) that
+/// [`poisson_cg_solve`] also pays — quantified by comparing to a full-solve wall clock.
+pub fn bench_poisson_kernels(
+    mesh: &Mesh2d,
+    alpha: f64,
+    reps: u32,
+) -> Result<PoissonBench, Box<dyn std::error::Error>> {
+    let ma = flatten_mesh(mesh, alpha, &[]);
+    let ndof = ma.ndof;
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+    let d_dev = up(&ma.diff)?;
+    let rx_dev = up(&ma.rx)?;
+    let ry_dev = up(&ma.ry)?;
+    let sx_dev = up(&ma.sx)?;
+    let sy_dev = up(&ma.sy)?;
+    let jw_dev = up(&ma.jw)?;
+    let fvl_dev = upu(&ma.fvl)?;
+    let fnx_dev = up(&ma.fnx)?;
+    let fny_dev = up(&ma.fny)?;
+    let fsw_dev = up(&ma.fsw)?;
+    let fnbr_dev = upu(&ma.fnbr)?;
+    let ftau_dev = up(&ma.ftau)?;
+
+    let u_dev = up(&vec![1.0f64; ndof])?;
+    let x_dev0 = up(&vec![0.5f64; ndof])?;
+    let mut y_dev = up(&vec![0.25f64; ndof])?;
+    let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut out = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+
+    let module = kernels::load(&ctx)?;
+    let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: 0 };
+    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
+    let n1 = ma.n1;
+    let n64 = ndof as u64;
+
+    // Time a kernel launch (expression `$body`) averaged over `reps`, after warmup.
+    let ev = || ctx.new_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT));
+    macro_rules! timed {
+        ($body:block) => {{
+            for _ in 0..3 {
+                $body
+            }
+            stream.synchronize()?;
+            let s = ev()?;
+            let e = ev()?;
+            s.record(&stream)?;
+            for _ in 0..reps {
+                $body
+            }
+            e.record(&stream)?;
+            e.synchronize()?;
+            (s.elapsed_ms(&e)? as f64) / reps as f64
+        }};
+    }
+
+    let grad_ms = timed!({
+        module.gradient(&stream, cfg, &d_dev, &u_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
+    });
+    let op_ms = timed!({
+        module.operator(
+            &stream, cfg, &d_dev, &u_dev, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
+            &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out,
+        )?;
+    });
+    let axpy_ms = timed!({
+        module.axpy(&stream, vec_cfg, &mut y_dev, &x_dev0, 0.7)?;
+    });
+    let xpby_ms = timed!({
+        module.xpby(&stream, vec_cfg, &mut y_dev, &x_dev0, 0.7)?;
+    });
+    let dot_ms = timed!({
+        module.dot_partial(&stream, red, &x_dev0, &u_dev, n64, &mut partial)?;
+    });
+
+    Ok(PoissonBench {
+        ne: ma.ne,
+        nn: ma.nn,
+        n1: ma.n1,
+        ndof,
+        kernels: vec![
+            KernelTime { name: "gradient", ms: grad_ms },
+            KernelTime { name: "operator", ms: op_ms },
+            KernelTime { name: "axpy", ms: axpy_ms },
+            KernelTime { name: "xpby", ms: xpby_ms },
+            KernelTime { name: "dot_partial", ms: dot_ms },
+        ],
+    })
+}
