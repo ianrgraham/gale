@@ -152,11 +152,29 @@ dot and are updated alongside P4.)
   gained `with_handle`; `project_and_diffuse*` route the 3 solves through it. The
   integrators (`GpuDualSplitting`/`GpuViscoelasticDualSplitting` + 3D) hold a
   `RefCell<Option<GpuPoisson(3d)>>`, lazily built on step 1 and reused across all timesteps,
-  so a sim pays the ~0.3 s setup **once total**, not 3×/step (~0.9 s/step removed). 2D NC
-  meshes stay on the one-shot mortar path. Full 2D+3D flow/VE/IBM/BC suite passes (ve-check
-  log-conf bound widened to 3e-4 — the libdevice + reduction-order precision floor).
-- **Phase 5 — revisit P5 (multi-element-per-block matvec)** only if the re-measured roofline
-  shows the matvec is still the ceiling at the orders we actually run.
+  so a sim pays the ~0.3 s setup **once total**, not 3×/step (~0.9 s/step removed). Full
+  2D+3D flow/VE/IBM/BC suite passes (ve-check log-conf bound widened to 3e-4 — the libdevice
+  + reduction-order precision floor). **Also done:** `GpuPoissonNc` extends the same
+  amortization to the **2:1-mortar (AMR) path** (5.6×/solve; `poisson-nc-handle-check`),
+  wired through the `GpuStokes` NC branch + integrators so adaptive sims pay NC setup once
+  per remesh, not 3×/step.
+
+## Second pass — operator face-membership (after P4)
+
+Re-measuring in the amortized regime showed the **operator** was the laggard kernel
+(20–42% of peak BW vs gradient's 36–96%) and — at p=8, already 81 threads/block — its gap
+was the per-thread face *scan* (every thread looped all 4·n1 / 6·n2 face entries to find
+its ≤2–3). Replaced with **direct face-membership**: a node's faces and in-face position
+are closed-form from the tensor face-node convention (`quad_faces`/`hex_faces`), so each
+thread visits only the faces it's on. No scan, no new arrays, kernel signature unchanged;
+the bit-for-bit operator validators confirm the convention. Operator **p=4 46→28 µs
+(1.63×), p=8 96→66 µs (1.45×)**; BW now 35–62%. Done 2D + 3D.
+
+- **P5 (multi-element-per-block) — assessed, deferred.** After the face fix, P5's only
+  remaining headroom is low-order occupancy (p=2 ~35%; p=4 gradient 74% / operator 44%;
+  p≥6 gradient near-saturated) — ~1.1–1.4× on the matvec at p=4, fading by p=8, for a fiddly
+  4-kernel rewrite (shared retiling, OOB guards). Revisit only if a real sim profiles the
+  matvec as the ceiling at the orders we run.
 
 3D (`poisson3d`) mirrors every kernel and inherits the same fixes; it is benchmarked and
 optimized after the 2D pattern is proven.
