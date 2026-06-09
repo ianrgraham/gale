@@ -44,13 +44,14 @@ stream overlap. The low-order rows are the clean signal.)
    (grid-stride partials per block → second pass / atomic combine). A streaming reduction
    (AI 0.12) should reach ~90% of peak BW — a ~30–50× speedup on this kernel.
 
-2. **Per-iteration host syncs (P2).** Each dot does a blocking `partial.to_host_vec()`;
-   `alpha`/`beta` are then computed on the host and pushed back as kernel scalar args.
-   That serializes the CPU and GPU every iteration (up to 81% of iteration time at low
-   order). Fix: keep the CG scalars **on-device** — compute `alpha = rs/pAp`,
-   `beta = rs_new/rs`, and the convergence test in tiny device kernels, so an entire CG
-   iteration is a dependency chain of launches on one stream with **zero host syncs**
-   until the final residual check (poll every k iters, not every iter).
+2. **Per-iteration host syncs (P2).** Each dot did a blocking `partial.to_host_vec()`;
+   `alpha`/`beta` were computed on the host and pushed back as kernel scalar args. Fix:
+   keep the CG scalars **on-device** (`reduce_scalar` → `cg_alpha`/`cg_beta` device kernels;
+   `axpy_s`/`xpby_s` read the scalar from a device buffer), polling the residual to the host
+   only every `CHECK` iterations. **NOTE (corrected after measuring):** this was *not* the
+   dominant cost — see the §"Measurement correction" below. It is a real but secondary win;
+   it makes the iteration 66–82% device-bound, and it is the right structure for once P4
+   removes the setup cost that was masking everything.
 
 3. **`operator` face loop (P3).** The SIPG face contribution is computed by thread 0 only
    (`if m == 0 { … }`), so the operator sustains 22–29% BW vs gradient's 76–96%. Fix:
@@ -95,18 +96,59 @@ ns-check, flow-bc-check, flow-nc-bc-check all pass.
 **Now dominant: per-iteration host-sync overhead (P2)** — 41–91% of the iteration once the
 kernels are fast. That is the Phase 3 target.
 
+## Measurement correction — the real overhead is per-solve *setup*, not per-iter sync
+
+Phase 1 attributed the `wall − Σ(device kernels)` gap to per-iteration host-sync/launch
+overhead. Direct measurement (the `roofline-poisson` `axpy` launch probe + a 1-iteration
+solve) shows that was **wrong**:
+
+- Kernel launches are async and ~free: 200 back-to-back `axpy` launches with a single sync
+  cost ≈ the device time (3.1 µs wall vs 3.0 µs device) → ~0.1 µs host per launch.
+- A **1-iteration** `helmholtz_cg_solve` takes **~285–310 ms** — that is the fixed
+  per-solve cost: `CudaContext::new` + `kernels::load` (cubin/JIT) + uploading all the
+  constant mesh arrays. It is the entire "overhead", and dividing it by the iteration count
+  is exactly why the earlier metric *looked* like a per-iteration cost that shrank with
+  order (more iters ⇒ more amortization).
+
+Corrected per-solve breakdown (post P1+P2+P3):
+
+| order | iters | setup (ms) | setup % of solve | iteration (µs) | iteration % device |
+|-------|-------|------------|------------------|----------------|--------------------|
+| p=2   | 600   | 286        | **88%**          | 63             | 77% |
+| p=4   | 1325  | 284        | **64%**          | 121            | 66% |
+| p=6   | 2125  | 310        | **49%**          | 152            | 74% |
+| p=8   | 3075  | 304        | **31%**          | 221            | 82% |
+
+**P4 (persistent solver handle) is therefore the dominant remaining win**, especially at
+the p=4–6 we actually run, and *most* of all in the time-stepping loop: every step does 3
+solves, each re-creating the context, re-loading the identical module, and re-uploading the
+identical mesh — ~0.9 s/step of pure setup. A handle owning the context/module/mesh buffers
+makes a solve just RHS-upload + solution-download.
+
+## Phase 3 results — on-device CG scalars (P2)
+
+Standard CG, scalars kept device-resident (`reduce_scalar`/`cg_alpha`/`cg_beta`/`axpy_s`/
+`xpby_s`), residual polled every `CHECK = 25` iters. Mathematically identical to the host CG
+(≤ `CHECK`−1 extra iters past convergence). Validated bit-for-bit (poisson-cg-check matches
+CPU to 4.6e-14, stokes 4.1e-10). The iteration is now 66–82% device-bound; the absolute
+solve time barely moves *because per-solve setup still dominates* — the payoff is realized
+once P4 lands. (2D `cg_solve_impl` only so far; the deflated/3D/NC CGs still readback per
+dot and are updated alongside P4.)
+
 ## Plan
 
 - **Phase 1 — measurement (done).** `bench_poisson_kernels` + `roofline-poisson` bin +
   this report.
-- **Phase 2 — kernel wins.** P1 (multi-block reduction) then P3 (parallel face loop).
-  Pure kernel changes, validated bit-for-bit against the CPU oracle and re-measured.
-- **Phase 3 — solver restructure.** P2 (on-device scalars / sync-free iteration) and P4
-  (persistent solver handle). These change the CG/solver API shape, so per the project's
-  "research before architecture" rule, run a verified research pass on device-resident CG
-  / communication-avoiding patterns first.
-- **Phase 4 — revisit P5** only if the re-measured roofline shows the matvec is still the
-  ceiling at the orders we actually run.
+- **Phase 2 — kernel wins (done, 2D+3D+NC).** P1 (multi-block reduction) + P3 (parallel
+  face loop). Validated bit-for-bit; `dot` 10–44×, CG 1.5–3.4×.
+- **Phase 3 — on-device CG scalars (done, 2D).** P2; secondary win (setup masks it).
+- **Phase 4 — persistent solver handle (P4) — NEXT, the dominant win.** A handle owning the
+  CUDA context, loaded module, and uploaded constant mesh arrays, so a solve (and each of
+  the 3 solves/timestep) skips the ~0.3 s setup. API change across the GPU flow solvers.
+  Removes ~0.9 s/step in the sim loop. Also fold the deflated/3D/NC CGs onto the on-device
+  scalar path here.
+- **Phase 5 — revisit P5 (multi-element-per-block matvec)** only if the re-measured roofline
+  shows the matvec is still the ceiling at the orders we actually run.
 
 3D (`poisson3d`) mirrors every kernel and inherits the same fixes; it is benchmarked and
 optimized after the 2D pattern is proven.

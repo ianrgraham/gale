@@ -242,6 +242,87 @@ mod kernels {
         }
     }
 
+    /// Single-block final reduction of the `n` block-partials from `dot_partial` into the
+    /// device scalar `out[0]`. Completes a fully on-device dot (`dot_partial → reduce_scalar`)
+    /// so the result never leaves the GPU — the CG scalars stay device-resident and an
+    /// iteration issues no host sync. `n ≤ dot_blocks(ndof) ≤ 1024`.
+    #[kernel]
+    pub fn reduce_scalar(partial: &[f64], n: u64, mut out: DisjointSlice<f64>) {
+        static mut SH: SharedArray<f64, RED> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let stride = thread::blockDim_x() as usize;
+        let mut acc = 0.0f64;
+        let mut i = tid;
+        while i < n as usize {
+            acc += partial[i];
+            i += stride;
+        }
+        unsafe { SH[tid] = acc; }
+        thread::sync_threads();
+        let mut s = stride / 2;
+        while s > 0 {
+            if tid < s {
+                unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
+            }
+            thread::sync_threads();
+            s /= 2;
+        }
+        if tid == 0 {
+            unsafe { *out.get_unchecked_mut(0) = SH[0]; }
+        }
+    }
+
+    /// CG step coefficient `α = rs/pAp`, on-device (1 thread). Writes both `α` and `−α`
+    /// (the latter for the residual update `r −= α·Ap` via [`axpy_s`]).
+    #[kernel]
+    pub fn cg_alpha(rs: &[f64], pap: &[f64], mut alpha: DisjointSlice<f64>, mut nalpha: DisjointSlice<f64>) {
+        if thread::threadIdx_x() == 0 {
+            let a = rs[0] / pap[0];
+            unsafe {
+                *alpha.get_unchecked_mut(0) = a;
+                *nalpha.get_unchecked_mut(0) = -a;
+            }
+        }
+    }
+
+    /// CG step coefficient `β = rs_new/rs`, on-device (1 thread), and advance the residual
+    /// scalar `rs ← rs_new` for the next iteration.
+    #[kernel]
+    pub fn cg_beta(rs_new: &[f64], mut rs: DisjointSlice<f64>, mut beta: DisjointSlice<f64>) {
+        if thread::threadIdx_x() == 0 {
+            let rn = rs_new[0];
+            unsafe {
+                let ro = *rs.get_unchecked_mut(0);
+                *beta.get_unchecked_mut(0) = rn / ro;
+                *rs.get_unchecked_mut(0) = rn;
+            }
+        }
+    }
+
+    /// `y ← y + a[0]·x` with the scalar read from a device buffer (the on-device-scalar
+    /// companion to [`axpy`], so CG coefficients never round-trip to the host).
+    #[kernel]
+    pub fn axpy_s(mut y: DisjointSlice<f64>, x: &[f64], a: &[f64]) {
+        let av = a[0];
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = y.get_mut(idx) {
+            *o += av * x[i];
+        }
+    }
+
+    /// `y ← x + b[0]·y` with the scalar read from a device buffer (on-device-scalar
+    /// companion to [`xpby`]).
+    #[kernel]
+    pub fn xpby_s(mut y: DisjointSlice<f64>, x: &[f64], b: &[f64]) {
+        let bv = b[0];
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = y.get_mut(idx) {
+            *o = x[i] + bv * *o;
+        }
+    }
+
     /// Prolong coarse→fine, per element (block = fine nodes). `out[e·nf + m]`.
     #[kernel]
     pub fn prolong(interp: &[f64], coarse: &[f64], n1f: u32, n1c: u32, mut out: DisjointSlice<f64>) {
@@ -565,6 +646,13 @@ fn cg_solve_impl(
     let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let nb = dot_blocks(ndof);
     let mut partial = DeviceBuffer::<f64>::zeroed(&stream, nb)?;
+    // CG scalars kept **on-device** (length-1 buffers) so an iteration issues no host sync.
+    let mut d_rs = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let mut d_rsnew = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let mut d_pap = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let mut d_alpha = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let mut d_nalpha = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let mut d_beta = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
 
     let module = kernels::load(&ctx)?;
     let cfg = LaunchConfig {
@@ -573,14 +661,18 @@ fn cg_solve_impl(
         shared_mem_bytes: 0,
     };
     let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
     let n64 = ndof as u64;
+    let nb64 = nb as u64;
 
-    macro_rules! dot {
-        ($a:expr, $b:expr) => {{
+    // Fully on-device dot a·b → device scalar `$out` (dot_partial → reduce_scalar), no sync.
+    macro_rules! dot_to {
+        ($a:expr, $b:expr, $out:expr) => {{
             module.dot_partial(&stream, red, $a, $b, n64, &mut partial)?;
-            partial.to_host_vec(&stream)?.iter().sum::<f64>()
+            module.reduce_scalar(&stream, red1, &partial, nb64, $out)?;
         }};
     }
     macro_rules! apply {
@@ -593,23 +685,28 @@ fn cg_solve_impl(
         }};
     }
 
-    let bnorm = dot!(&r, &r).sqrt().max(1e-300);
-    let mut rs = dot!(&r, &r);
+    // Standard CG with device-resident scalars; the residual is polled to the host only
+    // every CHECK iterations (instead of twice per iteration). Same arithmetic as the host
+    // CG — at most CHECK−1 extra iterations past convergence, far cheaper than the syncs.
+    const CHECK: usize = 25;
+    dot_to!(&r, &r, &mut d_rs);
+    let bnorm = d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300);
     let mut iters = 0;
     for it in 0..maxit {
         apply!(&p, &mut ap);
-        let pap = dot!(&p, &ap);
-        let alpha_cg = rs / pap;
-        module.axpy(&stream, vec_cfg, &mut x, &p, alpha_cg)?; // x += α p
-        module.axpy(&stream, vec_cfg, &mut r, &ap, -alpha_cg)?; // r −= α ap
-        let rs_new = dot!(&r, &r);
+        dot_to!(&p, &ap, &mut d_pap);
+        module.cg_alpha(&stream, one, &d_rs, &d_pap, &mut d_alpha, &mut d_nalpha)?;
+        module.axpy_s(&stream, vec_cfg, &mut x, &p, &d_alpha)?; // x += α p
+        module.axpy_s(&stream, vec_cfg, &mut r, &ap, &d_nalpha)?; // r −= α ap
+        dot_to!(&r, &r, &mut d_rsnew);
         iters = it + 1;
-        if rs_new.sqrt() / bnorm < tol {
-            break;
+        if (it + 1) % CHECK == 0 || it + 1 == maxit {
+            if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bnorm < tol {
+                break;
+            }
         }
-        let beta = rs_new / rs;
-        module.xpby(&stream, vec_cfg, &mut p, &r, beta)?; // p = r + β p
-        rs = rs_new;
+        module.cg_beta(&stream, one, &d_rsnew, &mut d_rs, &mut d_beta)?; // β = rsnew/rs; rs ← rsnew
+        module.xpby_s(&stream, vec_cfg, &mut p, &r, &d_beta)?; // p = r + β p
     }
 
     Ok((x.to_host_vec(&stream)?, iters))
@@ -943,6 +1040,8 @@ pub struct PoissonBench {
     pub nn: usize,
     pub n1: u32,
     pub ndof: usize,
+    /// Host wall-clock per `axpy` launch (single final sync) — the host-side launch cost.
+    pub axpy_wall_us: f64,
     pub kernels: Vec<KernelTime>,
 }
 
@@ -1031,11 +1130,25 @@ pub fn bench_poisson_kernels(
         module.dot_partial(&stream, red, &x_dev0, &u_dev, n64, &mut partial)?;
     });
 
+    // Host-side per-launch overhead: wall clock (host Instant) of `reps` axpy launches
+    // with a SINGLE final sync, vs the device-event time of the same. If wall ≫ event the
+    // host is the bottleneck (cuda-oxide's sync launch path issues cuLaunchKernel but the
+    // per-call arg-marshalling / FFI dominates), which caps how fast a launch-heavy CG
+    // iteration can go regardless of removing readback syncs.
+    stream.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        module.axpy(&stream, vec_cfg, &mut y_dev, &x_dev0, 0.7)?;
+    }
+    stream.synchronize()?;
+    let axpy_wall_us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+
     Ok(PoissonBench {
         ne: ma.ne,
         nn: ma.nn,
         n1: ma.n1,
         ndof,
+        axpy_wall_us,
         kernels: vec![
             KernelTime { name: "gradient", ms: grad_ms },
             KernelTime { name: "operator", ms: op_ms },

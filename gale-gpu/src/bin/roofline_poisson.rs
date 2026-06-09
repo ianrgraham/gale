@@ -58,6 +58,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {:<12} {:>9} {:>10} {:>10} {:>8} {:>7}",
             "kernel", "us/call", "GFLOP/s", "GB/s", "%BW", "AI"
         );
+        let dot_ev = b.kernels.iter().find(|k| k.name == "axpy").map(|k| k.ms * 1e3).unwrap_or(0.0);
+        println!(
+            "  launch overhead: axpy {:.2} us/call wall vs {:.2} us device  ⇒  ~{:.1} us host/launch",
+            b.axpy_wall_us, dot_ev, b.axpy_wall_us - dot_ev
+        );
         let mut k_ms = std::collections::HashMap::new();
         for k in &b.kernels {
             let (bytes, flops) = cost(k.name, b.ndof, b.n1);
@@ -77,6 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let lambda = 100.0;
         let pois = Poisson::with_reaction(&mesh, alpha, lambda);
         let rhs = pois.rhs(&vec![1.0; b.ndof], |_, _| 0.0);
+        // Per-solve setup cost (context + module load + mesh upload): a 1-iteration solve
+        // is ≈ setup + 1 iter, so its wall clock is essentially the fixed per-call overhead.
+        let t_setup = Instant::now();
+        let _ = helmholtz_cg_solve(&mesh, &rhs, alpha, lambda, 1e-12, 1)?;
+        let setup_ms = t_setup.elapsed().as_secs_f64() * 1e3;
+        println!("  per-solve setup (ctx+load+upload, 1-iter solve wall) = {setup_ms:.1} ms");
         // warmup + measured solve
         let _ = helmholtz_cg_solve(&mesh, &rhs, alpha, lambda, 1e-8, 5000)?;
         let t0 = Instant::now();
@@ -84,17 +95,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
         let g = |n: &str| k_ms.get(n).copied().unwrap_or(0.0);
         let dev_per_iter = g("gradient") + g("operator") + 2.0 * g("dot_partial") + 2.0 * g("axpy") + g("xpby");
-        let wall_per_iter = wall_ms / iters as f64;
-        let overhead = wall_per_iter - dev_per_iter;
+        let iter_ms = wall_ms - setup_ms; // total minus the fixed per-solve setup
+        println!("  CG solve: {iters} iters, {wall_ms:.2} ms wall", );
         println!(
-            "  CG solve: {iters} iters, {wall_ms:.2} ms wall ({:.1} us/iter)",
-            wall_per_iter * 1e3
-        );
-        println!(
-            "    device kernels/iter = {:.1} us;  host sync+launch overhead = {:.1} us/iter ({:.0}% of iter)\n",
-            dev_per_iter * 1e3,
-            overhead * 1e3,
-            100.0 * overhead / wall_per_iter
+            "    fixed setup = {setup_ms:.1} ms ({:.0}% of the solve);  iteration = {:.1} us/iter ({:.0}% device)\n",
+            100.0 * setup_ms / wall_ms,
+            iter_ms / iters as f64 * 1e3,
+            100.0 * dev_per_iter / (iter_ms / iters as f64).max(1e-9)
         );
     }
 
