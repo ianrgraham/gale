@@ -58,4 +58,5 @@ pub use operators::poisson3d::{
 };
 pub use operators::poisson_nc::{
     helmholtz_nc_cg_solve_tags, poisson_nc_apply, poisson_nc_cg_solve, pressure_nc_cg_solve,
+    GpuPoissonNc,
 };
