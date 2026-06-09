@@ -142,11 +142,16 @@ dot and are updated alongside P4.)
 - **Phase 2 — kernel wins (done, 2D+3D+NC).** P1 (multi-block reduction) + P3 (parallel
   face loop). Validated bit-for-bit; `dot` 10–44×, CG 1.5–3.4×.
 - **Phase 3 — on-device CG scalars (done, 2D).** P2; secondary win (setup masks it).
-- **Phase 4 — persistent solver handle (P4) — NEXT, the dominant win.** A handle owning the
-  CUDA context, loaded module, and uploaded constant mesh arrays, so a solve (and each of
-  the 3 solves/timestep) skips the ~0.3 s setup. API change across the GPU flow solvers.
-  Removes ~0.9 s/step in the sim loop. Also fold the deflated/3D/NC CGs onto the on-device
-  scalar path here.
+- **Phase 4 — persistent solver handle (P4) — the dominant win.** A handle owning the CUDA
+  context, loaded module, and uploaded constant mesh arrays, so a solve (and each of the 3
+  solves/timestep) skips the ~0.3 s setup. **Handles done:** `GpuPoisson` (2D) and
+  `GpuPoisson3d` (3D), each `solve(b, reaction, neumann_tags, deflate, …)` covering all
+  three flow solves; validated bit-for-bit vs the one-shot solvers (`poisson-handle-check`,
+  `poisson3d-handle-check`) and **7.7× faster per solve** under amortization (≈13 vs ≈99
+  ms/solve). **Remaining:** wire the handles through the flow integrators
+  (`GpuStokes`/`GpuDualSplitting`/viscoelastic, 2D + 3D) so the sim loop holds one across
+  timesteps — removes ~0.9 s/step. Conforming meshes only; NC stays on the one-shot mortar
+  path.
 - **Phase 5 — revisit P5 (multi-element-per-block matvec)** only if the re-measured roofline
   shows the matvec is still the ceiling at the orders we actually run.
 
