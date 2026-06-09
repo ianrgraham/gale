@@ -33,12 +33,13 @@ SPD for a symmetric 2×2), plus `tr C ≤ b` (FENE). Zhang–Shu / Christner–C
 - Tests: `limiter_restores_spd_and_conserves_mean` (non-SPD node → all `det≥ε`, mean preserved to 1e-12),
   `limiter_enforces_fene_trace_bound`, `limiter_leaves_admissible_field_unchanged` (θ=1, high-order intact).
 
-## 4. Roadmap (not yet done)
+## 4. Roadmap
 
-1. **Wire into the conformation time-stepping.** The limiter is a `StageHook`; the direct-form
-   `OldroydB::step_ssp_rk3` doesn't yet take a hook. Route the conformation advance through a hook-aware
-   stepper (or call `limit_conformation_bounds` after each stage) and add an end-to-end test: a high-Wi
-   sharp-gradient transport case that goes non-SPD without the limiter and stays SPD with it.
+1. ✅ **Wired into the conformation time-stepping (2026-06-09).** `OldroydB::step_ssp_rk3_bounded`
+   applies the limiter after each SSP-RK3 stage (Zhang–Shu stage limiting). End-to-end test
+   `bounded_stepper_keeps_spd_where_plain_fails`: advecting a steep `Cxy` front (under-resolved high-order
+   transport overshoots `|Cxy|>1` ⇒ `det<0`) loses SPD in `step_ssp_rk3` but stays `det≥ε` in the bounded
+   stepper. (Still TODO: the same for the GPU direct-form advance, and the log-conf path.)
 2. **Knapsack-optimal θ (research §6, Christner–Chan).** The current `min`-over-constraints `θ` is the
    simple robust Zhang–Shu choice; the **quadratic-knapsack** limiter finds the least-dissipative `θ`
    satisfying all constraints jointly (a 1-D root-find on one Lagrange multiplier — cheap, GPU-amenable).

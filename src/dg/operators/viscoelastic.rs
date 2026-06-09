@@ -220,6 +220,37 @@ impl<'m> OldroydB<'m> {
         combine(c, 1.0 / 3.0, &u3a, 2.0 / 3.0)
     }
 
+    /// SSP-RK3 step with the **bound-preserving limiter** applied after each stage (Zhang–Shu
+    /// stage limiting via [`limit_conformation_bounds`]). Keeps the direct-form conformation
+    /// SPD (`det C ≥ ε`) and `tr C ≤ b_max` through high-order transport — the HWNP fix that
+    /// the plain [`Self::step_ssp_rk3`] lacks. Otherwise identical (same Shu–Osher stages).
+    pub fn step_ssp_rk3_bounded(
+        &self,
+        c: &[Vec<f64>; 3],
+        ux: &[f64],
+        uy: &[f64],
+        dt: f64,
+        eps: f64,
+        b_max: f64,
+    ) -> [Vec<f64>; 3] {
+        let axpy = |a: &[Vec<f64>; 3], k: &[Vec<f64>; 3], s: f64| -> [Vec<f64>; 3] {
+            std::array::from_fn(|v| a[v].iter().zip(&k[v]).map(|(x, d)| x + s * d).collect())
+        };
+        let combine = |a: &[Vec<f64>; 3], wa: f64, b: &[Vec<f64>; 3], wb: f64| -> [Vec<f64>; 3] {
+            std::array::from_fn(|v| a[v].iter().zip(&b[v]).map(|(x, y)| wa * x + wb * y).collect())
+        };
+        let limit = |mut s: [Vec<f64>; 3]| -> [Vec<f64>; 3] {
+            limit_conformation_bounds(self.mesh, &mut s, eps, b_max);
+            s
+        };
+        let k0 = self.conformation_rhs(c, ux, uy);
+        let u1 = limit(axpy(c, &k0, dt));
+        let k1 = self.conformation_rhs(&u1, ux, uy);
+        let u2 = limit(combine(c, 0.75, &axpy(&u1, &k1, dt), 0.25));
+        let k2 = self.conformation_rhs(&u2, ux, uy);
+        limit(combine(c, 1.0 / 3.0, &axpy(&u2, &k2, dt), 2.0 / 3.0))
+    }
+
     /// Polymer stress `τ_p = (η_p/λ)(C − I)`, returned as `[τxx, τxy, τyy]`.
     pub fn polymer_stress(&self, c: &[Vec<f64>; 3]) -> [Vec<f64>; 3] {
         let f = self.eta_p / self.lambda;
@@ -1499,6 +1530,47 @@ mod tests {
                 assert!((c[v][i] - orig[v][i]).abs() < 1e-15, "admissible field altered at {v},{i}");
             }
         }
+    }
+
+    #[test]
+    fn bounded_stepper_keeps_spd_where_plain_fails() {
+        // End-to-end: advect a steep conformation front (Cxx=Cyy=1, Cxy a sharp tanh ⇒
+        // det = 1 − Cxy²). The under-resolved high-order transport overshoots |Cxy| > 1 ⇒
+        // det < 0 in the plain stepper; the bounded stepper holds det ≥ ε throughout.
+        let p = 4;
+        let mesh = Mesh2d::rectangular_periodic(p, 4, 1, [0.0, 1.0], [0.0, 0.25]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let ob = OldroydB::new(&mesh, 100.0, 1.0); // large λ ⇒ transport-dominated
+        let mut c0 = [vec![1.0; ndof], vec![0.0; ndof], vec![1.0; ndof]];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                c0[1][e * nn + k] = 0.95 * (60.0 * (el.geom.x[k] - 0.5)).tanh();
+            }
+        }
+        let (ux, uy) = (vec![3.0; ndof], vec![0.0; ndof]);
+        let (dt, nsteps, eps) = (0.002, 60usize, 1e-8);
+        let min_det = |c: &[Vec<f64>; 3]| {
+            c[0].iter()
+                .zip(&c[1])
+                .zip(&c[2])
+                .map(|((&a, &b), &d)| a * d - b * b)
+                .fold(f64::INFINITY, f64::min)
+        };
+        let mut cu = c0.clone();
+        let mut worst_plain = f64::INFINITY;
+        for _ in 0..nsteps {
+            cu = ob.step_ssp_rk3(&cu, &ux, &uy, dt);
+            worst_plain = worst_plain.min(min_det(&cu));
+        }
+        let mut cb = c0.clone();
+        let mut worst_bounded = f64::INFINITY;
+        for _ in 0..nsteps {
+            cb = ob.step_ssp_rk3_bounded(&cb, &ux, &uy, dt, eps, f64::INFINITY);
+            worst_bounded = worst_bounded.min(min_det(&cb));
+        }
+        assert!(worst_plain < eps, "premise: plain stepper should lose SPD (min det = {worst_plain})");
+        assert!(worst_bounded >= eps * (1.0 - 1e-6), "bounded stepper kept SPD (min det = {worst_bounded})");
     }
 
     #[test]
