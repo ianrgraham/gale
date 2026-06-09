@@ -159,6 +159,11 @@ path = "src/bin/flow_nc_bc_check.rs"
 name = "roofline-poisson"
 path = "src/bin/roofline_poisson.rs"
 
+# Validates the persistent GpuPoisson solver handle (P4) vs the one-shot solvers.
+[[bin]]
+name = "poisson-handle-check"
+path = "src/bin/poisson_handle_check.rs"
+
 # Validates GPU conformation inflow (upwind transport + inlet injection) vs CPU.
 [[bin]]
 name = "ve-bc-check"

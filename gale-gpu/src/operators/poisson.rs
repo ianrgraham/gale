@@ -16,8 +16,9 @@
 //! the validated CPU `Poisson` / `PMultigrid`; only the iterations run on-device.
 //! Libdevice-free ⇒ the embedded path works on sm_70.
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
+use std::sync::Arc;
 use cuda_host::cuda_module;
 use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid};
 
@@ -295,6 +296,18 @@ mod kernels {
                 let ro = *rs.get_unchecked_mut(0);
                 *beta.get_unchecked_mut(0) = rn / ro;
                 *rs.get_unchecked_mut(0) = rn;
+            }
+        }
+    }
+
+    /// In-place `s[0] ← −s[0]·ninv`, on-device (1 thread): turns a reduced `1ᵀr` sum into
+    /// the negative arithmetic mean, for the deflation `r ← r − mean(r)·1` via [`axpy_s`].
+    #[kernel]
+    pub fn cg_negmean(mut s: DisjointSlice<f64>, ninv: f64) {
+        if thread::threadIdx_x() == 0 {
+            unsafe {
+                let v = *s.get_unchecked_mut(0);
+                *s.get_unchecked_mut(0) = -v * ninv;
             }
         }
     }
@@ -1157,4 +1170,209 @@ pub fn bench_poisson_kernels(
             KernelTime { name: "dot_partial", ms: dot_ms },
         ],
     })
+}
+
+// ===== Persistent solver handle (P4) =============================================
+
+/// Persistent GPU SIPG-Poisson / Helmholtz solver handle. Owns the CUDA context, the
+/// loaded device module, and the uploaded **constant** mesh metrics + face metadata, so
+/// repeated solves on the same mesh pay the heavy setup (`CudaContext::new` +
+/// `kernels::load` cubin/JIT + mesh upload, ~0.3 s) **once** instead of per call. The
+/// dual-splitting flow loop's 3 solves/step (and every timestep) share one handle.
+///
+/// Only the per-region `neumann_tags` (which boundary faces are natural) and the
+/// `reaction`/`deflate` flags vary between solves; [`solve`](Self::solve) rebuilds just the
+/// small `fnbr` array on the host and uploads it, then runs the on-device-scalar CG on
+/// freshly-allocated (cheap) scratch. Bit-for-bit equivalent to [`cg_solve_impl`] /
+/// [`pressure_cg_solve`].
+pub struct GpuPoisson {
+    // `stream` and `module` each hold an `Arc<CudaContext>`, keeping the context alive.
+    stream: Arc<CudaStream>,
+    module: kernels::LoadedModule,
+    nn: usize,
+    ne: usize,
+    ndof: usize,
+    n1: u32,
+    // constant (neumann-tag-independent) device arrays, uploaded once.
+    d_dev: DeviceBuffer<f64>,
+    rx_dev: DeviceBuffer<f64>,
+    ry_dev: DeviceBuffer<f64>,
+    sx_dev: DeviceBuffer<f64>,
+    sy_dev: DeviceBuffer<f64>,
+    jw_dev: DeviceBuffer<f64>,
+    fvl_dev: DeviceBuffer<u32>,
+    fnx_dev: DeviceBuffer<f64>,
+    fny_dev: DeviceBuffer<f64>,
+    fsw_dev: DeviceBuffer<f64>,
+    ftau_dev: DeviceBuffer<f64>,
+    // host state to rebuild the per-region `fnbr` cheaply (base = all-Dirichlet; flip the
+    // listed boundary-face nodes to NEU when their tag is in `neumann_tags`).
+    fnbr_base: Vec<u32>,
+    bnodes: Vec<(usize, u32)>,
+}
+
+impl GpuPoisson {
+    /// Build the handle for `mesh` with SIPG penalty factor `alpha`: create the context,
+    /// load the module, and upload the constant metrics/face data. Conforming meshes only
+    /// (the non-conforming mortar path keeps its own solver for now).
+    pub fn new(mesh: &Mesh2d, alpha: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        let ma = flatten_mesh(mesh, alpha, &[]); // fnbr_base: all boundary faces Dirichlet (BND)
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+        let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+        // Boundary-face nodes and their tags, in the same flat order flatten_mesh uses, so
+        // a per-region solve only flips these few entries to NEU (no mesh walk per solve).
+        let n1u = ma.n1 as usize;
+        let mut bnodes = Vec::new();
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for (t, edge) in Edge::ALL.iter().enumerate() {
+                if let Neighbor::Boundary { tag } = el.neighbors[*edge as usize] {
+                    for a in 0..n1u {
+                        bnodes.push(((e * 4 + t) * n1u + a, tag));
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            module: kernels::load(&ctx)?,
+            nn: ma.nn,
+            ne: ma.ne,
+            ndof: ma.ndof,
+            n1: ma.n1,
+            d_dev: up(&ma.diff)?,
+            rx_dev: up(&ma.rx)?,
+            ry_dev: up(&ma.ry)?,
+            sx_dev: up(&ma.sx)?,
+            sy_dev: up(&ma.sy)?,
+            jw_dev: up(&ma.jw)?,
+            fvl_dev: upu(&ma.fvl)?,
+            fnx_dev: up(&ma.fnx)?,
+            fny_dev: up(&ma.fny)?,
+            fsw_dev: up(&ma.fsw)?,
+            ftau_dev: up(&ma.ftau)?,
+            fnbr_base: ma.fnbr,
+            bnodes,
+            stream,
+        })
+    }
+
+    /// Number of degrees of freedom (`n_elements · n_nodes`).
+    pub fn ndof(&self) -> usize {
+        self.ndof
+    }
+
+    /// Solve `(reaction·M + A)·x = b` on this mesh by on-device CG. `neumann_tags` are the
+    /// natural-BC boundary tags (`&[]` = all-Dirichlet velocity Helmholtz;
+    /// `&mesh.boundary_tags()` = pure-Neumann pressure). `deflate` removes the constant
+    /// nullspace each iteration (the singular pure-Neumann pressure system). No per-call
+    /// context/module setup or constant-mesh upload — only `b`, `fnbr`, and scratch move.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve(
+        &self,
+        b: &[f64],
+        reaction: f64,
+        neumann_tags: &[u32],
+        deflate: bool,
+        tol: f64,
+        maxit: usize,
+    ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+        assert_eq!(b.len(), self.ndof, "rhs length must be n_elements·n_nodes");
+        let stream = &self.stream;
+        let module = &self.module;
+        let ndof = self.ndof;
+
+        // Per-region fnbr: start from the all-Dirichlet base, flip listed boundary nodes to
+        // NEU where their tag is natural. Cheap host rebuild + one small upload per solve.
+        let mut fnbr = self.fnbr_base.clone();
+        if !neumann_tags.is_empty() {
+            for &(idx, tag) in &self.bnodes {
+                if neumann_tags.contains(&tag) {
+                    fnbr[idx] = NEU;
+                }
+            }
+        }
+        let fnbr_dev = DeviceBuffer::from_host(stream, &fnbr)?;
+
+        let up = |v: &[f64]| DeviceBuffer::from_host(stream, v);
+        let nb = dot_blocks(ndof);
+        let mut x = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut r = up(b)?;
+        let mut p = up(b)?;
+        let mut ap = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut gx = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut gy = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut partial = DeviceBuffer::<f64>::zeroed(stream, nb)?;
+        let mut d_rs = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+        let mut d_rsnew = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+        let mut d_pap = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+        let mut d_alpha = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+        let mut d_nalpha = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+        let mut d_beta = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+        let mut d_nmean = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+        let ones = up(&vec![1.0f64; ndof])?;
+
+        let cfg = LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: (self.nn as u32, 1, 1), shared_mem_bytes: 0 };
+        let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+        let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+        let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
+        let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
+        let n1 = self.n1;
+        let n64 = ndof as u64;
+        let nb64 = nb as u64;
+        let ninv = 1.0 / ndof as f64;
+
+        macro_rules! dot_to {
+            ($a:expr, $b:expr, $out:expr) => {{
+                module.dot_partial(stream, red, $a, $b, n64, &mut partial)?;
+                module.reduce_scalar(stream, red1, &partial, nb64, $out)?;
+            }};
+        }
+        // Deflate r ← r − mean(r) on-device (constant-nullspace removal for pure-Neumann).
+        macro_rules! deflate_r {
+            () => {{
+                if deflate {
+                    dot_to!(&r, &ones, &mut d_nmean);
+                    module.cg_negmean(stream, one, &mut d_nmean, ninv)?;
+                    module.axpy_s(stream, vec_cfg, &mut r, &ones, &d_nmean)?;
+                }
+            }};
+        }
+        macro_rules! apply {
+            ($field:expr, $dst:expr) => {{
+                module.gradient(stream, cfg, &self.d_dev, $field, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, n1, &mut gx, &mut gy)?;
+                module.operator(
+                    stream, cfg, &self.d_dev, $field, &gx, &gy, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, &self.jw_dev, n1,
+                    &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, &fnbr_dev, &self.ftau_dev, reaction, $dst,
+                )?;
+            }};
+        }
+
+        const CHECK: usize = 25;
+        deflate_r!(); // r = deflate(b)
+        module.xpby(stream, vec_cfg, &mut p, &r, 0.0)?; // p = r (β=0)
+        dot_to!(&r, &r, &mut d_rs);
+        let bnorm = d_rs.to_host_vec(stream)?[0].sqrt().max(1e-300);
+        let mut iters = 0;
+        for it in 0..maxit {
+            apply!(&p, &mut ap);
+            dot_to!(&p, &ap, &mut d_pap);
+            module.cg_alpha(stream, one, &d_rs, &d_pap, &mut d_alpha, &mut d_nalpha)?;
+            module.axpy_s(stream, vec_cfg, &mut x, &p, &d_alpha)?; // x += α p
+            module.axpy_s(stream, vec_cfg, &mut r, &ap, &d_nalpha)?; // r −= α ap
+            deflate_r!();
+            dot_to!(&r, &r, &mut d_rsnew);
+            iters = it + 1;
+            if (it + 1) % CHECK == 0 || it + 1 == maxit {
+                if d_rsnew.to_host_vec(stream)?[0].sqrt() / bnorm < tol {
+                    break;
+                }
+            }
+            module.cg_beta(stream, one, &d_rsnew, &mut d_rs, &mut d_beta)?; // β = rsnew/rs; rs ← rsnew
+            module.xpby_s(stream, vec_cfg, &mut p, &r, &d_beta)?; // p = r + β p
+        }
+        Ok((x.to_host_vec(stream)?, iters))
+    }
 }
