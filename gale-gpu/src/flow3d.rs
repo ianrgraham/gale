@@ -7,19 +7,39 @@
 //! machinery. Faithful (to solver tolerance) to `gale::dg::Stokes3d`.
 
 use crate::operators::poisson3d::{
-    helmholtz3d_cg_solve, helmholtz3d_cg_solve_tags, pressure3d_cg_solve,
+    helmholtz3d_cg_solve, helmholtz3d_cg_solve_tags, pressure3d_cg_solve, GpuPoisson3d,
 };
 use gale::dg::{BoundaryConditions3d, Mesh3d, Poisson3d};
+use std::cell::RefCell;
 
 type StepResult = Result<(Vec<f64>, Vec<f64>, Vec<f64>), Box<dyn std::error::Error>>;
 
+/// Lazily (re)build the persistent [`GpuPoisson3d`] handle in `slot` for `mesh`, so an
+/// integrator's `step(&self, …)` can hold ONE handle across timesteps (P4) — the 3D
+/// analogue of [`crate::flow::ensure_poisson_handle`]. `Mesh3d` is conforming-only, so
+/// there is no non-conforming fallback; the handle is rebuilt only when the dof count
+/// changes (e.g. after a remesh), so a static mesh pays the ~0.3 s setup exactly once.
+fn ensure_poisson3d_handle(slot: &RefCell<Option<GpuPoisson3d>>, mesh: &Mesh3d, alpha: f64) {
+    let ndof = mesh.n_elements() * mesh.refh.n_nodes();
+    let mut cur = slot.borrow_mut();
+    if cur.as_ref().map_or(true, |h| h.ndof() != ndof) {
+        *cur = Some(GpuPoisson3d::new(mesh, alpha).expect("gale-gpu: GpuPoisson3d handle build failed"));
+    }
+}
+
 /// GPU 3D unsteady-NS stepper. Host `Poisson3d` operators are used only for SIPG RHS
 /// assembly; the operator applies / solves run on the GPU.
-pub struct GpuStokes3d<'m> {
+pub struct GpuStokes3d<'m, 'p> {
     pub mesh: &'m Mesh3d,
     pub nu: f64,
     pub dt: f64,
     alpha: f64,
+    /// Optional **persistent** [`GpuPoisson3d`] handle (P4). When `Some`, the three
+    /// per-step elliptic solves route through it — reusing the loaded module + uploaded
+    /// mesh instead of paying ~0.3 s of context/upload setup per solve. Set via
+    /// [`with_handle`](Self::with_handle); the owning integrator keeps it alive across
+    /// timesteps. `None` ⇒ the one-shot solvers (legacy path).
+    poisson: Option<&'p GpuPoisson3d>,
     /// Pressure-Poisson assembly (pure Neumann, singular — unless an outflow pins it).
     pressure: Poisson3d<'m>,
     /// Velocity Helmholtz assembly `(λM + A)`, one per component (differ only in their
@@ -40,7 +60,7 @@ pub struct GpuStokes3d<'m> {
     maxit: usize,
 }
 
-impl<'m> GpuStokes3d<'m> {
+impl<'m, 'p> GpuStokes3d<'m, 'p> {
     /// Closed-box solver: all-Dirichlet velocity (data from the `bc_*` closures) +
     /// pure-Neumann (deflated) pressure. For per-region inflow/outflow/wall/symmetry
     /// conditions use [`with_bcs`](Self::with_bcs).
@@ -51,6 +71,7 @@ impl<'m> GpuStokes3d<'m> {
             nu,
             dt,
             alpha,
+            poisson: None,
             pressure: Poisson3d::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
             velocity_x: Poisson3d::with_reaction(mesh, alpha, lambda),
             velocity_y: Poisson3d::with_reaction(mesh, alpha, lambda),
@@ -63,6 +84,16 @@ impl<'m> GpuStokes3d<'m> {
             tol: 1e-10,
             maxit: 20000,
         }
+    }
+
+    /// Route the three per-step elliptic solves through the persistent [`GpuPoisson3d`]
+    /// `handle` (P4) instead of the one-shot solvers, amortizing context/module/mesh setup
+    /// across timesteps. The caller must ensure `handle` was built from a mesh matching
+    /// `self.mesh` (same `ndof`). Bit-identical to the one-shot solver it replaces
+    /// (validated by `poisson3d-handle-check`).
+    pub fn with_handle(mut self, handle: &'p GpuPoisson3d) -> Self {
+        self.poisson = Some(handle);
+        self
     }
 
     /// Solver with **per-region** boundary conditions — the GPU analogue of
@@ -82,6 +113,7 @@ impl<'m> GpuStokes3d<'m> {
             nu,
             dt,
             alpha,
+            poisson: None,
             pressure: Poisson3d::with_bc(mesh, alpha, 0.0, pres_neumann.clone()),
             velocity_x: Poisson3d::with_bc(mesh, alpha, lambda, velx_neumann.clone()),
             velocity_y: Poisson3d::with_bc(mesh, alpha, lambda, vely_neumann.clone()),
@@ -225,7 +257,12 @@ impl<'m> GpuStokes3d<'m> {
         let div = self.divergence(&uhx, &uhy, &uhz);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _, _| 0.0, |_, _, _| 0.0);
-        let (p, _it) = pressure3d_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?;
+        let (p, _it) = if let Some(h) = self.poisson {
+            // Pure-Neumann pressure, deflated (closed box ⇒ all tags Neumann, no outflow).
+            h.solve(&bp, 0.0, &self.pres_neumann_tags, true, self.tol, self.maxit)?
+        } else {
+            pressure3d_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+        };
         for (e, el) in mesh.elements.iter().enumerate() {
             let sl = e * nn..(e + 1) * nn;
             let gpx = el.geom.grad_x(refh, &p[sl.clone()]);
@@ -245,9 +282,17 @@ impl<'m> GpuStokes3d<'m> {
         let bx = self.velocity_x.rhs(&fxv, |x, y, z| bc_u(x, y, z, t));
         let by = self.velocity_y.rhs(&fyv, |x, y, z| bc_v(x, y, z, t));
         let bz = self.velocity_z.rhs(&fzv, |x, y, z| bc_w(x, y, z, t));
-        let (uxn, _) = helmholtz3d_cg_solve(mesh, &bx, self.alpha, lambda, self.tol, self.maxit)?;
-        let (uyn, _) = helmholtz3d_cg_solve(mesh, &by, self.alpha, lambda, self.tol, self.maxit)?;
-        let (uzn, _) = helmholtz3d_cg_solve(mesh, &bz, self.alpha, lambda, self.tol, self.maxit)?;
+        // All-Dirichlet velocity Helmholtz (closed box ⇒ empty Neumann-tag sets).
+        let solve_vel = |b: &[f64]| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+            Ok(if let Some(h) = self.poisson {
+                h.solve(b, lambda, &self.velx_neumann, false, self.tol, self.maxit)?.0
+            } else {
+                helmholtz3d_cg_solve(mesh, b, self.alpha, lambda, self.tol, self.maxit)?.0
+            })
+        };
+        let uxn = solve_vel(&bx)?;
+        let uyn = solve_vel(&by)?;
+        let uzn = solve_vel(&bz)?;
         Ok((uxn, uyn, uzn))
     }
 
@@ -302,7 +347,10 @@ impl<'m> GpuStokes3d<'m> {
         let div = self.divergence(&uhx, &uhy, &uhz);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _, _| 0.0, |_, _, _| 0.0);
-        let (p, _it) = if self.has_outflow {
+        let (p, _it) = if let Some(h) = self.poisson {
+            // Outflow ⇒ pressure pinned (non-deflated); no outflow ⇒ singular ⇒ deflated.
+            h.solve(&bp, 0.0, &self.pres_neumann_tags, !self.has_outflow, self.tol, self.maxit)?
+        } else if self.has_outflow {
             helmholtz3d_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?
         } else {
             pressure3d_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
@@ -326,9 +374,16 @@ impl<'m> GpuStokes3d<'m> {
         let bx = self.velocity_x.rhs_tagged(&fxv, |tag, x, y, z| vel_dir(tag, x, y, z).0, |_, _, _, _| 0.0);
         let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y, z| vel_dir(tag, x, y, z).1, |_, _, _, _| 0.0);
         let bz = self.velocity_z.rhs_tagged(&fzv, |tag, x, y, z| vel_dir(tag, x, y, z).2, |_, _, _, _| 0.0);
-        let (uxn, _) = helmholtz3d_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?;
-        let (uyn, _) = helmholtz3d_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.vely_neumann, self.tol, self.maxit)?;
-        let (uzn, _) = helmholtz3d_cg_solve_tags(mesh, &bz, self.alpha, lambda, &self.velz_neumann, self.tol, self.maxit)?;
+        let solve_vel = |b: &[f64], neu: &[u32]| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+            Ok(if let Some(h) = self.poisson {
+                h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
+            } else {
+                helmholtz3d_cg_solve_tags(mesh, b, self.alpha, lambda, neu, self.tol, self.maxit)?.0
+            })
+        };
+        let uxn = solve_vel(&bx, &self.velx_neumann)?;
+        let uyn = solve_vel(&by, &self.vely_neumann)?;
+        let uzn = solve_vel(&bz, &self.velz_neumann)?;
         Ok((uxn, uyn, uzn))
     }
 }
@@ -348,6 +403,9 @@ pub struct GpuDualSplitting3d {
     bc_w: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
     #[allow(clippy::type_complexity)]
     body_force: Box<dyn Fn(&gale::sim::State<Mesh3d>, f64) -> (Vec<f64>, Vec<f64>, Vec<f64>)>,
+    /// Persistent GPU elliptic handle (P4), built lazily on the first step and reused
+    /// across timesteps so the 3 solves/step skip the ~0.3 s context/module/upload setup.
+    poisson: RefCell<Option<GpuPoisson3d>>,
 }
 
 impl GpuDualSplitting3d {
@@ -364,6 +422,7 @@ impl GpuDualSplitting3d {
                 let n = s.ndof();
                 (vec![0.0; n], vec![0.0; n], vec![0.0; n])
             }),
+            poisson: RefCell::new(None),
         }
     }
 
@@ -397,7 +456,12 @@ impl gale::sim::StateIntegrator<Mesh3d> for GpuDualSplitting3d {
 
     fn step(&self, state: &mut gale::sim::State<Mesh3d>, hook: &dyn gale::sim::StateStageHook<Mesh3d>) {
         let t_new = state.time.t + self.dt;
-        let stokes = GpuStokes3d::new(&state.mesh, self.alpha, self.nu, self.dt);
+        ensure_poisson3d_handle(&self.poisson, &state.mesh, self.alpha);
+        let handle = self.poisson.borrow();
+        let mut stokes = GpuStokes3d::new(&state.mesh, self.alpha, self.nu, self.dt);
+        if let Some(h) = handle.as_ref() {
+            stokes = stokes.with_handle(h);
+        }
         let (ux, uy, uz) = {
             let v = state.fields.by_id(self.velocity);
             (v.component(0).to_vec(), v.component(1).to_vec(), v.component(2).to_vec())
@@ -531,6 +595,8 @@ pub struct GpuViscoelasticDualSplitting3d {
     fz: Box<dyn Fn(f64, f64, f64, f64) -> f64>,
     /// Optional conformation inflow boundary data (incoming polymer state at an inlet).
     inflow: Option<ConformationInflow3d>,
+    /// Persistent GPU elliptic handle (P4), built lazily and reused across timesteps.
+    poisson: RefCell<Option<GpuPoisson3d>>,
 }
 
 impl GpuViscoelasticDualSplitting3d {
@@ -561,6 +627,7 @@ impl GpuViscoelasticDualSplitting3d {
             fy: Box::new(|_, _, _, _| 0.0),
             fz: Box::new(|_, _, _, _| 0.0),
             inflow: None,
+            poisson: RefCell::new(None),
         }
     }
 
@@ -637,7 +704,12 @@ impl gale::sim::StateIntegrator<Mesh3d> for GpuViscoelasticDualSplitting3d {
                     bz[e * nn + k] += (self.fz)(x, y, z, t_new);
                 }
             }
-            let stokes = GpuStokes3d::new(&state.mesh, self.alpha, self.eta_s, self.dt);
+            ensure_poisson3d_handle(&self.poisson, &state.mesh, self.alpha);
+            let handle = self.poisson.borrow();
+            let mut stokes = GpuStokes3d::new(&state.mesh, self.alpha, self.eta_s, self.dt);
+            if let Some(h) = handle.as_ref() {
+                stokes = stokes.with_handle(h);
+            }
             let (nux, nuy, nuz) = stokes
                 .step_ns_forced(&ux, &uy, &uz, t_new, &self.bc_u, &self.bc_v, &self.bc_w, &bx, &by, &bz)
                 .expect("gale-gpu: 3D viscoelastic velocity step failed");
