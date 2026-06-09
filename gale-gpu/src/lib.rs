@@ -52,4 +52,6 @@ pub use operators::poisson::{
 pub use operators::poisson3d::{
     helmholtz3d_cg_solve, helmholtz3d_cg_solve_tags, poisson3d_apply, pressure3d_cg_solve,
 };
-pub use operators::poisson_nc::{poisson_nc_apply, poisson_nc_cg_solve, pressure_nc_cg_solve};
+pub use operators::poisson_nc::{
+    helmholtz_nc_cg_solve_tags, poisson_nc_apply, poisson_nc_cg_solve, pressure_nc_cg_solve,
+};

@@ -618,6 +618,44 @@ mod tests {
     }
 
     #[test]
+    fn per_region_bcs_on_refined_mesh_preserve_uniform_flow() {
+        // Per-region BCs on a NON-CONFORMING (2:1-refined) mesh: west inlet (tag 3)
+        // u=(1,0), east outflow (tag 1), free-slip top/bottom (tags 0,2), with two refined
+        // interior cells (hanging nodes → mortar SIPG). Uniform flow u=(1,0) is the exact
+        // steady state. This exercises the per-region elliptic operators (tag-aware
+        // velocity-Neumann + outflow-pinned pressure) THROUGH the mortar coupling — the
+        // CPU side needs no NC guard because Poisson::apply/rhs_tagged already handle both.
+        use crate::dg::bc::{BoundaryConditions, FlowBc};
+        let nu = 1.0;
+        let p = 4;
+        let mesh = Mesh2d::cartesian_refined(p, 4, 3, [0.0, 2.0], [0.0, 1.0], &[(1, 1), (2, 1)]);
+        let bcs = BoundaryConditions::no_slip()
+            .set(3, FlowBc::velocity(|_, _, _| (1.0, 0.0)))
+            .set(1, FlowBc::Outflow)
+            .set(0, FlowBc::Symmetry)
+            .set(2, FlowBc::Symmetry);
+        let dt = 0.05;
+        let st = Stokes::with_bcs(&mesh, 5.0, nu, dt, &bcs);
+        let nd = mesh.n_elements() * mesh.refq.n_nodes();
+        let (mut ux, mut uy) = (vec![1.0; nd], vec![0.0; nd]);
+        let z = vec![0.0; nd];
+        let mut t = 0.0;
+        for _ in 0..20 {
+            t += dt;
+            let (nx, ny) = st.step_ns_forced_bc(&ux, &uy, t, &bcs, &z, &z);
+            ux = nx;
+            uy = ny;
+        }
+        let one = vec![1.0; nd];
+        let eu: Vec<f64> = ux.iter().map(|v| v - 1.0).collect();
+        let err_u = st.l2_norm(&eu) / st.l2_norm(&one);
+        let err_v = st.l2_norm(&uy);
+        eprintln!("per-region BCs on refined mesh: rel u err = {err_u:.3e}, |v| = {err_v:.3e}");
+        assert!(err_u < 1e-6, "uniform flow not preserved on refined mesh: {err_u}");
+        assert!(err_v < 1e-6, "spurious cross-flow on refined mesh: {err_v}");
+    }
+
+    #[test]
     fn stokes_on_refined_mesh() {
         // The full dual-splitting Stokes solver on a NON-CONFORMING mesh (two refined
         // cells): the pressure-Poisson and viscous-Helmholtz solves go through the

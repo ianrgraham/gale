@@ -394,7 +394,7 @@ fn sorted_positions(mesh: &Mesh2d, e: usize, edge: Edge) -> Vec<usize> {
 /// and the mortar metadata for the `CoarseToFine`/`FineToCoarse` edges. Penalty `tau`
 /// uses `α(p+1)²/min(h_self, h_nbr)` with `h = √Σjw`; for NC faces the min is taken
 /// over the coarse and the relevant fine element(s).
-fn flatten_nc(mesh: &Mesh2d, alpha: f64, neumann_all: bool) -> NcArrays {
+fn flatten_nc(mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32]) -> NcArrays {
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
@@ -462,18 +462,20 @@ fn flatten_nc(mesh: &Mesh2d, alpha: f64, neumann_all: bool) -> NcArrays {
                         fnbr[idx] = (*re * nn + rf.nodes[perm[a]]) as u32;
                     }
                 }
-                Neighbor::Boundary { .. } => {
-                    // All-Dirichlet (BND). (Neumann tagging not needed for the apply
-                    // validation; the check uses a default all-Dirichlet operator.)
+                Neighbor::Boundary { tag } => {
+                    // Per-region: tags in `neumann_tags` are natural (NEU), the rest are
+                    // Dirichlet SIPG (BND) — same per-tag routing as the conforming
+                    // `flatten_mesh`. `&[]` ⇒ all-Dirichlet, all-tags ⇒ all-Neumann.
                     ekind[et] = K_CONF;
                     etau[et] = alpha * p1f * p1f / h[e];
+                    let neu = neumann_tags.contains(tag);
                     for a in 0..n1u {
                         let idx = et * n1u + a;
                         fvl[idx] = face.nodes[a] as u32;
                         fnx[idx] = face.nx[a];
                         fny[idx] = face.ny[a];
                         fsw[idx] = face.sw[a];
-                        fnbr[idx] = if neumann_all { NEU } else { BND };
+                        fnbr[idx] = if neu { NEU } else { BND };
                     }
                 }
                 Neighbor::FineToCoarse { coarse, edge: cedge, half } => {
@@ -575,7 +577,7 @@ pub fn poisson_nc_apply(
     alpha: f64,
     reaction: f64,
 ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    let ma = flatten_nc(mesh, alpha, false);
+    let ma = flatten_nc(mesh, alpha, &[]);
     assert_eq!(u.len(), ma.ndof, "state length must be n_elements·n_nodes");
 
     let ctx = CudaContext::new(0)?;
@@ -637,7 +639,19 @@ pub fn poisson_nc_apply(
 pub fn poisson_nc_cg_solve(
     mesh: &Mesh2d, b: &[f64], alpha: f64, reaction: f64, tol: f64, maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    cg_nc_impl(mesh, b, alpha, reaction, false, false, tol, maxit)
+    cg_nc_impl(mesh, b, alpha, reaction, false, &[], tol, maxit)
+}
+
+/// Tag-aware NC CG for `(reaction·M + A)·x = b`: boundary tags in `neumann_tags` are
+/// natural (Neumann), the rest Dirichlet SIPG — the per-region (inflow/outflow/symmetry)
+/// path on a **2:1 non-conforming** mesh. Non-deflated (a Dirichlet boundary makes it
+/// non-singular); used for the velocity Helmholtz (`neumann_tags` = outflow + symmetry-
+/// tangential) and the outflow-pinned pressure (`reaction = 0`, `neumann_tags` = all
+/// except outflow). Mirrors `gale::dg::Poisson::with_bc(mesh, alpha, reaction, neumann_tags).cg`.
+pub fn helmholtz_nc_cg_solve_tags(
+    mesh: &Mesh2d, b: &[f64], alpha: f64, reaction: f64, neumann_tags: &[u32], tol: f64, maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg_nc_impl(mesh, b, alpha, reaction, false, neumann_tags, tol, maxit)
 }
 
 /// Solve the singular pure-Neumann pressure-Poisson `A·x = b` on a non-conforming mesh
@@ -646,18 +660,19 @@ pub fn poisson_nc_cg_solve(
 pub fn pressure_nc_cg_solve(
     mesh: &Mesh2d, b: &[f64], alpha: f64, tol: f64, maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    cg_nc_impl(mesh, b, alpha, 0.0, true, true, tol, maxit)
+    cg_nc_impl(mesh, b, alpha, 0.0, true, &mesh.boundary_tags(), tol, maxit)
 }
 
 /// CG for `(reaction·M + A)·x = b` on a non-conforming mesh; `deflate` removes the
 /// constant nullspace each iteration (for the singular pure-Neumann pressure system).
-/// The matvec is the validated NC `gradient_nc → operator_nc` pipeline; vectors stay
-/// device-resident (only the CG scalars transfer host-side).
+/// `neumann_tags` routes per-region boundaries (NEU vs Dirichlet BND). The matvec is the
+/// validated NC `gradient_nc → operator_nc` pipeline; vectors stay device-resident (only
+/// the CG scalars transfer host-side).
 #[allow(clippy::too_many_arguments)]
 fn cg_nc_impl(
-    mesh: &Mesh2d, b: &[f64], alpha: f64, reaction: f64, deflate: bool, neumann_all: bool, tol: f64, maxit: usize,
+    mesh: &Mesh2d, b: &[f64], alpha: f64, reaction: f64, deflate: bool, neumann_tags: &[u32], tol: f64, maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    let ma = flatten_nc(mesh, alpha, neumann_all);
+    let ma = flatten_nc(mesh, alpha, neumann_tags);
     let ndof = ma.ndof;
     assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
 

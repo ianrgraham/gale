@@ -14,7 +14,9 @@
 //! machinery. Bit-for-bit (to solver tolerance) equal to `gale::dg::Stokes::step`.
 
 use crate::operators::poisson::{helmholtz_cg_solve, helmholtz_cg_solve_tags, pressure_cg_solve};
-use crate::operators::poisson_nc::{poisson_nc_cg_solve, pressure_nc_cg_solve};
+use crate::operators::poisson_nc::{
+    helmholtz_nc_cg_solve_tags, poisson_nc_cg_solve, pressure_nc_cg_solve,
+};
 
 /// True if the mesh has any 2:1 non-conforming interface (hanging nodes). The GPU
 /// elliptic solves must then route through the mortar-capable NC path; conforming
@@ -368,7 +370,10 @@ impl<'m> GpuStokes<'m> {
     /// Stages 2–3 for the per-region BC path — the [`project_and_diffuse`] analogue
     /// using tag-aware host RHS assembly and the tag-aware GPU elliptic solves. An
     /// outflow pins the pressure (Dirichlet `p=0`) so the deflated solve is replaced by
-    /// a plain CG. Conforming meshes only (NC + per-region BCs is a follow-up).
+    /// a plain CG. **Non-conforming (2:1 AMR) meshes are supported**: when hanging nodes
+    /// are present the three tag-aware solves route through the mortar SIPG NC path
+    /// ([`helmholtz_nc_cg_solve_tags`] / [`pressure_nc_cg_solve`]); the conforming path is
+    /// bit-identical otherwise.
     fn project_and_diffuse_bc(
         &self,
         mut uhx: Vec<f64>,
@@ -380,10 +385,7 @@ impl<'m> GpuStokes<'m> {
         let nn = refq.n_nodes();
         let dt = self.dt;
         let lambda = 1.0 / (self.nu * dt);
-        assert!(
-            !mesh_is_nonconforming(mesh),
-            "per-region GPU BCs on non-conforming meshes are not yet supported"
-        );
+        let nc = mesh_is_nonconforming(mesh);
 
         // Stage 2 — pressure projection (homogeneous data either way). With an outflow
         // the operator is non-singular (Dirichlet p=0 there) ⇒ plain Poisson CG; with
@@ -391,10 +393,11 @@ impl<'m> GpuStokes<'m> {
         let div = self.divergence(&uhx, &uhy);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _| 0.0, |_, _| 0.0);
-        let (p, _it) = if self.has_outflow {
-            helmholtz_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?
-        } else {
-            pressure_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+        let (p, _it) = match (self.has_outflow, nc) {
+            (true, false) => helmholtz_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?,
+            (true, true) => helmholtz_nc_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?,
+            (false, false) => pressure_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?,
+            (false, true) => pressure_nc_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?,
         };
         for (e, el) in mesh.elements.iter().enumerate() {
             let gpx = el.geom.grad_x(refq, &p[e * nn..(e + 1) * nn]);
@@ -410,8 +413,16 @@ impl<'m> GpuStokes<'m> {
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let bx = self.velocity_x.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
         let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
-        let (uxn, _) = helmholtz_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?;
-        let (uyn, _) = helmholtz_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.vely_neumann, self.tol, self.maxit)?;
+        let (uxn, _) = if nc {
+            helmholtz_nc_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?
+        } else {
+            helmholtz_cg_solve_tags(mesh, &bx, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?
+        };
+        let (uyn, _) = if nc {
+            helmholtz_nc_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.vely_neumann, self.tol, self.maxit)?
+        } else {
+            helmholtz_cg_solve_tags(mesh, &by, self.alpha, lambda, &self.vely_neumann, self.tol, self.maxit)?
+        };
         Ok((uxn, uyn))
     }
 
