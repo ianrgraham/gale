@@ -94,8 +94,6 @@ mod kernels {
     ) {
         static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         static mut P: SharedArray<f64, P3MAX> = SharedArray::UNINIT; // packed pr/ps/pt
-        static mut H: SharedArray<f64, P3MAX> = SharedArray::UNINIT; // packed hx/hy/hz
-        static mut RF: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         let n1 = n1 as usize;
         let n2 = n1 * n1;
         let nn = n1 * n2;
@@ -105,10 +103,6 @@ mod kernels {
         let mo = b * 9;
         unsafe {
             DS[m] = d[m];
-            RF[m] = 0.0;
-            H[m] = 0.0;
-            H[NN_MAX + m] = 0.0;
-            H[2 * NN_MAX + m] = 0.0;
             // Volume flux W·∇u, projected to (r,s,t) contravariant directions (rows).
             let wx = jw[b] * gx[b];
             let wy = jw[b] * gy[b];
@@ -117,52 +111,50 @@ mod kernels {
             P[NN_MAX + m] = met[mo + 3] * wx + met[mo + 4] * wy + met[mo + 5] * wz;
             P[2 * NN_MAX + m] = met[mo + 6] * wx + met[mo + 7] * wy + met[mo + 8] * wz;
         }
-        thread::sync_threads();
-        if m == 0 {
-            let mut t = 0usize;
-            while t < 6 {
-                let tau = face_tau[e * 6 + t];
-                let mut a = 0usize;
-                while a < n2 {
-                    let idx = (e * 6 + t) * n2 + a;
-                    let vl = face_vl[idx] as usize;
-                    let fo = idx * 4;
-                    let nx = fmet[fo];
-                    let ny = fmet[fo + 1];
-                    let nz = fmet[fo + 2];
-                    let sw = fmet[fo + 3];
+        // Face contribution by **gather** (race-free, fully parallel; see the 2D operator):
+        // thread `m` scans the element's 6·n2 face entries for the ones at its node
+        // (`face_vl == m`; hex corners match on three faces), accumulating the SIPG
+        // consistency/penalty `rf` and symmetry-lift `hx,hy,hz` into registers — no shared
+        // `RF/H`, no races. `face_vl == m` ⇒ the interior trace is `gx[b]`/`gy[b]`/`gz[b]`.
+        let mut rf = 0.0f64;
+        let mut hx = 0.0f64;
+        let mut hy = 0.0f64;
+        let mut hz = 0.0f64;
+        let mut t = 0usize;
+        while t < 6 {
+            let tau = face_tau[e * 6 + t];
+            let mut a = 0usize;
+            while a < n2 {
+                let idx = (e * 6 + t) * n2 + a;
+                if face_vl[idx] as usize == m {
                     let nbr = face_nbr[idx];
-                    if nbr == NEU {
-                        a += 1;
-                        continue; // natural BC: no contribution
+                    if nbr != NEU {
+                        let fo = idx * 4;
+                        let nx = fmet[fo];
+                        let ny = fmet[fo + 1];
+                        let nz = fmet[fo + 2];
+                        let sw = fmet[fo + 3];
+                        let dun_e = nx * gx[b] + ny * gy[b] + nz * gz[b];
+                        let ug = u[b];
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0) // Dirichlet
+                        } else {
+                            let ng = nbr as usize;
+                            (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng] + nz * gz[ng]), ug - u[ng], 0.5)
+                        };
+                        let gg = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += gg * nx;
+                        hy += gg * ny;
+                        hz += gg * nz;
                     }
-                    let el_vl = e * nn + vl;
-                    let dun_e = nx * gx[el_vl] + ny * gy[el_vl] + nz * gz[el_vl];
-                    let ug = u[el_vl];
-                    let (avg, jump, gfac) = if nbr == BND {
-                        (dun_e, ug, 1.0) // Dirichlet
-                    } else {
-                        let ng = nbr as usize;
-                        (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng] + nz * gz[ng]), ug - u[ng], 0.5)
-                    };
-                    let gg = gfac * sw * jump;
-                    unsafe {
-                        RF[vl] += -sw * avg + tau * sw * jump;
-                        H[vl] += gg * nx;
-                        H[NN_MAX + vl] += gg * ny;
-                        H[2 * NN_MAX + vl] += gg * nz;
-                    }
-                    a += 1;
                 }
-                t += 1;
+                a += 1;
             }
+            t += 1;
         }
-        thread::sync_threads();
         // Subtract the symmetry-lift sources (project H to (r,s,t) like the volume).
         unsafe {
-            let hx = H[m];
-            let hy = H[NN_MAX + m];
-            let hz = H[2 * NN_MAX + m];
             P[m] -= met[mo] * hx + met[mo + 1] * hy + met[mo + 2] * hz;
             P[NN_MAX + m] -= met[mo + 3] * hx + met[mo + 4] * hy + met[mo + 5] * hz;
             P[2 * NN_MAX + m] -= met[mo + 6] * hx + met[mo + 7] * hy + met[mo + 8] * hz;
@@ -181,9 +173,8 @@ mod kernels {
             }
             a += 1;
         }
-        let rfm = unsafe { RF[m] };
         if let Some(o) = out.get_mut(thread::index_1d()) {
-            *o = acc + rfm + lambda * jw[b] * u[b];
+            *o = acc + rf + lambda * jw[b] * u[b];
         }
     }
 
@@ -207,21 +198,24 @@ mod kernels {
         }
     }
 
-    /// Block dot-product partial reduction.
+    /// Multi-block grid-stride dot product: each block reduces its strided slice into
+    /// shared memory and writes one partial to `partial[blockIdx]` (host sums them). With
+    /// `gridDim = 1` this is the old single-block reduction; with many blocks it streams
+    /// `a`/`b` across all SMs at ~peak bandwidth instead of saturating one SM.
     #[kernel]
     pub fn dot3v_partial(a: &[f64], b: &[f64], n: u64, mut partial: DisjointSlice<f64>) {
         static mut SH: SharedArray<f64, RED> = SharedArray::UNINIT;
         let tid = thread::threadIdx_x() as usize;
-        let stride = thread::blockDim_x() as usize;
+        let gstride = (thread::gridDim_x() * thread::blockDim_x()) as usize;
         let mut acc = 0.0f64;
-        let mut i = tid;
+        let mut i = (thread::blockIdx_x() * thread::blockDim_x()) as usize + tid;
         while i < n as usize {
             acc += a[i] * b[i];
-            i += stride;
+            i += gstride;
         }
         unsafe { SH[tid] = acc; }
         thread::sync_threads();
-        let mut s = stride / 2;
+        let mut s = thread::blockDim_x() as usize / 2;
         while s > 0 {
             if tid < s {
                 unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
@@ -230,11 +224,16 @@ mod kernels {
             s /= 2;
         }
         if tid == 0 {
-            if let Some(o) = partial.get_mut(thread::index_1d()) {
-                *o = unsafe { SH[0] };
-            }
+            unsafe { *partial.get_unchecked_mut(thread::blockIdx_x() as usize) = SH[0]; }
         }
     }
+}
+
+/// Number of blocks for the multi-block `dot3v_partial` reduction (see the 2D
+/// `dot_blocks`): enough to stream the vector across all SMs, capped at 1024 so the
+/// host-side sum of partials stays trivial. `RED` threads per block.
+fn dot_blocks(ndof: usize) -> usize {
+    ndof.div_ceil(RED).clamp(1, 1024)
 }
 
 /// Per-element metrics + flattened face metadata for one hex mesh, ready to upload.
@@ -408,12 +407,13 @@ fn cg3d_impl(mesh: &Mesh3d, b: &[f64], alpha: f64, reaction: f64, neumann_tags: 
     let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gz = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let nb = dot_blocks(ndof);
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, nb)?;
     let ones = up(&vec![1.0f64; ndof])?;
 
     let module = kernels::load(&ctx)?;
     let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: 0 };
-    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
     let n64 = ndof as u64;
@@ -422,7 +422,7 @@ fn cg3d_impl(mesh: &Mesh3d, b: &[f64], alpha: f64, reaction: f64, neumann_tags: 
     macro_rules! dot {
         ($a:expr, $b:expr) => {{
             module.dot3v_partial(&stream, red, $a, $b, n64, &mut partial)?;
-            partial.to_host_vec(&stream)?[0]
+            partial.to_host_vec(&stream)?.iter().sum::<f64>()
         }};
     }
     macro_rules! deflate {

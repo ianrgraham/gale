@@ -305,21 +305,24 @@ mod kernels {
         }
     }
 
-    /// Block dot-product partial reduction.
+    /// Multi-block grid-stride dot product: each block reduces its strided slice into
+    /// shared memory and writes one partial to `partial[blockIdx]` (host sums them). With
+    /// `gridDim = 1` this is the old single-block reduction; with many blocks it streams
+    /// `a`/`b` across all SMs at ~peak bandwidth instead of saturating one SM.
     #[kernel]
     pub fn dot_nc_partial(a: &[f64], b: &[f64], n: u64, mut partial: DisjointSlice<f64>) {
         static mut SH: SharedArray<f64, RED> = SharedArray::UNINIT;
         let tid = thread::threadIdx_x() as usize;
-        let stride = thread::blockDim_x() as usize;
+        let gstride = (thread::gridDim_x() * thread::blockDim_x()) as usize;
         let mut acc = 0.0f64;
-        let mut i = tid;
+        let mut i = (thread::blockIdx_x() * thread::blockDim_x()) as usize + tid;
         while i < n as usize {
             acc += a[i] * b[i];
-            i += stride;
+            i += gstride;
         }
         unsafe { SH[tid] = acc; }
         thread::sync_threads();
-        let mut s = stride / 2;
+        let mut s = thread::blockDim_x() as usize / 2;
         while s > 0 {
             if tid < s {
                 unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
@@ -328,11 +331,16 @@ mod kernels {
             s /= 2;
         }
         if tid == 0 {
-            if let Some(o) = partial.get_mut(thread::index_1d()) {
-                *o = unsafe { SH[0] };
-            }
+            unsafe { *partial.get_unchecked_mut(thread::blockIdx_x() as usize) = SH[0]; }
         }
     }
+}
+
+/// Number of blocks for the multi-block `dot_nc_partial` reduction (see the 2D
+/// `dot_blocks`): enough to stream the vector across all SMs, capped at 1024 so the
+/// host-side sum of partials stays trivial. `RED` threads per block.
+fn dot_blocks(ndof: usize) -> usize {
+    ndof.div_ceil(RED).clamp(1, 1024)
 }
 
 /// Per-element metrics + flattened (conforming + non-conforming) face metadata,
@@ -712,12 +720,13 @@ fn cg_nc_impl(
     let mut ap = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
+    let nb = dot_blocks(ndof);
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, nb)?;
     let ones = up(&vec![1.0f64; ndof])?;
 
     let module = kernels::load(&ctx)?;
     let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: 0 };
-    let red = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
     let n64 = ndof as u64;
@@ -726,7 +735,7 @@ fn cg_nc_impl(
     macro_rules! dot {
         ($a:expr, $b:expr) => {{
             module.dot_nc_partial(&stream, red, $a, $b, n64, &mut partial)?;
-            partial.to_host_vec(&stream)?[0]
+            partial.to_host_vec(&stream)?.iter().sum::<f64>()
         }};
     }
     macro_rules! deflate {
