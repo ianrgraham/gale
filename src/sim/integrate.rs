@@ -303,6 +303,48 @@ impl ArkImex {
     }
 }
 
+/// **Relaxation Runge–Kutta** parameter (Ranocha et al., SISC 2020): given the old functional value
+/// `eta_old`, the per-step production estimate `prod` (so the target functional is `eta_old + γ·prod`),
+/// and an evaluator `eval(γ)` of the functional at the relaxed state `γ·uₙ₊₁ + (1−γ)·uₙ`, returns the
+/// relaxation `γ` solving `eval(γ) = eta_old + γ·prod` for the non-trivial root near `γ = 1`. Enforces
+/// the discrete balance of **any convex functional** (energy, viscoelastic free energy, …) at the cost
+/// of one scalar root-find. `γ = 0` is always a trivial root, so the search scans the window `(0, 2]`
+/// (excluding 0); if no sign change is found (no admissible relaxation) it returns `1.0` (the plain step).
+/// See `docs/plan-free-energy-compatible.md`. NOTE: relaxation only corrects *time-integration* entropy
+/// leakage — it presupposes an entropy-stable *spatial* operator.
+pub fn relaxation_gamma(eval: impl Fn(f64) -> f64, eta_old: f64, prod: f64) -> f64 {
+    let r = |g: f64| eval(g) - (eta_old + g * prod);
+    let (lo_bound, hi_bound, n) = (1e-3, 2.0, 256usize);
+    let (mut prev_g, mut prev_r) = (lo_bound, r(lo_bound));
+    let mut bracket = None;
+    for i in 1..=n {
+        let g = lo_bound + (hi_bound - lo_bound) * (i as f64) / (n as f64);
+        let rg = r(g);
+        if prev_r * rg <= 0.0 {
+            bracket = Some((prev_g, g));
+            break;
+        }
+        prev_g = g;
+        prev_r = rg;
+    }
+    let (mut a, mut b) = match bracket {
+        Some(x) => x,
+        None => return 1.0,
+    };
+    let mut ra = r(a);
+    for _ in 0..80 {
+        let m = 0.5 * (a + b);
+        let rm = r(m);
+        if ra * rm <= 0.0 {
+            b = m;
+        } else {
+            a = m;
+            ra = rm;
+        }
+    }
+    0.5 * (a + b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,5 +387,25 @@ mod tests {
         }
         // Sanity: it actually evolved.
         assert!(s_ref[0].iter().any(|&v| v.abs() > 1e-6));
+    }
+
+    #[test]
+    fn relaxation_gamma_matches_quadratic_closed_form() {
+        // Quadratic functional η(u)=½u² along u(γ)=1+γ: r(γ)=η(u(γ))−½−γ·prod has non-trivial root
+        // γ* = 2(prod−1). Verify the solver finds it, satisfies the equation, and returns 1 when
+        // γ=1 is the root.
+        let eval = |g: f64| 0.5 * (1.0 + g) * (1.0 + g);
+        let eta_old = 0.5; // η(u(0)) = ½·1²
+        for &prod in &[1.25_f64, 1.5, 1.75] {
+            let g = relaxation_gamma(eval, eta_old, prod);
+            let want = 2.0 * (prod - 1.0);
+            assert!((g - want).abs() < 1e-9, "γ={g}, want {want} (prod={prod})");
+            // residual of the relaxation equation
+            assert!((eval(g) - (eta_old + g * prod)).abs() < 1e-9, "relaxation residual");
+        }
+        // prod = 1.5 ⇒ γ* = 1 exactly (no relaxation needed).
+        assert!((relaxation_gamma(eval, eta_old, 1.5) - 1.0).abs() < 1e-9);
+        // prod < 1 ⇒ γ* = 2(prod−1) < 0, outside (0,2] ⇒ no admissible relaxation ⇒ γ = 1.
+        assert!((relaxation_gamma(eval, eta_old, 0.5) - 1.0).abs() < 1e-12);
     }
 }

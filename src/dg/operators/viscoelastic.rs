@@ -1175,6 +1175,37 @@ pub fn limit_scalar_bounds(mesh: &Mesh2d, u: &mut [f64], lo: f64, hi: f64) {
     }
 }
 
+/// Oldroyd-B elastic **free-energy** density per node: `F = (η_p/2λ)[tr C − ln det C − d]` (d = 2),
+/// the relative-entropy / Helmholtz free energy (Boyaval–Lelièvre–Mangoubi). `F ≥ 0`, `F(I) = 0`, and
+/// its finiteness (via `−ln det C`) is the structural property precluding `det C → 0` — the free-energy
+/// bound underlying SPD stability at high Wi (`docs/plan-free-energy-compatible.md`). Requires SPD `C`
+/// (`det > 0`). A *diagnostic*: track it over a run to detect free-energy incompatibility.
+pub fn free_energy_density(c: &[Vec<f64>; 3], eta_p: f64, lambda: f64) -> Vec<f64> {
+    let f = eta_p / (2.0 * lambda);
+    let d = 2.0;
+    (0..c[0].len())
+        .map(|i| {
+            let tr = c[0][i] + c[2][i];
+            let det = c[0][i] * c[2][i] - c[1][i] * c[1][i];
+            f * (tr - det.ln() - d)
+        })
+        .collect()
+}
+
+/// Total Oldroyd-B free energy `∫ F dV` over the mesh (quadrature-weighted) — the discrete functional
+/// whose balance a free-energy-compatible scheme must respect.
+pub fn free_energy_total(mesh: &Mesh2d, c: &[Vec<f64>; 3], eta_p: f64, lambda: f64) -> f64 {
+    let nn = mesh.refq.n_nodes();
+    let dens = free_energy_density(c, eta_p, lambda);
+    let mut total = 0.0;
+    for (e, el) in mesh.elements.iter().enumerate() {
+        for k in 0..nn {
+            total += el.geom.jw[k] * dens[e * nn + k];
+        }
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,6 +1940,88 @@ mod tests {
                 assert!((psi[v][i] - orig[v][i]).abs() < 1e-15, "admissible Ψ altered at {v},{i}");
             }
         }
+    }
+
+    #[test]
+    fn free_energy_zero_at_identity_and_nonnegative() {
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let ndof = mesh.n_elements() * mesh.refq.n_nodes();
+        let (eta_p, lambda) = (1.3, 0.7);
+        let ci = [vec![1.0; ndof], vec![0.0; ndof], vec![1.0; ndof]]; // C = I
+        for &v in &free_energy_density(&ci, eta_p, lambda) {
+            assert!(v.abs() < 1e-12, "F(I) ≠ 0: {v}");
+        }
+        assert!(free_energy_total(&mesh, &ci, eta_p, lambda).abs() < 1e-12);
+        let c = [
+            nodal(&mesh, |x, y| 2.0 + 0.5 * (x + y).sin()),
+            nodal(&mesh, |x, y| 0.2 * x - 0.1 * y),
+            nodal(&mesh, |x, _| 1.5 + 0.3 * x),
+        ];
+        for &v in &free_energy_density(&c, eta_p, lambda) {
+            assert!(v >= -1e-12, "F < 0 on SPD C: {v}");
+        }
+    }
+
+    #[test]
+    fn free_energy_decays_under_relaxation() {
+        // Pure relaxation dissipates the free energy monotonically toward 0 (C → I).
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let (eta_p, lambda) = (1.0, 0.5);
+        let lc = LogConfOldroydB::new(&mesh, lambda, eta_p);
+        let c0 = [vec![3.0; lc.ndof()], vec![0.5; lc.ndof()], vec![2.0; lc.ndof()]];
+        let mut psi = lc.from_conformation(&c0);
+        let mut f_prev = free_energy_total(&mesh, &lc.conformation(&psi), eta_p, lambda);
+        assert!(f_prev > 0.0, "stretched C should have F > 0");
+        let dt = 0.1;
+        for _ in 0..100 {
+            psi = lc.relax_exact(&psi, dt);
+            let f = free_energy_total(&mesh, &lc.conformation(&psi), eta_p, lambda);
+            assert!(f <= f_prev + 1e-12, "F increased under relaxation: {f} > {f_prev}");
+            f_prev = f;
+        }
+        assert!(f_prev < 1e-6, "F should decay to ≈0: {f_prev}");
+    }
+
+    #[test]
+    fn free_energy_grows_under_shear_startup() {
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+        let (eta_p, lambda, gdot) = (1.0, 1.0, 5.0);
+        let lc = LogConfOldroydB::new(&mesh, lambda, eta_p);
+        let ux = nodal(&mesh, |_, y| gdot * y);
+        let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+        let mut psi = lc.identity(); // C = I ⇒ F = 0
+        assert!(free_energy_total(&mesh, &lc.conformation(&psi), eta_p, lambda).abs() < 1e-12);
+        let dt = 0.005;
+        for _ in 0..200 {
+            psi = lc.step_ark2_imex(&psi, &ux, &uy, dt);
+        }
+        let f1 = free_energy_total(&mesh, &lc.conformation(&psi), eta_p, lambda);
+        assert!(f1 > 1e-3, "F should grow under shear startup: {f1}");
+    }
+
+    #[test]
+    fn free_energy_jensen_bias() {
+        // Zero-mean log fluctuation: <F(C)> > F(exp(<Ψ>)) — the arithmetic-C mean over-estimates the
+        // free energy vs the log-mean state (Peng Prop 3.1; the conservation/enforcement tension).
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 1, 1, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let (eta_p, lambda) = (1.0, 1.0);
+        let lc = LogConfOldroydB::new(&mesh, lambda, eta_p);
+        let mut psi = [vec![0.0; nn], vec![0.0; nn], vec![0.0; nn]];
+        for k in 0..nn {
+            psi[0][k] = 1.0 + 0.5 * ((k as f64) * 0.7).sin(); // varying Ψxx
+        }
+        let c = lc.conformation(&psi);
+        let dens = free_energy_density(&c, eta_p, lambda);
+        let mean_f = dens.iter().sum::<f64>() / nn as f64;
+        let mpsi: [f64; 3] = std::array::from_fn(|v| psi[v].iter().sum::<f64>() / nn as f64);
+        let c_lm = sym_apply(mpsi[0], mpsi[1], mpsi[2], f64::exp);
+        let f_lm = free_energy_density(&[vec![c_lm[0]], vec![c_lm[1]], vec![c_lm[2]]], eta_p, lambda)[0];
+        assert!(mean_f > f_lm + 1e-9, "Jensen bias not positive: <F>={mean_f}, F(logmean)={f_lm}");
     }
 
     #[test]
