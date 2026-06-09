@@ -223,3 +223,21 @@ grads = central FD to machine precision; fit converges to loss `2.6e-30`). This 
 differentiating through the solver* — the differentiable-gale value proposition, working. The remaining
 gale-native step is wiring `LLVMEnzyme` as an `opt` pass on cuda-oxide's emitted opaque `.ll` so gale's
 actual GPU conformation kernels (not the C transcription) are differentiated in-build.
+
+### 11. gale's REAL GPU kernel differentiated end-to-end on the Titan V ✅ (2026-06-09)
+`examples/enzyme-gpu-kernel/` closes §10's "remaining gale-native step" at the mechanism level: it
+differentiates gale-gpu's **actual emitted `implicit_relax` device code** — the `#[kernel] implicit_relax`
+in `gale-gpu/src/operators/logconf.rs`, the per-node implicit viscoelastic relaxation solve the solver runs
+every IMEX substep — **with no edits to the Rust source**, operating purely on the opaque LLVM IR cuda-oxide
+emits. `build.sh` runs the full pipeline from a clean checkout: dump the gale-gpu bundle
+(`CUDA_OXIDE_DUMP_LLVM=1 CUDA_OXIDE_TARGET=sm_120`, opaque) → **de-kernelize `implicit_relax`** (drop its
+`!nvvm.annotations ... !"kernel"` entry, by node name not line number, so Enzyme sees a `__device__` fn —
+the load-bearing trick; without it the tangent body comes out empty) → link `enzyme_driver.ll`
+(`primal_relax` + `d_implicit_dinvlam` wrappers, forward-mode seed on `inv_lambda`) → `opt -passes=enzyme`
+→ link libdevice + internalize/globaldce (drops un-lowerable `tanh.approx.f32`) → `llc -mcpu=sm_70` →
+`ptxas` → `launch.c` runs it on hardware. **Result on the Titan V: `d(Psi_xx)/d(1/λ)` Enzyme vs FD agrees
+to max-rel `7.231e-08`, Enzyme primal = unperturbed primal exactly (`0.00e+00`).** This proves gale's real
+GPU conformation kernels are differentiable through the cuda-oxide→Enzyme→sm_70 path with correct parameter
+gradients on hardware. The only step still outstanding is *automation*: wiring `LLVMEnzyme` into `cargo
+oxide` (after the IR dump, before the typed-pointer shim) with a Rust-level annotation, so this manual
+pipeline becomes a build flag.
