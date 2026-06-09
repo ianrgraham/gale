@@ -15,10 +15,11 @@
 //! face floats packed (`fmet[idx*4+{nx,ny,nz,sw}]`) to keep kernel signatures narrow
 //! (the NVVM-text backend mis-parses very wide signatures).
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
 use gale::dg::{Face, Mesh3d, Neighbor3};
+use std::sync::Arc;
 
 const NN_MAX: usize = 125; // (p+1)³ up to p=4
 const P3MAX: usize = 3 * NN_MAX; // packed 3-vector shared arrays
@@ -465,4 +466,184 @@ fn cg3d_impl(mesh: &Mesh3d, b: &[f64], alpha: f64, reaction: f64, neumann_tags: 
         rs = rs_new;
     }
     Ok((x.to_host_vec(&stream)?, iters))
+}
+
+// ===== Persistent 3D solver handle (P4) ==========================================
+
+/// Persistent GPU 3D SIPG-Poisson / Helmholtz solver handle — the hex-mesh analogue of
+/// [`crate::GpuPoisson`]. Owns the CUDA context, the loaded device module, and the
+/// uploaded **constant** mesh arrays (metrics + face geometry + tau), so repeated solves
+/// on the same mesh pay the heavy setup (`CudaContext::new` + `kernels::load` cubin/JIT +
+/// mesh upload, ~0.3 s) **once** instead of per call — the 3 elliptic solves/step of the
+/// 3D dual-splitting flow loop, across every timestep, share one handle.
+///
+/// Only the per-region `neumann_tags`/`reaction`/`deflate` vary between solves;
+/// [`solve`](Self::solve) rebuilds just the small `fnbr` array on the host and uploads it.
+/// CG scalars are read back per dot (the multi-block `dot3v_partial` + host sum — the same
+/// as `cg3d_impl`; the on-device-scalar refinement is 2D-only for now). Bit-for-bit
+/// equivalent to `cg3d_impl` (i.e. `helmholtz3d_cg_solve_tags` / `pressure3d_cg_solve`).
+pub struct GpuPoisson3d {
+    // `stream` and `module` each hold an `Arc<CudaContext>`, keeping the context alive.
+    stream: Arc<CudaStream>,
+    module: kernels::LoadedModule,
+    nn: usize,
+    ne: usize,
+    ndof: usize,
+    n1: u32,
+    // constant (neumann-tag-independent) device arrays, uploaded once.
+    d_dev: DeviceBuffer<f64>,
+    met_dev: DeviceBuffer<f64>,
+    jw_dev: DeviceBuffer<f64>,
+    fvl_dev: DeviceBuffer<u32>,
+    fmet_dev: DeviceBuffer<f64>,
+    ftau_dev: DeviceBuffer<f64>,
+    // host state to rebuild the per-region `fnbr` cheaply (base = all-Dirichlet; flip the
+    // listed boundary-face nodes to NEU when their tag is in `neumann_tags`).
+    fnbr_base: Vec<u32>,
+    bnodes: Vec<(usize, u32)>,
+}
+
+impl GpuPoisson3d {
+    /// Build the handle for `mesh` with SIPG penalty factor `alpha`: create the context,
+    /// load the module, and upload the constant metrics/face data.
+    pub fn new(mesh: &Mesh3d, alpha: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        let ma = flatten3d(mesh, alpha, &[]); // fnbr_base: all boundary faces Dirichlet (BND)
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+        let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+        // Boundary-face nodes + tags, in the same flat order flatten3d uses (6 faces, n2
+        // nodes each), so a per-region solve flips only these entries to NEU.
+        let n2 = (ma.n1 * ma.n1) as usize;
+        let mut bnodes = Vec::new();
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for (t, face) in Face::ALL.iter().enumerate() {
+                if let Neighbor3::Boundary { tag } = el.neighbors[*face as usize] {
+                    for a in 0..n2 {
+                        bnodes.push(((e * 6 + t) * n2 + a, tag));
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            module: kernels::load(&ctx)?,
+            nn: ma.nn,
+            ne: ma.ne,
+            ndof: ma.ndof,
+            n1: ma.n1,
+            d_dev: up(&ma.diff_pad)?,
+            met_dev: up(&ma.met)?,
+            jw_dev: up(&ma.jw)?,
+            fvl_dev: upu(&ma.fvl)?,
+            fmet_dev: up(&ma.fmet)?,
+            ftau_dev: up(&ma.ftau)?,
+            fnbr_base: ma.fnbr,
+            bnodes,
+            stream,
+        })
+    }
+
+    /// Number of degrees of freedom (`n_elements · n_nodes`).
+    pub fn ndof(&self) -> usize {
+        self.ndof
+    }
+
+    /// Solve `(reaction·M + A)·x = b` on this hex mesh by CG (multi-block dot + host-sum
+    /// scalars). `neumann_tags` are the natural-BC boundary tags (`&[]` = all-Dirichlet
+    /// velocity Helmholtz; `&mesh.boundary_tags()` = pure-Neumann pressure). `deflate`
+    /// removes the constant nullspace each iteration. No per-call context/module setup or
+    /// constant-mesh upload — only `b`, the small `fnbr`, and scratch move.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve(
+        &self,
+        b: &[f64],
+        reaction: f64,
+        neumann_tags: &[u32],
+        deflate: bool,
+        tol: f64,
+        maxit: usize,
+    ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+        assert_eq!(b.len(), self.ndof, "rhs length must be n_elements·n_nodes");
+        let stream = &self.stream;
+        let module = &self.module;
+        let ndof = self.ndof;
+
+        let mut fnbr = self.fnbr_base.clone();
+        if !neumann_tags.is_empty() {
+            for &(idx, tag) in &self.bnodes {
+                if neumann_tags.contains(&tag) {
+                    fnbr[idx] = NEU;
+                }
+            }
+        }
+        let fnbr_dev = DeviceBuffer::from_host(stream, &fnbr)?;
+
+        let up = |v: &[f64]| DeviceBuffer::from_host(stream, v);
+        let nb = dot_blocks(ndof);
+        let mut x = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut r = up(b)?;
+        let mut p = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut ap = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut gx = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut gy = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut gz = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut partial = DeviceBuffer::<f64>::zeroed(stream, nb)?;
+        let ones = up(&vec![1.0f64; ndof])?;
+
+        let cfg = LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: (self.nn as u32, 1, 1), shared_mem_bytes: 0 };
+        let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+        let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
+        let n1 = self.n1;
+        let n64 = ndof as u64;
+        let ninv = 1.0 / ndof as f64;
+
+        macro_rules! dot {
+            ($a:expr, $b:expr) => {{
+                module.dot3v_partial(stream, red, $a, $b, n64, &mut partial)?;
+                partial.to_host_vec(stream)?.iter().sum::<f64>()
+            }};
+        }
+        macro_rules! deflate_v {
+            ($v:expr) => {{
+                if deflate {
+                    let mean = dot!($v, &ones) * ninv;
+                    module.axpy3v(stream, vec_cfg, $v, &ones, -mean)?;
+                }
+            }};
+        }
+        macro_rules! apply {
+            ($field:expr, $dst:expr) => {{
+                module.gradient3d(stream, cfg, &self.d_dev, $field, &self.met_dev, n1, &mut gx, &mut gy, &mut gz)?;
+                module.operator3d(
+                    stream, cfg, &self.d_dev, $field, &gx, &gy, &gz, &self.met_dev, &self.jw_dev, n1,
+                    &self.fvl_dev, &self.fmet_dev, &fnbr_dev, &self.ftau_dev, reaction, $dst,
+                )?;
+            }};
+        }
+
+        deflate_v!(&mut r);
+        module.xpby3v(stream, vec_cfg, &mut p, &r, 0.0)?; // p = r
+        let bn = dot!(&r, &r).sqrt().max(1e-300);
+        let mut rs = dot!(&r, &r);
+        let mut iters = 0;
+        for it in 0..maxit {
+            apply!(&p, &mut ap);
+            let pap = dot!(&p, &ap);
+            let alpha_cg = rs / pap;
+            module.axpy3v(stream, vec_cfg, &mut x, &p, alpha_cg)?;
+            module.axpy3v(stream, vec_cfg, &mut r, &ap, -alpha_cg)?;
+            deflate_v!(&mut r);
+            let rs_new = dot!(&r, &r);
+            iters = it + 1;
+            if rs_new.sqrt() / bn < tol {
+                break;
+            }
+            let beta = rs_new / rs;
+            module.xpby3v(stream, vec_cfg, &mut p, &r, beta)?;
+            rs = rs_new;
+        }
+        Ok((x.to_host_vec(stream)?, iters))
+    }
 }
