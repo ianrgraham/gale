@@ -32,7 +32,10 @@ pub mod operators;
 
 // Backwards-compatible flat re-exports of the most-used host API.
 pub use distributed::{multigpu_advection_2d, multigpu_advection_3d};
-pub use flow::{GpuDualSplitting, GpuStokes, GpuStokesIntegrator, GpuViscoelasticDualSplitting};
+pub use flow::{
+    logconf_ark2_advance_gpu, GpuDualSplitting, GpuStokes, GpuStokesIntegrator,
+    GpuViscoelasticDualSplitting,
+};
 pub use flow3d::{GpuDualSplitting3d, GpuStokes3d, GpuViscoelasticDualSplitting3d};
 pub use immersed::{
     penalize3d_apply, penalize_apply, GpuPenalization3dHook, GpuPenalizationHook,
@@ -41,7 +44,7 @@ pub use operators::advection::{advection_rhs, GpuAdvection};
 pub use operators::advection3d::advection3d_rhs;
 pub use operators::burgers::burgers_rhs;
 pub use operators::euler::euler_rhs;
-pub use operators::logconf::logconf_psi_rhs;
+pub use operators::logconf::{logconf_implicit_relax, logconf_psi_rhs};
 pub use operators::logconf3d::logconf3d_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
 pub use operators::oldroyd3d::oldroyd3d_conf_rhs;
@@ -51,6 +54,7 @@ pub use operators::poisson::{
 };
 pub use operators::poisson3d::{
     helmholtz3d_cg_solve, helmholtz3d_cg_solve_tags, poisson3d_apply, pressure3d_cg_solve,
+    GpuPoisson3d,
 };
 pub use operators::poisson_nc::{
     helmholtz_nc_cg_solve_tags, poisson_nc_apply, poisson_nc_cg_solve, pressure_nc_cg_solve,

@@ -392,6 +392,19 @@ pub struct LogConfOldroydB<'m> {
     pub mesh: &'m Mesh2d,
     pub lambda: f64,
     pub eta_p: f64,
+    /// **Giesekus mobility** `α ∈ [0, 1]`. `α = 0` is Oldroyd-B; `α > 0` adds the quadratic
+    /// relaxation `−(α/λ)(C − I)²`, giving shear-thinning and a bounded steady extension.
+    /// Only the relaxation differs from Oldroyd-B (advection + upper-convected stretching are
+    /// identical), so in the IMEX split it enters solely through the implicit relaxation
+    /// physics ([`Self::relax_exact`] / [`Self::implicit_relax_solve`]).
+    pub mobility: f64,
+    /// **FENE-P extensibility** `b > 2` (`tr I = 2` in 2D). `b = ∞` (the default) disables the
+    /// finite-extensibility limit (Oldroyd-B / Giesekus). When finite, the relaxation is the
+    /// Peterlin form `−(1/λ)[f·C − I]`, `f = (1−2/b)/(1−tr C/b)`, whose barrier `f→∞ as tr C→b`
+    /// keeps `tr C < b` — a **bound-preserving** implicit solve. Supported by the ARK stepper
+    /// ([`Self::implicit_relax_solve`]); the Strang stepper's `relax_exact` is Oldroyd-B/Giesekus
+    /// only (FENE-P's trace coupling has no per-eigenvalue closed form).
+    pub extensibility: f64,
     /// Optional conformation inflow boundary data (specified as the conformation `C`;
     /// converted to `Ψ = log C` internally). `None` ⇒ all boundaries transparent.
     pub inflow: Option<ConformationInflow>,
@@ -399,12 +412,24 @@ pub struct LogConfOldroydB<'m> {
 
 impl<'m> LogConfOldroydB<'m> {
     pub fn new(mesh: &'m Mesh2d, lambda: f64, eta_p: f64) -> Self {
-        Self { mesh, lambda, eta_p, inflow: None }
+        Self { mesh, lambda, eta_p, mobility: 0.0, extensibility: f64::INFINITY, inflow: None }
     }
 
     /// Set the conformation inflow boundary data (builder style).
     pub fn with_inflow(mut self, inflow: ConformationInflow) -> Self {
         self.inflow = Some(inflow);
+        self
+    }
+
+    /// Set the Giesekus mobility `α` (builder style). `α = 0` ⇒ Oldroyd-B (the default).
+    pub fn with_mobility(mut self, alpha: f64) -> Self {
+        self.mobility = alpha;
+        self
+    }
+
+    /// Set the FENE-P extensibility `b` (builder style). `b = ∞` (default) ⇒ no finite limit.
+    pub fn with_extensibility(mut self, b: f64) -> Self {
+        self.extensibility = b;
         self
     }
 
@@ -556,6 +581,234 @@ impl<'m> LogConfOldroydB<'m> {
         combine(psi, 1.0 / 3.0, &axpy(&u2, &k2, dt), 2.0 / 3.0)
     }
 
+    // ─── IMEX relaxation substep (Phase 1 of docs/plan-imex-relaxation-substep.md) ───
+    //
+    // The conformation RHS splits additively into a non-stiff transport part `E` and a
+    // stiff relaxation part `S`:  ∂Ψ/∂t = E(Ψ,u) + S(Ψ),  with
+    //   E = −(u·∇)Ψ + (ΩΨ−ΨΩ) + 2B        (advection + rotation + stretching, explicit)
+    //   S = (1/λ)(e^{−Ψ} − I)              (relaxation, stiff as λ→0, treated implicitly)
+    // Because `S` is local, pointwise, and isotropic in `C` (it commutes with `C`), the
+    // implicit step decouples onto the conformation eigenvalues — and for Oldroyd-B the
+    // eigenvalue ODE `dc_i/dt = −(c_i−1)/λ` has the *exact* closed-form flow used below.
+
+    /// The stiff relaxation source `S(Ψ) = (1/λ)(e^{−Ψ} − I)` — the implicit operand of
+    /// the IMEX split, identical to the relaxation contribution inside [`Self::psi_rhs`].
+    pub fn relax_source(&self, psi: &[Vec<f64>; 3]) -> [Vec<f64>; 3] {
+        let inv_lambda = 1.0 / self.lambda;
+        let n = self.ndof();
+        let mut out = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+        for i in 0..n {
+            let em = sym_apply(psi[0][i], psi[1][i], psi[2][i], |x| (-x).exp());
+            out[0][i] = inv_lambda * (em[0] - 1.0);
+            out[1][i] = inv_lambda * em[1];
+            out[2][i] = inv_lambda * (em[2] - 1.0);
+        }
+        out
+    }
+
+    /// Non-stiff transport part of the RHS (advection + rotation + stretching, *without*
+    /// relaxation) — the explicit operand of the IMEX/Strang split. Computed as
+    /// `psi_rhs − relax_source`, so it tracks [`Self::psi_rhs`] exactly by construction.
+    pub fn psi_transport_rhs(&self, psi: &[Vec<f64>; 3], ux: &[f64], uy: &[f64]) -> [Vec<f64>; 3] {
+        let full = self.psi_rhs(psi, ux, uy);
+        let relax = self.relax_source(psi);
+        std::array::from_fn(|v| full[v].iter().zip(&relax[v]).map(|(f, r)| f - r).collect())
+    }
+
+    /// Stiff relaxation substep integrated **exactly** on the conformation eigenvalues.
+    /// The eigenvalue ODE `dc/dt = −(1/λ)[(c−1) + α(c−1)²]` (Oldroyd-B for `α = 0`, Giesekus
+    /// for `α > 0`) is a Bernoulli equation with the closed-form flow
+    /// `w(τ)/(1+αw(τ)) = w₀/(1+αw₀)·e^{−τ/λ}`, `w = c−1` ⇒ `c(τ) = 1 + R/(1−αR)`,
+    /// `R = w₀/(1+αw₀)·e^{−τ/λ}`; in log-conformation `ψ ↦ log c(τ)` in the shared eigenframe.
+    /// SPD-preserving and unconditionally stable for any `τ`. (`α = 0` recovers
+    /// `c = 1 + (e^ψ−1)e^{−τ/λ}`.)
+    pub fn relax_exact(&self, psi: &[Vec<f64>; 3], tau: f64) -> [Vec<f64>; 3] {
+        let decay = (-tau / self.lambda).exp();
+        let alpha = self.mobility;
+        let n = self.ndof();
+        let mut out = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+        for i in 0..n {
+            let m = sym_apply(psi[0][i], psi[1][i], psi[2][i], |mu| {
+                let w0 = mu.exp() - 1.0; // c₀ − 1
+                let rr = (w0 / (1.0 + alpha * w0)) * decay;
+                (1.0 + rr / (1.0 - alpha * rr)).ln()
+            });
+            out[0][i] = m[0];
+            out[1][i] = m[1];
+            out[2][i] = m[2];
+        }
+        out
+    }
+
+    /// SSP-RK3 on the transport-only RHS (the explicit half-steps of the Strang split).
+    fn step_transport_ssp_rk3(
+        &self,
+        psi: &[Vec<f64>; 3],
+        ux: &[f64],
+        uy: &[f64],
+        dt: f64,
+    ) -> [Vec<f64>; 3] {
+        let axpy = |a: &[Vec<f64>; 3], k: &[Vec<f64>; 3], sc: f64| -> [Vec<f64>; 3] {
+            std::array::from_fn(|v| a[v].iter().zip(&k[v]).map(|(x, d)| x + sc * d).collect())
+        };
+        let combine = |a: &[Vec<f64>; 3], wa: f64, b: &[Vec<f64>; 3], wb: f64| -> [Vec<f64>; 3] {
+            std::array::from_fn(|v| a[v].iter().zip(&b[v]).map(|(x, y)| wa * x + wb * y).collect())
+        };
+        let k0 = self.psi_transport_rhs(psi, ux, uy);
+        let u1 = axpy(psi, &k0, dt);
+        let k1 = self.psi_transport_rhs(&u1, ux, uy);
+        let u2 = combine(psi, 0.75, &axpy(&u1, &k1, dt), 0.25);
+        let k2 = self.psi_transport_rhs(&u2, ux, uy);
+        combine(psi, 1.0 / 3.0, &axpy(&u2, &k2, dt), 2.0 / 3.0)
+    }
+
+    /// One **Strang-split IMEX** step: explicit transport over `dt/2`, *exact* relaxation
+    /// over `dt`, explicit transport over `dt/2`. Second-order; because the stiff
+    /// relaxation is integrated exactly (no `dt ≲ λ` limit) this is stable at `dt ≫ λ`,
+    /// where the fully-explicit [`Self::step_ssp_rk3`] diverges. Targeted at the small-λ /
+    /// high-elastic-modulus regime (see the plan's §1 scope note).
+    pub fn step_strang_imex(
+        &self,
+        psi: &[Vec<f64>; 3],
+        ux: &[f64],
+        uy: &[f64],
+        dt: f64,
+    ) -> [Vec<f64>; 3] {
+        let half = self.step_transport_ssp_rk3(psi, ux, uy, 0.5 * dt);
+        let relaxed = self.relax_exact(&half, dt);
+        self.step_transport_ssp_rk3(&relaxed, ux, uy, 0.5 * dt)
+    }
+
+    /// Solve one stiff implicit stage `Ψ − γ·S(Ψ) = B` for `Ψ`, where `S` is the (Oldroyd-B
+    /// or Giesekus) relaxation. The source is isotropic in `C` (commutes with it), so the
+    /// matrix solve decouples onto the eigenvalues of `B`: per eigenvalue `b`, Newton-solve
+    /// `g(ψ) = ψ + (γ/λ)(1−e^{−ψ}) + (γα/λ)(e^ψ−1)²e^{−ψ} − b = 0`. The derivative
+    /// `g′ = 1 + (γ/λ)e^{−ψ}[1 + α(e^{2ψ}−1)] > 0` for `α ∈ [0,1]`, so it is strictly monotone
+    /// and converges globally from `ψ = b`. SPD-preserving (real `Ψ` ⇒ `C = expΨ` SPD).
+    /// `α = 0` recovers the Oldroyd-B scalar `ψ − (γ/λ)(e^{−ψ}−1) = b`. (Plan §3/§7.)
+    pub fn implicit_relax_solve(&self, b: &[Vec<f64>; 3], gamma: f64) -> [Vec<f64>; 3] {
+        if self.extensibility.is_finite() {
+            return self.implicit_relax_solve_fenep(b, gamma);
+        }
+        let gl = gamma / self.lambda; // γ/λ
+        let alpha = self.mobility;
+        let n = self.ndof();
+        let mut out = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+        for i in 0..n {
+            let m = sym_apply(b[0][i], b[1][i], b[2][i], |bi| {
+                let mut psi = bi; // initial guess
+                for _ in 0..60 {
+                    let em = (-psi).exp(); // e^{−ψ}
+                    let ep = psi.exp(); // e^{ψ}
+                    let w = ep - 1.0;
+                    let g = psi + gl * (1.0 - em) + gl * alpha * w * w * em - bi;
+                    let gp = 1.0 + gl * em * (1.0 + alpha * (ep * ep - 1.0));
+                    let step = g / gp;
+                    psi -= step;
+                    if step.abs() < 1e-14 {
+                        break;
+                    }
+                }
+                psi
+            });
+            out[0][i] = m[0];
+            out[1][i] = m[1];
+            out[2][i] = m[2];
+        }
+        out
+    }
+
+    /// FENE-P implicit relaxation solve. The Peterlin relaxation `−(1/λ)[f(T)C − I]`,
+    /// `f = (1−2/b)/(1−T/b)`, couples the eigenvalues only through the scalar trace `T = tr C`.
+    /// Given `T`, each eigenvalue solves the Oldroyd-B-type scalar `ψ − (γ/λ)e^{−ψ} = b_i − (γ/λ)f(T)`
+    /// (monotone Newton); consistency `Σe^{ψ_i} = T` is a **monotone 1-D root** on `T ∈ (0, b)`,
+    /// solved by bisection — which keeps `tr C < b` by construction (bound-preserving). (Plan §7.)
+    fn implicit_relax_solve_fenep(&self, b: &[Vec<f64>; 3], gamma: f64) -> [Vec<f64>; 3] {
+        let gl = gamma / self.lambda;
+        let be = self.extensibility;
+        let n = self.ndof();
+        let mut out = [vec![0.0; n], vec![0.0; n], vec![0.0; n]];
+        // Inner: solve ψ − (γ/λ)e^{−ψ} = μ − (γ/λ)f for ψ (monotone, globally convergent).
+        let inner = |ff: f64, mu: f64| -> f64 {
+            let beta = mu - gl * ff;
+            let mut psi = mu;
+            for _ in 0..50 {
+                let e = (-psi).exp();
+                let step = (psi - gl * e - beta) / (1.0 + gl * e);
+                psi -= step;
+                if step.abs() < 1e-14 {
+                    break;
+                }
+            }
+            psi
+        };
+        for i in 0..n {
+            let (mu1, mu2, c, s) = sym_eig(b[0][i], b[1][i], b[2][i]);
+            // Bisection on the trace T: G(T) = e^{ψ1(T)} + e^{ψ2(T)} − T is strictly decreasing,
+            // G(0⁺) > 0, G(b⁻) < 0 ⇒ a unique root in (0, b).
+            let (mut lo, mut hi) = (1e-12, be * (1.0 - 1e-12));
+            let (mut p1, mut p2) = (mu1, mu2);
+            for _ in 0..80 {
+                let t = 0.5 * (lo + hi);
+                let ff = (1.0 - 2.0 / be) / (1.0 - t / be);
+                p1 = inner(ff, mu1);
+                p2 = inner(ff, mu2);
+                if p1.exp() + p2.exp() - t > 0.0 {
+                    lo = t;
+                } else {
+                    hi = t;
+                }
+            }
+            // Recompose Ψ = R diag(ψ1, ψ2) Rᵀ.
+            out[0][i] = c * c * p1 + s * s * p2;
+            out[1][i] = c * s * (p1 - p2);
+            out[2][i] = s * s * p1 + c * c * p2;
+        }
+        out
+    }
+
+    /// One **ARK2 / ARS(2,2,2)** IMEX step (Ascher–Ruuth–Spiteri): L-stable, second-order,
+    /// stiffly accurate, with **no operator-splitting error** (unlike [`Self::step_strang_imex`]).
+    /// Transport (`E = psi_transport_rhs`) is explicit; relaxation (`S`) is implicit via
+    /// [`Self::implicit_relax_solve`]. Stiffly accurate ⇒ the update equals the last implicit
+    /// stage. Coefficients: `γ = 1 − √2/2`, `δ = 1 − 1/(2γ)`. (Plan §2.3 / Phase 2.)
+    pub fn step_ark2_imex(
+        &self,
+        psi: &[Vec<f64>; 3],
+        ux: &[f64],
+        uy: &[f64],
+        dt: f64,
+    ) -> [Vec<f64>; 3] {
+        let gamma = 1.0 - 0.5_f64.sqrt();
+        let delta = 1.0 - 1.0 / (2.0 * gamma);
+        let gdt = dt * gamma;
+        // accumulate `psi + Σ c_t · term_t` (componentwise over the 3 tensor entries)
+        let accum = |terms: &[(f64, &[Vec<f64>; 3])]| -> [Vec<f64>; 3] {
+            std::array::from_fn(|v| {
+                let mut o = psi[v].clone();
+                for &(c, t) in terms {
+                    for i in 0..o.len() {
+                        o[i] += c * t[v][i];
+                    }
+                }
+                o
+            })
+        };
+        // Stage 1 (explicit, a^I_11 = 0): Ψ_1 = Ψⁿ.
+        let e1 = self.psi_transport_rhs(psi, ux, uy);
+        // Stage 2: B_2 = Ψⁿ + dt·γ·E_1 ; solve Ψ_2 − dt·γ·S(Ψ_2) = B_2.
+        let b2 = accum(&[(dt * gamma, &e1)]);
+        let psi2 = self.implicit_relax_solve(&b2, gdt);
+        let e2 = self.psi_transport_rhs(&psi2, ux, uy);
+        // Recover S_2 = (Ψ_2 − B_2)/(dt·γ) exactly from the stage equation (free).
+        let s2: [Vec<f64>; 3] =
+            std::array::from_fn(|v| psi2[v].iter().zip(&b2[v]).map(|(y, b)| (y - b) / gdt).collect());
+        // Stage 3: B_3 = Ψⁿ + dt(δ·E_1 + (1−δ)·E_2) + dt(1−γ)·S_2 ; solve.
+        let b3 = accum(&[(dt * delta, &e1), (dt * (1.0 - delta), &e2), (dt * (1.0 - gamma), &s2)]);
+        // Stiffly accurate: Ψⁿ⁺¹ = Ψ_3 (= B_3 + dt·γ·S_3, the ARK update).
+        self.implicit_relax_solve(&b3, gdt)
+    }
+
     /// Polymer stress `τ_p = (η_p/λ)(C − I)` from `Ψ`, as `[τxx, τxy, τyy]`.
     pub fn polymer_stress(&self, psi: &[Vec<f64>; 3]) -> [Vec<f64>; 3] {
         let c = self.conformation(psi);
@@ -586,6 +839,140 @@ impl<'m> LogConfOldroydB<'m> {
             }
         }
         (fx, fy)
+    }
+}
+
+/// [`ImexSemi`](crate::sim::integrate::ImexSemi) adapter exposing [`LogConfOldroydB`] (with a
+/// prescribed velocity field) to the generic [`ArkImex`](crate::sim::integrate::ArkImex)
+/// driver. State layout is `[3][ndof]` = `[Ψxx, Ψxy, Ψyy]`; transport is the explicit part,
+/// relaxation the (locally-solved) implicit part.
+pub struct LogConfImex<'a> {
+    pub model: &'a LogConfOldroydB<'a>,
+    pub ux: &'a [f64],
+    pub uy: &'a [f64],
+}
+
+impl crate::sim::integrate::ImexSemi for LogConfImex<'_> {
+    fn n_vars(&self) -> usize {
+        3
+    }
+    fn ndof(&self) -> usize {
+        self.model.ndof()
+    }
+    fn rhs_explicit(&self, state: &[Vec<f64>], _t: f64) -> Vec<Vec<f64>> {
+        let psi = [state[0].clone(), state[1].clone(), state[2].clone()];
+        self.model.psi_transport_rhs(&psi, self.ux, self.uy).into()
+    }
+    fn rhs_implicit(&self, state: &[Vec<f64>], _t: f64) -> Vec<Vec<f64>> {
+        let psi = [state[0].clone(), state[1].clone(), state[2].clone()];
+        self.model.relax_source(&psi).into()
+    }
+    fn solve_implicit(&self, b: &[Vec<f64>], gamma: f64, _t: f64) -> Vec<Vec<f64>> {
+        let bb = [b[0].clone(), b[1].clone(), b[2].clone()];
+        self.model.implicit_relax_solve(&bb, gamma).into()
+    }
+}
+
+/// Largest `θ ∈ [0, 1]` with `q(θ) = aθ² + bθ + c ≥ 0`, given `q(0) = c ≥ 0` and `q(1) < 0`
+/// (a single down-crossing in `(0,1)`): the smallest positive root. Used by the det limiter.
+fn theta_first_root(a: f64, b: f64, c: f64) -> f64 {
+    if a.abs() < 1e-300 {
+        // Linear `bθ + c`: with c ≥ 0 and b·1+c < 0 ⇒ b < 0 ⇒ root −c/b ∈ (0,1).
+        return if b.abs() < 1e-300 { 1.0 } else { (-c / b).clamp(0.0, 1.0) };
+    }
+    let disc = b * b - 4.0 * a * c;
+    if disc < 0.0 {
+        return 1.0; // no real crossing (shouldn't occur given the sign hypotheses)
+    }
+    let sq = disc.sqrt();
+    let mut t = 1.0f64;
+    for r in [(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)] {
+        if r > 0.0 && r <= 1.0 {
+            t = t.min(r);
+        }
+    }
+    t
+}
+
+/// **Scalar-surrogate bound-preserving limiter** for a direct-form conformation field
+/// `C = [Cxx, Cxy, Cyy]` (Zhang–Shu / Christner–Chan style). Per element it scales every node's
+/// deviation from the (quadrature-weighted) cell mean toward the mean by the largest common
+/// `θ ∈ [0, 1]` that keeps all nodes in the admissible set, enforcing the scalar surrogates the
+/// research (`docs/research-entropy-stable-methods.md` §9) identifies in place of the full SPD
+/// cone: `det C ≥ ε` and `tr C ≥ 2√ε` (together ⇒ SPD), and optionally `tr C ≤ b` (FENE).
+/// Conservative (the cell mean is unchanged) and high-order-accurate where the bound is slack.
+/// This is the transport-side complement to the bound-preserving *implicit relaxation* solve:
+/// the implicit solve keeps relaxation in-bounds; this keeps the high-order transport in-bounds
+/// (the HWNP positivity failure). The cell mean is assumed admissible (a conservative scheme on
+/// admissible data keeps the mean admissible); if it is not, the element is left untouched.
+pub fn limit_conformation_bounds(mesh: &Mesh2d, c: &mut [Vec<f64>], eps: f64, b_max: f64) {
+    let nn = mesh.refq.n_nodes();
+    let tr_lo = 2.0 * eps.sqrt(); // AM–GM-consistent trace floor for SPD
+    for (e, el) in mesh.elements.iter().enumerate() {
+        let base = e * nn;
+        // Quadrature-weighted cell mean.
+        let (mut wsum, mut mxx, mut mxy, mut myy) = (0.0, 0.0, 0.0, 0.0);
+        for k in 0..nn {
+            let w = el.geom.jw[k];
+            wsum += w;
+            mxx += w * c[0][base + k];
+            mxy += w * c[1][base + k];
+            myy += w * c[2][base + k];
+        }
+        mxx /= wsum;
+        mxy /= wsum;
+        myy /= wsum;
+        // Skip if the mean is itself inadmissible (nothing safe to limit toward).
+        let trm = mxx + myy;
+        if mxx * myy - mxy * mxy < eps || trm < tr_lo || (b_max.is_finite() && trm > b_max) {
+            continue;
+        }
+        // Largest common θ keeping every node admissible.
+        let mut theta = 1.0f64;
+        for k in 0..nn {
+            let (dxx, dxy, dyy) =
+                (c[0][base + k] - mxx, c[1][base + k] - mxy, c[2][base + k] - myy);
+            // det(M + θΔ) = a θ² + b θ + det(M) ≥ ε.
+            let a = dxx * dyy - dxy * dxy;
+            let b = mxx * dyy + myy * dxx - 2.0 * mxy * dxy;
+            let det_m = mxx * myy - mxy * mxy;
+            if det_m + b + a < eps {
+                theta = theta.min(theta_first_root(a, b, det_m - eps));
+            }
+            // tr(M + θΔ) = trm + θ·(dxx+dyy) ∈ [tr_lo, b_max] (linear).
+            let dtr = dxx + dyy;
+            let trn = trm + dtr;
+            if trn < tr_lo {
+                theta = theta.min((tr_lo - trm) / dtr); // dtr < 0 here
+            }
+            if b_max.is_finite() && trn > b_max {
+                theta = theta.min((b_max - trm) / dtr); // dtr > 0 here
+            }
+        }
+        let theta = theta.clamp(0.0, 1.0);
+        if theta < 1.0 {
+            for k in 0..nn {
+                c[0][base + k] = mxx + theta * (c[0][base + k] - mxx);
+                c[1][base + k] = mxy + theta * (c[1][base + k] - mxy);
+                c[2][base + k] = myy + theta * (c[2][base + k] - myy);
+            }
+        }
+    }
+}
+
+/// [`StageHook`](crate::sim::integrate::StageHook) wrapper around [`limit_conformation_bounds`],
+/// applying the scalar-surrogate bound-preserving limiter to the conformation state
+/// `[Cxx, Cxy, Cyy]` after each Runge–Kutta stage.
+pub struct ConformationBoundLimiter {
+    /// Minimum `det C` (SPD floor). Typical `1e-8`–`1e-10`.
+    pub eps: f64,
+    /// Maximum `tr C` (FENE-P extensibility `b`); `f64::INFINITY` to disable.
+    pub b_max: f64,
+}
+
+impl crate::sim::integrate::StageHook for ConformationBoundLimiter {
+    fn after_stage(&self, mesh: &Mesh2d, state: &mut [Vec<f64>], _stage: usize) {
+        limit_conformation_bounds(mesh, state, self.eps, self.b_max);
     }
 }
 
@@ -679,6 +1066,438 @@ mod tests {
         for (v, &ex) in exact.iter().enumerate() {
             let err = c[v].iter().fold(0.0f64, |a, &x| a.max((x - ex).abs()));
             assert!(err < 1e-7, "comp {v}: max err {err}, want {ex}");
+        }
+    }
+
+    #[test]
+    fn relax_exact_matches_analytic_for_any_dt() {
+        // The exact eigenvalue relaxation reproduces C = I + (C₀−I)e^{−τ/λ} to machine
+        // precision for ANY τ — including τ ≫ λ, where an explicit step is unstable.
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let lambda = 0.1;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.0);
+        let c0 = [vec![3.0; lc.ndof()], vec![0.5; lc.ndof()], vec![2.0; lc.ndof()]];
+        let psi0 = lc.from_conformation(&c0);
+        for &dt in &[0.01_f64, 0.1, 1.0, 10.0] {
+            let psi = lc.relax_exact(&psi0, dt);
+            let c = lc.conformation(&psi);
+            let g = (-dt / lambda).exp();
+            let exact = [1.0 + 2.0 * g, 0.5 * g, 1.0 + 1.0 * g];
+            for (v, &ex) in exact.iter().enumerate() {
+                let err = c[v].iter().fold(0.0f64, |a, &x| a.max((x - ex).abs()));
+                assert!(err < 1e-12, "dt={dt} comp {v}: err {err}, want {ex}");
+            }
+        }
+    }
+
+    #[test]
+    fn imex_unlocks_large_timestep_where_explicit_fails() {
+        // At dt = 10λ — far past the explicit stability limit dt ≲ 2.5λ — the IMEX/Strang
+        // step is accurate and SPD, while fully-explicit SSP-RK3 is not. (The unlock.)
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let lambda = 0.1;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.0);
+        let zero = vec![0.0; lc.ndof()];
+        let c0 = [vec![3.0; lc.ndof()], vec![0.5; lc.ndof()], vec![2.0; lc.ndof()]];
+        let psi0 = lc.from_conformation(&c0);
+        let dt = 1.0; // = 10λ
+        let g = (-dt / lambda).exp();
+        let exact = [1.0 + 2.0 * g, 0.5 * g, 1.0 + 1.0 * g];
+
+        // IMEX: accurate and SPD even at dt = 10λ.
+        let psi_imex = lc.step_strang_imex(&psi0, &zero, &zero, dt);
+        let c_imex = lc.conformation(&psi_imex);
+        for i in 0..c_imex[0].len() {
+            let det = c_imex[0][i] * c_imex[2][i] - c_imex[1][i] * c_imex[1][i];
+            assert!(c_imex[0][i] > 0.0 && det > 0.0, "IMEX C not SPD at {i}");
+        }
+        for (v, &ex) in exact.iter().enumerate() {
+            let err = c_imex[v].iter().fold(0.0f64, |a, &x| a.max((x - ex).abs()));
+            assert!(err < 1e-10, "IMEX comp {v}: err {err}, want {ex}");
+        }
+
+        // Explicit SSP-RK3 at the same dt is past its stability limit and does NOT reach
+        // the analytic state (here it diverges to non-finite values) — exactly the wall
+        // IMEX removes. Check finiteness + accuracy explicitly: `f64::max` *absorbs* NaN
+        // (returns the non-NaN arg), so a naive max-reduction would silently read 0.
+        let psi_exp = lc.step_ssp_rk3(&psi0, &zero, &zero, dt);
+        let c_exp = lc.conformation(&psi_exp);
+        let explicit_accurate = c_exp.iter().all(|comp| comp.iter().all(|&x| x.is_finite()))
+            && (0..3).all(|v| c_exp[v].iter().all(|&x| (x - exact[v]).abs() < 1e-2));
+        assert!(!explicit_accurate, "explicit unexpectedly stable & accurate at dt=10λ");
+    }
+
+    #[test]
+    fn strang_imex_recovers_high_wi_steady_shear() {
+        // The Strang IMEX step (transport + exact relaxation) must reach the SAME Wi=10
+        // analytic steady shear state as the fully-explicit path, staying SPD throughout.
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+        let lambda = 1.0;
+        let gdot = 10.0;
+        let wi = lambda * gdot;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.5);
+        let ux = nodal(&mesh, |_, y| gdot * y);
+        let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+        let mut psi = lc.identity();
+        let dt = 0.002;
+        let nsteps = (25.0_f64 / dt).round() as usize;
+        for _ in 0..nsteps {
+            psi = lc.step_strang_imex(&psi, &ux, &uy, dt);
+        }
+        let c = lc.conformation(&psi);
+        for i in 0..c[0].len() {
+            let det = c[0][i] * c[2][i] - c[1][i] * c[1][i];
+            assert!(c[0][i] > 0.0 && det > 0.0, "C not SPD at {i}: det={det}");
+        }
+        let exact = [1.0 + 2.0 * wi * wi, wi, 1.0];
+        for (v, &ex) in exact.iter().enumerate() {
+            let err = c[v].iter().fold(0.0f64, |a, &x| a.max((x - ex).abs()));
+            assert!(err < 1e-2 * ex.max(1.0), "comp {v}: max err {err}, want {ex}");
+        }
+    }
+
+    #[test]
+    fn ark2_imex_recovers_high_wi_steady_shear() {
+        // ARK2 (no splitting error) reaches the same Wi=10 analytic steady shear, SPD throughout.
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+        let lambda = 1.0;
+        let gdot = 10.0;
+        let wi = lambda * gdot;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.5);
+        let ux = nodal(&mesh, |_, y| gdot * y);
+        let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+        let mut psi = lc.identity();
+        let dt = 0.005;
+        let nsteps = (25.0_f64 / dt).round() as usize;
+        for _ in 0..nsteps {
+            psi = lc.step_ark2_imex(&psi, &ux, &uy, dt);
+        }
+        let c = lc.conformation(&psi);
+        for i in 0..c[0].len() {
+            let det = c[0][i] * c[2][i] - c[1][i] * c[1][i];
+            assert!(c[0][i] > 0.0 && det > 0.0, "C not SPD at {i}: det={det}");
+        }
+        let exact = [1.0 + 2.0 * wi * wi, wi, 1.0];
+        for (v, &ex) in exact.iter().enumerate() {
+            let err = c[v].iter().fold(0.0f64, |a, &x| a.max((x - ex).abs()));
+            assert!(err < 1e-2 * ex.max(1.0), "comp {v}: max err {err}, want {ex}");
+        }
+    }
+
+    #[test]
+    fn ark2_imex_is_second_order_in_time() {
+        // Startup of steady shear from C=I is spatially uniform ⇒ the exact transient is
+        // Cxy(t) = Wi(1 − e^{−t/λ}). ARK2 must converge at 2nd order (no splitting error).
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let lambda = 1.0;
+        let gdot = 1.0;
+        let wi = lambda * gdot;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.0);
+        let ux = nodal(&mesh, |_, y| gdot * y);
+        let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+        let t_end = 1.0_f64;
+        let cxy_exact = wi * (1.0 - (-t_end / lambda).exp());
+        let err_at = |dt: f64| -> f64 {
+            let nsteps = (t_end / dt).round() as usize;
+            let mut psi = lc.identity();
+            for _ in 0..nsteps {
+                psi = lc.step_ark2_imex(&psi, &ux, &uy, dt);
+            }
+            let c = lc.conformation(&psi);
+            c[1].iter().fold(0.0f64, |a, &x| a.max((x - cxy_exact).abs()))
+        };
+        let (e1, e2) = (err_at(0.05), err_at(0.025));
+        let rate = (e1 / e2).log2();
+        assert!(rate > 1.8 && rate < 2.3, "ARK2 observed order {rate} (e1={e1}, e2={e2})");
+    }
+
+    #[test]
+    fn ark2_imex_stable_and_spd_at_large_dt() {
+        // Pure relaxation at dt = 10λ: the L-stable implicit relaxation stays finite & SPD
+        // and damps toward equilibrium — where explicit SSP-RK3 would diverge.
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let lambda = 0.1;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.0);
+        let zero = vec![0.0; lc.ndof()];
+        let c0 = [vec![3.0; lc.ndof()], vec![0.5; lc.ndof()], vec![2.0; lc.ndof()]];
+        let mut psi = lc.from_conformation(&c0);
+        let dt = 1.0; // = 10λ
+        for _ in 0..5 {
+            psi = lc.step_ark2_imex(&psi, &zero, &zero, dt);
+            let c = lc.conformation(&psi);
+            for i in 0..c[0].len() {
+                let det = c[0][i] * c[2][i] - c[1][i] * c[1][i];
+                assert!(c[0][i].is_finite() && c[0][i] > 0.0 && det > 0.0, "not finite/SPD at {i}");
+            }
+        }
+        let c = lc.conformation(&psi);
+        assert!(
+            (c[0][0] - 1.0).abs() < 0.2 && c[1][0].abs() < 0.2,
+            "did not relax toward I: Cxx={}, Cxy={}",
+            c[0][0],
+            c[1][0]
+        );
+    }
+
+    #[test]
+    fn ark_imex_generic_matches_bespoke_ark2() {
+        // The generic ArkImex(ars222) driver over the LogConfImex adapter must reproduce the
+        // bespoke `step_ark2_imex` to round-off (Plan §4.5 / Validation 6).
+        use crate::sim::integrate::{ArkImex, ArkTableau};
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let lc = LogConfOldroydB::new(&mesh, 0.5, 1.0);
+        let ux = nodal(&mesh, |_, y| 2.0 * y);
+        let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+        let c0 = [
+            nodal(&mesh, |x, _| 2.0 + 0.5 * x),
+            nodal(&mesh, |x, y| 0.2 * x - 0.1 * y),
+            nodal(&mesh, |_, y| 1.5 + 0.3 * y),
+        ];
+        let psi0 = lc.from_conformation(&c0);
+        let dt = 0.03;
+        let bespoke = lc.step_ark2_imex(&psi0, &ux, &uy, dt);
+        let semi = LogConfImex { model: &lc, ux: &ux, uy: &uy };
+        let ark = ArkImex::new(ArkTableau::ars222(), dt);
+        let state = vec![psi0[0].clone(), psi0[1].clone(), psi0[2].clone()];
+        let generic = ark.step(&semi, &state, 0.0);
+        for v in 0..3 {
+            let err =
+                generic[v].iter().zip(&bespoke[v]).fold(0.0f64, |a, (g, b)| a.max((g - b).abs()));
+            assert!(err < 1e-12, "generic vs bespoke comp {v}: {err}");
+        }
+    }
+
+    #[test]
+    fn giesekus_relax_exact_matches_ode_integration() {
+        // The closed-form Giesekus relaxation flow (Bernoulli) must match a high-resolution
+        // RK4 integration of dc/dt = −(1/λ)[(c−1) + α(c−1)²] per eigenvalue.
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let lambda = 0.7;
+        let alpha = 0.4;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.0).with_mobility(alpha);
+        // Diagonal conformation ⇒ eigenvalues are Cxx, Cyy directly.
+        let c0 = [vec![3.0; lc.ndof()], vec![0.0; lc.ndof()], vec![2.0; lc.ndof()]];
+        let psi0 = lc.from_conformation(&c0);
+        let tau = 0.5_f64;
+        let psi = lc.relax_exact(&psi0, tau);
+        let c = lc.conformation(&psi);
+        // RK4 reference for a scalar eigenvalue.
+        let rk4 = |c_init: f64| -> f64 {
+            let f = |cc: f64| -(1.0 / lambda) * ((cc - 1.0) + alpha * (cc - 1.0).powi(2));
+            let n = 200_000;
+            let h = tau / n as f64;
+            let mut cc = c_init;
+            for _ in 0..n {
+                let k1 = f(cc);
+                let k2 = f(cc + 0.5 * h * k1);
+                let k3 = f(cc + 0.5 * h * k2);
+                let k4 = f(cc + h * k3);
+                cc += h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
+            }
+            cc
+        };
+        let (want_xx, want_yy) = (rk4(3.0), rk4(2.0));
+        assert!((c[0][0] - want_xx).abs() < 1e-8, "Cxx {} vs {}", c[0][0], want_xx);
+        assert!((c[2][0] - want_yy).abs() < 1e-8, "Cyy {} vs {}", c[2][0], want_yy);
+        assert!(c[1][0].abs() < 1e-12, "Cxy stayed zero");
+    }
+
+    #[test]
+    fn giesekus_imex_satisfies_steady_shear_equation() {
+        // ARK2 IMEX with Giesekus mobility α>0 marched to steady shear. The converged
+        // conformation must satisfy the Giesekus steady balance L·C+C·Lᵀ = (1/λ)[(C−I)+α(C−I)²],
+        // and show bounded extension (Cxx < the Oldroyd-B value 1+2Wi²).
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+        let (lambda, gdot, alpha) = (1.0, 2.0, 0.4);
+        let wi = lambda * gdot;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.0).with_mobility(alpha);
+        let ux = nodal(&mesh, |_, y| gdot * y);
+        let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+        let mut psi = lc.identity();
+        let dt = 0.01;
+        for _ in 0..(25.0 / dt) as usize {
+            psi = lc.step_ark2_imex(&psi, &ux, &uy, dt);
+        }
+        let c = lc.conformation(&psi);
+        let mut max_res = 0.0f64;
+        for i in 0..c[0].len() {
+            let (cxx, cxy, cyy) = (c[0][i], c[1][i], c[2][i]);
+            let (a, b, d) = (cxx - 1.0, cxy, cyy - 1.0);
+            // L·C+C·Lᵀ − (1/λ)[(C−I) + α(C−I)²], with L = [[0,γ̇],[0,0]].
+            let res_xx = 2.0 * gdot * cxy - (1.0 / lambda) * (a + alpha * (a * a + b * b));
+            let res_xy = gdot * cyy - (1.0 / lambda) * (b + alpha * b * (a + d));
+            let res_yy = -(1.0 / lambda) * (d + alpha * (b * b + d * d));
+            max_res = max_res.max(res_xx.abs()).max(res_xy.abs()).max(res_yy.abs());
+            assert!(cxx > 0.0 && cxx * cyy - cxy * cxy > 0.0, "C not SPD at {i}");
+        }
+        assert!(max_res < 1e-5, "Giesekus steady residual {max_res}");
+        // Shear-thinning: bounded extension vs Oldroyd-B (1 + 2Wi²).
+        assert!(c[0][0] < 1.0 + 2.0 * wi * wi, "Cxx={} not below Oldroyd-B {}", c[0][0], 1.0 + 2.0 * wi * wi);
+    }
+
+    #[test]
+    fn fenep_implicit_solve_is_consistent_and_bounded() {
+        // The FENE-P implicit solve must (a) satisfy the stage equation Ψ − γ·S(Ψ) = B with
+        // S(Ψ) = (1/λ)(e^{−Ψ} − f·I), and (b) keep tr C < b (Peterlin bound preservation).
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let (lambda, b_ext) = (0.5, 10.0);
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.0).with_extensibility(b_ext);
+        let gamma = 0.05;
+        let nn = mesh.refq.n_nodes();
+        let mut bb = [vec![0.0; lc.ndof()], vec![0.0; lc.ndof()], vec![0.0; lc.ndof()]];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let g = e * nn + k;
+                let (x, y) = (el.geom.x[k], el.geom.y[k]);
+                bb[0][g] = 0.8 + 0.3 * (x + y).sin();
+                bb[1][g] = 0.15 * x - 0.1 * y;
+                bb[2][g] = 0.4 + 0.2 * (x * y).cos();
+            }
+        }
+        let psi = lc.implicit_relax_solve(&bb, gamma);
+        let c = lc.conformation(&psi);
+        let mut max_res = 0.0f64;
+        let mut max_tr = 0.0f64;
+        for i in 0..c[0].len() {
+            let trc = c[0][i] + c[2][i];
+            max_tr = max_tr.max(trc);
+            let f = (1.0 - 2.0 / b_ext) / (1.0 - trc / b_ext);
+            let em = sym_apply(psi[0][i], psi[1][i], psi[2][i], |x| (-x).exp());
+            // S = (1/λ)(e^{−Ψ} − f·I);  residual = Ψ − γ·S − B.
+            let sxx = (em[0] - f) / lambda;
+            let sxy = em[1] / lambda;
+            let syy = (em[2] - f) / lambda;
+            let rxx = psi[0][i] - gamma * sxx - bb[0][i];
+            let rxy = psi[1][i] - gamma * sxy - bb[1][i];
+            let ryy = psi[2][i] - gamma * syy - bb[2][i];
+            max_res = max_res.max(rxx.abs()).max(rxy.abs()).max(ryy.abs());
+        }
+        assert!(max_res < 1e-9, "FENE-P stage residual {max_res}");
+        assert!(max_tr < b_ext, "trace bound violated: {max_tr} ≥ {b_ext}");
+    }
+
+    #[test]
+    fn fenep_imex_steady_shear_respects_trace_bound() {
+        // ARK2 IMEX with FENE-P marched to steady shear: the conformation satisfies the
+        // FENE-P steady balance L·C+C·Lᵀ = (1/λ)[f·C − I], stays SPD, and tr C < b throughout.
+        let p = 4;
+        let mesh = Mesh2d::rectangular(p, 3, 3, [0.0, 1.0], [0.0, 1.0]);
+        let (lambda, gdot, b_ext) = (1.0, 4.0, 20.0);
+        let wi = lambda * gdot;
+        let lc = LogConfOldroydB::new(&mesh, lambda, 1.0).with_extensibility(b_ext);
+        let ux = nodal(&mesh, |_, y| gdot * y);
+        let uy = vec![0.0; mesh.n_elements() * mesh.refq.n_nodes()];
+        let mut psi = lc.identity();
+        let dt = 0.01;
+        for _ in 0..(25.0 / dt) as usize {
+            psi = lc.step_ark2_imex(&psi, &ux, &uy, dt);
+        }
+        let c = lc.conformation(&psi);
+        let mut max_res = 0.0f64;
+        let mut max_tr = 0.0f64;
+        for i in 0..c[0].len() {
+            let (cxx, cxy, cyy) = (c[0][i], c[1][i], c[2][i]);
+            let trc = cxx + cyy;
+            max_tr = max_tr.max(trc);
+            let f = (1.0 - 2.0 / b_ext) / (1.0 - trc / b_ext);
+            let res_xx = 2.0 * gdot * cxy - (1.0 / lambda) * (f * cxx - 1.0);
+            let res_xy = gdot * cyy - (1.0 / lambda) * (f * cxy);
+            let res_yy = -(1.0 / lambda) * (f * cyy - 1.0);
+            max_res = max_res.max(res_xx.abs()).max(res_xy.abs()).max(res_yy.abs());
+            assert!(cxx > 0.0 && cxx * cyy - cxy * cxy > 0.0, "C not SPD at {i}");
+        }
+        assert!(max_res < 1e-4, "FENE-P steady residual {max_res}");
+        assert!(max_tr < b_ext, "trace bound violated: {max_tr} ≥ {b_ext}");
+        // Finite extensibility ⇒ far below the Oldroyd-B extension 1 + 2Wi².
+        assert!(c[0][0] < 1.0 + 2.0 * wi * wi, "Cxx={} not bounded below Oldroyd-B", c[0][0]);
+    }
+
+    fn elem_mean(mesh: &Mesh2d, c: &[Vec<f64>], comp: usize) -> f64 {
+        let nn = mesh.refq.n_nodes();
+        let el = &mesh.elements[0];
+        let (mut ws, mut s) = (0.0, 0.0);
+        for k in 0..nn {
+            let w = el.geom.jw[k];
+            ws += w;
+            s += w * c[comp][k];
+        }
+        s / ws
+    }
+
+    #[test]
+    fn limiter_restores_spd_and_conserves_mean() {
+        // A field with an admissible cell mean but a non-SPD node: the limiter must pull every
+        // node into `det ≥ ε` (SPD) while preserving the (conserved) cell mean exactly.
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 1, 1, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let mut c = [vec![1.0; ndof], vec![0.0; ndof], vec![1.0; ndof]]; // C = I everywhere
+        c[1][0] = 2.0; // node 0: Cxy=2 ⇒ det = 1 − 4 = −3 (non-SPD)
+        let m0 = [elem_mean(&mesh, &c, 0), elem_mean(&mesh, &c, 1), elem_mean(&mesh, &c, 2)];
+        let eps = 1e-8;
+        limit_conformation_bounds(&mesh, &mut c, eps, f64::INFINITY);
+        for i in 0..ndof {
+            let det = c[0][i] * c[2][i] - c[1][i] * c[1][i];
+            assert!(det >= eps * (1.0 - 1e-9) && c[0][i] + c[2][i] > 0.0, "node {i} not SPD: det={det}");
+        }
+        let m1 = [elem_mean(&mesh, &c, 0), elem_mean(&mesh, &c, 1), elem_mean(&mesh, &c, 2)];
+        for v in 0..3 {
+            assert!((m1[v] - m0[v]).abs() < 1e-12, "mean comp {v} not conserved");
+        }
+    }
+
+    #[test]
+    fn limiter_enforces_fene_trace_bound() {
+        // A node overshooting tr C > b is pulled back to tr C ≤ b; in-bounds nodes are kept.
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 1, 1, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let mut c = [vec![2.0; ndof], vec![0.0; ndof], vec![2.0; ndof]]; // tr = 4 everywhere
+        c[0][0] = 15.0;
+        c[2][0] = 5.0; // node 0: tr = 20
+        let b = 8.0;
+        limit_conformation_bounds(&mesh, &mut c, 1e-8, b);
+        for i in 0..ndof {
+            let tr = c[0][i] + c[2][i];
+            assert!(tr <= b * (1.0 + 1e-9), "node {i} tr={tr} > b={b}");
+        }
+    }
+
+    #[test]
+    fn limiter_leaves_admissible_field_unchanged() {
+        // A smooth SPD field well inside the bounds must be untouched (θ = 1, high-order intact).
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let mut c = [vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let (x, y) = (el.geom.x[k], el.geom.y[k]);
+                let g = e * nn + k;
+                c[0][g] = 2.0 + 0.3 * (x + y).sin();
+                c[1][g] = 0.1 * x;
+                c[2][g] = 1.5 + 0.2 * y;
+            }
+        }
+        let orig = c.clone();
+        limit_conformation_bounds(&mesh, &mut c, 1e-8, 50.0);
+        for v in 0..3 {
+            for i in 0..ndof {
+                assert!((c[v][i] - orig[v][i]).abs() < 1e-15, "admissible field altered at {v},{i}");
+            }
         }
     }
 

@@ -244,6 +244,18 @@ path = "src/bin/euler_check.rs"
 name = "logconf-check"
 path = "src/bin/logconf_check.rs"
 
+# Validates the GPU IMEX implicit relaxation solve (gale_gpu::logconf_implicit_relax,
+# Phase 3) vs the CPU oracle + the implicit stage equation.
+[[bin]]
+name = "imex-relax-check"
+path = "src/bin/imex_relax_check.rs"
+
+# Validates the GPU ARK2/ARS(2,2,2) IMEX conformation advance
+# (gale_gpu::logconf_ark2_advance_gpu) vs the CPU oracle step_ark2_imex.
+[[bin]]
+name = "imex-ark-check"
+path = "src/bin/imex_ark_check.rs"
+
 # Validates gale_gpu::multigpu_advection_2d (distributed, 2-device P2P) vs CPU.
 [[bin]]
 name = "multigpu-check"

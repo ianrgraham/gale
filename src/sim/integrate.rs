@@ -190,6 +190,119 @@ impl Integrator for SspRk3 {
     }
 }
 
+/// An **additively-split** semi-discrete operator for IMEX integration:
+/// `∂ₜu = E(u) + S(u)`, with `E` non-stiff (explicit) and `S` stiff (implicit). The stiff
+/// part is consumed through a *local solve* (`solve_implicit`) rather than a global system,
+/// so stiffness never forces a global linear solve. Additive analogue of [`Semi`];
+/// see `docs/plan-imex-relaxation-substep.md` §4.3.
+pub trait ImexSemi {
+    fn n_vars(&self) -> usize;
+    fn ndof(&self) -> usize;
+    /// Non-stiff (explicit) part `E(u)`.
+    fn rhs_explicit(&self, state: &[Vec<f64>], t: f64) -> Vec<Vec<f64>>;
+    /// Stiff source `S(u)` — needed only at explicit stages, where it cannot be recovered
+    /// from a solve.
+    fn rhs_implicit(&self, state: &[Vec<f64>], t: f64) -> Vec<Vec<f64>>;
+    /// Solve the stiff stage `Y − γ·S(Y) = b` for `Y` (a local/elementwise solve).
+    fn solve_implicit(&self, b: &[Vec<f64>], gamma: f64, t: f64) -> Vec<Vec<f64>>;
+}
+
+/// Butcher tableau pair for an additive (IMEX) Runge–Kutta method: an explicit table
+/// `(a_e, b_e)` for the non-stiff part and a diagonally-implicit table `(a_i, b_i)` for the
+/// stiff part, sharing abscissae. `a_i[i][i]` is the implicit-stage coefficient `γᵢ`.
+#[derive(Clone, Debug)]
+pub struct ArkTableau {
+    pub a_e: Vec<Vec<f64>>,
+    pub a_i: Vec<Vec<f64>>,
+    pub b_e: Vec<f64>,
+    pub b_i: Vec<f64>,
+}
+
+impl ArkTableau {
+    /// ARS(2,2,2) (Ascher–Ruuth–Spiteri 1997): L-stable, 2nd-order, stiffly accurate.
+    /// `γ = 1 − √2/2`, `δ = 1 − 1/(2γ)`.
+    pub fn ars222() -> Self {
+        let g = 1.0 - 0.5_f64.sqrt();
+        let d = 1.0 - 1.0 / (2.0 * g);
+        Self {
+            a_e: vec![vec![0.0, 0.0, 0.0], vec![g, 0.0, 0.0], vec![d, 1.0 - d, 0.0]],
+            a_i: vec![vec![0.0, 0.0, 0.0], vec![0.0, g, 0.0], vec![0.0, 1.0 - g, g]],
+            b_e: vec![d, 1.0 - d, 0.0],
+            b_i: vec![0.0, 1.0 - g, g],
+        }
+    }
+    pub fn stages(&self) -> usize {
+        self.b_e.len()
+    }
+}
+
+/// Additive IMEX Runge–Kutta integrator over an [`ImexSemi`]. Drives the generic stage
+/// recursion of `docs/plan-imex-relaxation-substep.md` §2.3, reusing the operator's local
+/// implicit solve. For an implicit stage the stiff value is recovered exactly as
+/// `S_i = (Y_i − B_i)/γ` (free); explicit stages fall back to `rhs_implicit`. (It is its own
+/// integrator rather than an [`Integrator`] impl because it consumes an `ImexSemi`, not a
+/// `Semi`.)
+#[derive(Clone, Debug)]
+pub struct ArkImex {
+    pub tableau: ArkTableau,
+    pub dt: f64,
+}
+
+impl ArkImex {
+    pub fn new(tableau: ArkTableau, dt: f64) -> Self {
+        Self { tableau, dt }
+    }
+    pub fn dt(&self) -> f64 {
+        self.dt
+    }
+
+    /// Advance `state` (layout `[n_vars][ndof]`) by one IMEX step.
+    pub fn step(&self, semi: &dyn ImexSemi, state: &[Vec<f64>], t: f64) -> Vec<Vec<f64>> {
+        let s = self.tableau.stages();
+        let (nv, n, dt) = (semi.n_vars(), semi.ndof(), self.dt);
+        let axpy = |dst: &mut [Vec<f64>], c: f64, src: &[Vec<f64>]| {
+            if c != 0.0 {
+                for v in 0..nv {
+                    for k in 0..n {
+                        dst[v][k] += c * src[v][k];
+                    }
+                }
+            }
+        };
+        let mut e_stage: Vec<Vec<Vec<f64>>> = Vec::with_capacity(s);
+        let mut s_stage: Vec<Vec<Vec<f64>>> = Vec::with_capacity(s);
+        for i in 0..s {
+            // Bᵢ = state + dt Σ_{j<i} (a_e[i][j] E_j + a_i[i][j] S_j)
+            let mut b = state.to_vec();
+            for j in 0..i {
+                axpy(&mut b, dt * self.tableau.a_e[i][j], &e_stage[j]);
+                axpy(&mut b, dt * self.tableau.a_i[i][j], &s_stage[j]);
+            }
+            let gamma = self.tableau.a_i[i][i];
+            let (y, si) = if gamma == 0.0 {
+                let si = semi.rhs_implicit(&b, t); // explicit stage
+                (b, si)
+            } else {
+                let g = dt * gamma;
+                let y = semi.solve_implicit(&b, g, t);
+                let si: Vec<Vec<f64>> = (0..nv)
+                    .map(|v| (0..n).map(|k| (y[v][k] - b[v][k]) / g).collect())
+                    .collect();
+                (y, si)
+            };
+            e_stage.push(semi.rhs_explicit(&y, t));
+            s_stage.push(si);
+        }
+        // uⁿ⁺¹ = state + dt Σ_i (b_e[i] E_i + b_i[i] S_i)
+        let mut out = state.to_vec();
+        for i in 0..s {
+            axpy(&mut out, dt * self.tableau.b_e[i], &e_stage[i]);
+            axpy(&mut out, dt * self.tableau.b_i[i], &s_stage[i]);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

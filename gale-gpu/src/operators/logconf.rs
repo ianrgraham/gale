@@ -172,6 +172,115 @@ mod kernels {
             *o = -adv_yy + rot_yy + 2.0 * byy + inv_lambda * (em_yy - 1.0);
         }
     }
+
+    /// Per-node IMEX implicit relaxation solve (Phase 3). Solves `Ψ − γ·S(Ψ) = B` with
+    /// `S(Ψ) = (1/λ)(e^{−Ψ} − I)` by eigendecomposing the RHS `B` and, per eigenvalue `μ`,
+    /// Newton-solving the scalar `ψ − (γ/λ)(e^{−ψ} − 1) = μ` (monotone ⇒ globally
+    /// convergent), then recomposing in `B`'s eigenframe. Purely pointwise (no neighbour
+    /// data); mirrors `gale::dg::LogConfOldroydB::implicit_relax_solve`. One node per thread.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn implicit_relax(
+        bxx: &[f64], bxy: &[f64], byy: &[f64],
+        gamma: f64, inv_lambda: f64, alpha: f64, ext: f64, n1: u32,
+        mut oxx: DisjointSlice<f64>, mut oxy: DisjointSlice<f64>, mut oyy: DisjointSlice<f64>,
+    ) {
+        let nn = (n1 as usize) * (n1 as usize);
+        let e = thread::blockIdx_x() as usize;
+        let m = thread::threadIdx_x() as usize;
+        let b = e * nn + m;
+        let (p, q, r) = (bxx[b], bxy[b], byy[b]);
+        // Eigendecompose B (atan2-free, identical to the psi_rhs frame).
+        let tr = 0.5 * (p + r);
+        let diff = p - r;
+        let rad = (0.25 * diff * diff + q * q).sqrt();
+        let mu1 = tr + rad;
+        let mu2 = tr - rad;
+        let mu1r = mu1 - r;
+        let nrm = (mu1r * mu1r + q * q).sqrt();
+        let (c0, s0) = if nrm > 1e-300 { (mu1r / nrm, q / nrm) } else { (0.0, 1.0) };
+        let gl = gamma * inv_lambda;
+        let mut psi1 = mu1;
+        let mut psi2 = mu2;
+        if ext < 1e300 {
+            // FENE-P: bisection on the trace T ∈ (0, b). For a trial T, each eigenvalue solves
+            // the monotone scalar ψ − (γ/λ)e^{−ψ} = μ − (γ/λ)f(T); consistency Σe^{ψ_i} = T is a
+            // monotone 1-D root. The bracket keeps T < b ⇒ bound-preserving.
+            let mut lo = 1e-12;
+            let mut hi = ext * (1.0 - 1e-12);
+            let mut it = 0usize;
+            while it < 80 {
+                let t = 0.5 * (lo + hi);
+                let ff = (1.0 - 2.0 / ext) / (1.0 - t / ext);
+                let beta1 = mu1 - gl * ff;
+                let mut q1 = mu1;
+                let mut j1 = 0usize;
+                while j1 < 50 {
+                    let e = (-q1).exp();
+                    let st = (q1 - gl * e - beta1) / (1.0 + gl * e);
+                    q1 -= st;
+                    if st.abs() < 1e-14 {
+                        break;
+                    }
+                    j1 += 1;
+                }
+                let beta2 = mu2 - gl * ff;
+                let mut q2 = mu2;
+                let mut j2 = 0usize;
+                while j2 < 50 {
+                    let e = (-q2).exp();
+                    let st = (q2 - gl * e - beta2) / (1.0 + gl * e);
+                    q2 -= st;
+                    if st.abs() < 1e-14 {
+                        break;
+                    }
+                    j2 += 1;
+                }
+                psi1 = q1;
+                psi2 = q2;
+                if q1.exp() + q2.exp() - t > 0.0 {
+                    lo = t;
+                } else {
+                    hi = t;
+                }
+                it += 1;
+            }
+        } else {
+            // Oldroyd-B (α=0) / Giesekus Newton per eigenvalue:
+            //   g(ψ) = ψ + (γ/λ)(1−e^{−ψ}) + (γα/λ)(e^ψ−1)²e^{−ψ} − μ,  g′ > 0.
+            let mut it = 0usize;
+            while it < 60 {
+                let em1 = (-psi1).exp();
+                let ep1 = psi1.exp();
+                let w1 = ep1 - 1.0;
+                let g1 = psi1 + gl * (1.0 - em1) + gl * alpha * w1 * w1 * em1 - mu1;
+                let gp1 = 1.0 + gl * em1 * (1.0 + alpha * (ep1 * ep1 - 1.0));
+                let step1 = g1 / gp1;
+                psi1 -= step1;
+                let em2 = (-psi2).exp();
+                let ep2 = psi2.exp();
+                let w2 = ep2 - 1.0;
+                let g2 = psi2 + gl * (1.0 - em2) + gl * alpha * w2 * w2 * em2 - mu2;
+                let gp2 = 1.0 + gl * em2 * (1.0 + alpha * (ep2 * ep2 - 1.0));
+                let step2 = g2 / gp2;
+                psi2 -= step2;
+                if step1.abs() < 1e-14 && step2.abs() < 1e-14 {
+                    break;
+                }
+                it += 1;
+            }
+        }
+        // Recompose Ψ = R diag(ψ1, ψ2) Rᵀ.
+        if let Some(o) = oxx.get_mut(thread::index_1d()) {
+            *o = c0 * c0 * psi1 + s0 * s0 * psi2;
+        }
+        if let Some(o) = oxy.get_mut(thread::index_1d()) {
+            *o = c0 * s0 * (psi1 - psi2);
+        }
+        if let Some(o) = oyy.get_mut(thread::index_1d()) {
+            *o = s0 * s0 * psi1 + c0 * c0 * psi2;
+        }
+    }
 }
 
 /// Compute the log-conformation (Fattal–Kupferman) Ψ time-derivative `∂ₜΨ` on the
@@ -239,4 +348,45 @@ pub fn logconf_psi_rhs(
         &mut dxx, &mut dxy, &mut dyy,
     )?;
     Ok([dxx.to_host_vec(&stream)?, dxy.to_host_vec(&stream)?, dyy.to_host_vec(&stream)?])
+}
+
+/// GPU per-node IMEX implicit relaxation solve (Phase 3): solve `Ψ − γ·S(Ψ) = B` for the
+/// log-conformation `Ψ`, where `S(Ψ) = (1/λ)(e^{−Ψ} − I)` and `B = b` is the accumulated
+/// explicit stage. Host wrapper around [`kernels::implicit_relax`]; the solve is local and
+/// pointwise (one thread per node, no halo). Matches the CPU oracle
+/// `gale::dg::LogConfOldroydB::implicit_relax_solve` to round-off. `gamma` is the stage
+/// coefficient `dt·a^I_{ii}`; `b` is the `[Bxx, Bxy, Byy]` RHS, each `n_elements·n_nodes` long.
+pub fn logconf_implicit_relax(
+    mesh: &Mesh2d,
+    lc: &LogConfOldroydB,
+    b: &[Vec<f64>; 3],
+    gamma: f64,
+) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
+    let nn = mesh.refq.n_nodes();
+    let ne = mesh.n_elements();
+    let ndof = ne * nn;
+    let n1 = mesh.order + 1;
+    for c in b {
+        assert_eq!(c.len(), ndof, "B component length must be n_elements·n_nodes");
+    }
+    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let bxx_d = up(&b[0])?;
+    let bxy_d = up(&b[1])?;
+    let byy_d = up(&b[2])?;
+    let mut oxx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut oxy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut oyy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+
+    let module = kernels::load(&ctx)?;
+    let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
+    module.implicit_relax(
+        &stream, cfg, &bxx_d, &bxy_d, &byy_d,
+        gamma, lc.lambda.recip(), lc.mobility, lc.extensibility, n1 as u32,
+        &mut oxx, &mut oxy, &mut oyy,
+    )?;
+    Ok([oxx.to_host_vec(&stream)?, oxy.to_host_vec(&stream)?, oyy.to_host_vec(&stream)?])
 }
