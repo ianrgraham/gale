@@ -170,6 +170,22 @@ thread visits only the faces it's on. No scan, no new arrays, kernel signature u
 the bit-for-bit operator validators confirm the convention. Operator **p=4 46→28 µs
 (1.63×), p=8 96→66 µs (1.45×)**; BW now 35–62%. Done 2D + 3D.
 
+## Shared-memory right-sizing (3D)
+
+The kernels declared `SharedArray<f64, NN_MAX>` (compile-time worst case: 2D 81 = order-8,
+3D 125 = order-4), reserving that much shared per block *regardless of the runtime order*.
+A/B (right-sized vs NN_MAX-sized shared):
+
+- **2D: no change** — the 32-blocks/SM hardware cap binds before shared does, so
+  over-reserving costs nothing.
+- **3D, p=3: solve 12.8 → 8.2 ms (1.56×)** — each 3D block needs ~4 KB shared (`DS` +
+  packed `P` pr/ps/pt), so occupancy is genuinely shared-bound at the order we run.
+
+Fixed `gradient3d`/`operator3d` with **`DynamicSharedArray`** sized to the runtime element
+via `LaunchConfig::shared_mem_bytes` (gradient 2·nn·8, operator 4·nn·8). This captures the
+full p=3 win (12.8 → 8.3 ms/solve) *and* preserves p=4 support (no static cap) — unlike just
+lowering NN_MAX. 2D left static (nothing to gain). Bit-for-bit validated.
+
 - **P5 (multi-element-per-block) — assessed, deferred.** After the face fix, P5's only
   remaining headroom is low-order occupancy (p=2 ~35%; p=4 gradient 74% / operator 44%;
   p≥6 gradient near-saturated) — ~1.1–1.4× on the matvec at p=4, fading by p=8, for a fiddly
