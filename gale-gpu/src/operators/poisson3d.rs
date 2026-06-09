@@ -16,13 +16,12 @@
 //! (the NVVM-text backend mis-parses very wide signatures).
 
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
-use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
+use cuda_device::{kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
 use cuda_host::cuda_module;
 use gale::dg::{Face, Mesh3d, Neighbor3};
 use std::sync::Arc;
 
 const NN_MAX: usize = 125; // (p+1)³ up to p=4
-const P3MAX: usize = 3 * NN_MAX; // packed 3-vector shared arrays
 const RED: usize = 256; // reduction block size
 const BND: u32 = u32::MAX; // Dirichlet boundary face (SIPG consistency+penalty)
 const NEU: u32 = u32::MAX - 1; // Neumann boundary face (natural BC ⇒ no contribution)
@@ -40,17 +39,19 @@ mod kernels {
         d: &[f64], u: &[f64], met: &[f64], n1: u32,
         mut gx: DisjointSlice<f64>, mut gy: DisjointSlice<f64>, mut gz: DisjointSlice<f64>,
     ) {
-        static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut US: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        // Dynamic shared sized to the runtime element (`shared_mem_bytes = 2·nn·8` at
+        // launch), not the compile-time `NN_MAX` worst case — so a low-order solve doesn't
+        // over-reserve shared and throttle SM occupancy. Layout: DS=[0,nn), US=[nn,2nn).
         let n1 = n1 as usize;
         let n2 = n1 * n1;
         let nn = n1 * n2;
+        let sm = DynamicSharedArray::<f64>::get();
         let e = thread::blockIdx_x() as usize;
         let m = thread::threadIdx_x() as usize;
         let b = e * nn + m;
         unsafe {
-            DS[m] = d[m];
-            US[m] = u[b];
+            *sm.add(m) = d[m];
+            *sm.add(nn + m) = u[b];
         }
         thread::sync_threads();
         let i = m % n1;
@@ -62,9 +63,9 @@ mod kernels {
         let mut a = 0usize;
         while a < n1 {
             unsafe {
-                ur += DS[i * n1 + a] * US[a + j * n1 + k * n2];
-                us += DS[j * n1 + a] * US[i + a * n1 + k * n2];
-                ut += DS[k * n1 + a] * US[i + j * n1 + a * n2];
+                ur += *sm.add(i * n1 + a) * *sm.add(nn + a + j * n1 + k * n2);
+                us += *sm.add(j * n1 + a) * *sm.add(nn + i + a * n1 + k * n2);
+                ut += *sm.add(k * n1 + a) * *sm.add(nn + i + j * n1 + a * n2);
             }
             a += 1;
         }
@@ -93,24 +94,27 @@ mod kernels {
         _face_vl: &[u32], fmet: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64,
         mut out: DisjointSlice<f64>,
     ) {
-        static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut P: SharedArray<f64, P3MAX> = SharedArray::UNINIT; // packed pr/ps/pt
+        // Dynamic shared sized to the runtime element (`shared_mem_bytes = 4·nn·8` at
+        // launch), not the compile-time `NN_MAX`/`P3MAX` worst case — right-sizing this is a
+        // ~1.5× win on the 3D solve at the orders we run (occupancy is shared-bound here).
+        // Layout: DS=[0,nn); packed P pr/ps/pt = [nn,2nn)/[2nn,3nn)/[3nn,4nn).
         let n1 = n1 as usize;
         let n2 = n1 * n1;
         let nn = n1 * n2;
+        let sm = DynamicSharedArray::<f64>::get();
         let e = thread::blockIdx_x() as usize;
         let m = thread::threadIdx_x() as usize;
         let b = e * nn + m;
         let mo = b * 9;
         unsafe {
-            DS[m] = d[m];
+            *sm.add(m) = d[m];
             // Volume flux W·∇u, projected to (r,s,t) contravariant directions (rows).
             let wx = jw[b] * gx[b];
             let wy = jw[b] * gy[b];
             let wz = jw[b] * gz[b];
-            P[m] = met[mo] * wx + met[mo + 1] * wy + met[mo + 2] * wz;
-            P[NN_MAX + m] = met[mo + 3] * wx + met[mo + 4] * wy + met[mo + 5] * wz;
-            P[2 * NN_MAX + m] = met[mo + 6] * wx + met[mo + 7] * wy + met[mo + 8] * wz;
+            *sm.add(nn + m) = met[mo] * wx + met[mo + 1] * wy + met[mo + 2] * wz;
+            *sm.add(2 * nn + m) = met[mo + 3] * wx + met[mo + 4] * wy + met[mo + 5] * wz;
+            *sm.add(3 * nn + m) = met[mo + 6] * wx + met[mo + 7] * wy + met[mo + 8] * wz;
         }
         // Face contribution by **direct membership** (race-free; the 3D analogue of the 2D
         // operator). A hex node m=(ii,jj,kk) lies on at most 3 of the 6 faces (an element
@@ -170,9 +174,9 @@ mod kernels {
         }
         // Subtract the symmetry-lift sources (project H to (r,s,t) like the volume).
         unsafe {
-            P[m] -= met[mo] * hx + met[mo + 1] * hy + met[mo + 2] * hz;
-            P[NN_MAX + m] -= met[mo + 3] * hx + met[mo + 4] * hy + met[mo + 5] * hz;
-            P[2 * NN_MAX + m] -= met[mo + 6] * hx + met[mo + 7] * hy + met[mo + 8] * hz;
+            *sm.add(nn + m) -= met[mo] * hx + met[mo + 1] * hy + met[mo + 2] * hz;
+            *sm.add(2 * nn + m) -= met[mo + 3] * hx + met[mo + 4] * hy + met[mo + 5] * hz;
+            *sm.add(3 * nn + m) -= met[mo + 6] * hx + met[mo + 7] * hy + met[mo + 8] * hz;
         }
         thread::sync_threads();
         let i = m % n1;
@@ -182,9 +186,9 @@ mod kernels {
         let mut a = 0usize;
         while a < n1 {
             unsafe {
-                acc += DS[a * n1 + i] * P[a + j * n1 + k * n2];
-                acc += DS[a * n1 + j] * P[NN_MAX + i + a * n1 + k * n2];
-                acc += DS[a * n1 + k] * P[2 * NN_MAX + i + j * n1 + a * n2];
+                acc += *sm.add(a * n1 + i) * *sm.add(nn + a + j * n1 + k * n2);
+                acc += *sm.add(a * n1 + j) * *sm.add(2 * nn + i + a * n1 + k * n2);
+                acc += *sm.add(a * n1 + k) * *sm.add(3 * nn + i + j * n1 + a * n2);
             }
             a += 1;
         }
@@ -355,7 +359,7 @@ pub fn poisson3d_apply(mesh: &Mesh3d, u: &[f64], alpha: f64, reaction: f64) -> R
     let mut gz_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
     let mut out_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
     let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: 0 };
+    let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: (4 * ma.nn * 8) as u32 };
     module.gradient3d(&stream, cfg, &d_dev, &u_dev, &met_dev, ma.n1, &mut gx_dev, &mut gy_dev, &mut gz_dev)?;
     module.operator3d(
         &stream, cfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &gz_dev, &met_dev, &jw_dev, ma.n1,
@@ -427,7 +431,7 @@ fn cg3d_impl(mesh: &Mesh3d, b: &[f64], alpha: f64, reaction: f64, neumann_tags: 
     let ones = up(&vec![1.0f64; ndof])?;
 
     let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: 0 };
+    let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: (4 * ma.nn * 8) as u32 };
     let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
@@ -606,7 +610,7 @@ impl GpuPoisson3d {
         let mut partial = DeviceBuffer::<f64>::zeroed(stream, nb)?;
         let ones = up(&vec![1.0f64; ndof])?;
 
-        let cfg = LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: (self.nn as u32, 1, 1), shared_mem_bytes: 0 };
+        let cfg = LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: (self.nn as u32, 1, 1), shared_mem_bytes: (4 * self.nn * 8) as u32 };
         let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
         let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
         let n1 = self.n1;
