@@ -51,9 +51,15 @@ SPD for a symmetric 2×2), plus `tr C ≤ b` (FENE). Zhang–Shu / Christner–C
    case the research §9 flags as open. So `limit_conformation_bounds` stays on uniform `θ` (correct, fully
    tensor-conservative); the knapsack primitive is the building block for the eventual subcell/multi-constraint
    tensor limiter.
-3. **Log-conformation variant.** In `Ψ`-space, `C = exp(Ψ)` is SPD *by construction* — so the SPD limiter
-   is moot there; only the FENE bound `tr exp(Ψ) ≤ b` can be violated (nonlinear in `Ψ`). A log-conf
-   limiter would scale `Ψ` toward its mean to satisfy the scalar trace surrogate.
+3. ✅ **Log-conformation variant done (2026-06-09).** `limit_logconf_trace_bound(mesh, psi, b_max)` +
+   `LogConfTraceLimiter` StageHook. In `Ψ`-space `C = exp(Ψ)` is SPD by construction (SPD limiter moot);
+   only `tr exp(Ψ) ≤ b` can be violated. Per element it scales `Ψ` toward its mean by the largest common
+   `θ` keeping every node's `tr exp(Ψ) ≤ b` — and since `tr exp(·)` is **convex** (blend affine in `θ`),
+   `g(θ)=tr exp(Ψ̄+θΔ)` is convex with `g(0)≤b<g(1)`, so the crossing is a robust **bisection**. Conserves
+   the **mean of `Ψ`** (not of `C` — the standard log-conf trade-off, documented); no-op where slack /
+   `b=∞`. Tests: `logconf_limiter_enforces_trace_bound_and_keeps_spd` (tr C ≤ b, SPD, Ψ-mean conserved),
+   `logconf_limiter_leaves_admissible_unchanged`. Note: in the FENE-P *IMEX* path the implicit solve already
+   bounds the step's *final* `tr C`; this limiter covers the *transport/explicit* overshoot (and non-IMEX paths).
 4. **GPU port.** The limiter is element-local (one block per element, a reduction for the mean + per-node
    `θ` + a min-reduction) — fits the established `gale-gpu` kernel pattern.
 5. **AMR / mortar interaction.** Verify the limiter composes with 2:1 non-conforming interfaces (the

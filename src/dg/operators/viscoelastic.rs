@@ -1055,6 +1055,81 @@ fn knapsack_theta(weights: &[f64], devs: &[f64], caps: &[f64]) -> Vec<f64> {
     theta(0.5 * (lo + hi))
 }
 
+/// **Log-conformation** bound-preserving limiter. In `Ψ`-space `C = exp(Ψ)` is SPD *by
+/// construction*, so the only violable bound is the FENE-P trace `tr C = tr exp(Ψ) ≤ b`. Per
+/// element it scales each node's `Ψ` deviation from the cell mean toward the mean by the largest
+/// common `θ ∈ [0,1]` keeping every node's `tr exp(Ψ) ≤ b`. Because `tr exp(·)` is convex (and the
+/// blend is affine in `θ`), `g(θ) = tr exp(Ψ̄ + θΔ)` is convex with `g(0) ≤ b < g(1)` at a violating
+/// node ⇒ a single crossing, found by bisection. **Conserves the mean of `Ψ`** (not of `C` — the
+/// usual log-conformation trade-off); leaves the field untouched where the bound is slack (incl.
+/// `b = ∞`, the non-FENE case). Pairs with the FENE-P implicit solve (which bounds *relaxation*)
+/// to keep the high-order *transport* under the extensibility limit.
+pub fn limit_logconf_trace_bound(mesh: &Mesh2d, psi: &mut [Vec<f64>], b_max: f64) {
+    if !b_max.is_finite() {
+        return;
+    }
+    let nn = mesh.refq.n_nodes();
+    let tr_exp = |a: f64, b: f64, d: f64| -> f64 {
+        let (m1, m2, _, _) = sym_eig(a, b, d);
+        m1.exp() + m2.exp()
+    };
+    for (e, el) in mesh.elements.iter().enumerate() {
+        let base = e * nn;
+        let (mut ws, mut mxx, mut mxy, mut myy) = (0.0, 0.0, 0.0, 0.0);
+        for k in 0..nn {
+            let w = el.geom.jw[k];
+            ws += w;
+            mxx += w * psi[0][base + k];
+            mxy += w * psi[1][base + k];
+            myy += w * psi[2][base + k];
+        }
+        mxx /= ws;
+        mxy /= ws;
+        myy /= ws;
+        if tr_exp(mxx, mxy, myy) > b_max {
+            continue; // mean already over the bound — nothing safe to limit toward
+        }
+        let mut theta = 1.0f64;
+        for k in 0..nn {
+            let (dxx, dxy, dyy) =
+                (psi[0][base + k] - mxx, psi[1][base + k] - mxy, psi[2][base + k] - myy);
+            if tr_exp(mxx + dxx, mxy + dxy, myy + dyy) > b_max {
+                // g(θ) = tr exp(Ψ̄ + θΔ) convex, g(0) ≤ b < g(1): bisect the unique crossing.
+                let (mut lo, mut hi) = (0.0f64, 1.0f64);
+                for _ in 0..60 {
+                    let mid = 0.5 * (lo + hi);
+                    if tr_exp(mxx + mid * dxx, mxy + mid * dxy, myy + mid * dyy) <= b_max {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                theta = theta.min(lo);
+            }
+        }
+        if theta < 1.0 {
+            for k in 0..nn {
+                psi[0][base + k] = mxx + theta * (psi[0][base + k] - mxx);
+                psi[1][base + k] = mxy + theta * (psi[1][base + k] - mxy);
+                psi[2][base + k] = myy + theta * (psi[2][base + k] - myy);
+            }
+        }
+    }
+}
+
+/// [`StageHook`](crate::sim::integrate::StageHook) wrapper for [`limit_logconf_trace_bound`],
+/// enforcing `tr exp(Ψ) ≤ b_max` on the log-conformation state after each Runge–Kutta stage.
+pub struct LogConfTraceLimiter {
+    /// FENE-P extensibility `b` (max `tr C`).
+    pub b_max: f64,
+}
+
+impl crate::sim::integrate::StageHook for LogConfTraceLimiter {
+    fn after_stage(&self, mesh: &Mesh2d, state: &mut [Vec<f64>], _stage: usize) {
+        limit_logconf_trace_bound(mesh, state, self.b_max);
+    }
+}
+
 /// Bound-preserving limiter for a **scalar** field `u` to `[lo, hi]`, using the
 /// quadratic-knapsack optimal per-node blending ([`knapsack_theta`]) — conservative (cell mean
 /// preserved), high-order where the bound is slack, and **less dissipative than the uniform
@@ -1730,6 +1805,66 @@ mod tests {
         limit_scalar_bounds(&mesh, &mut u, 0.0, 1.0);
         for i in 0..ndof {
             assert!((u[i] - orig[i]).abs() < 1e-15, "admissible scalar altered at {i}");
+        }
+    }
+
+    #[test]
+    fn logconf_limiter_enforces_trace_bound_and_keeps_spd() {
+        // A log-conf field with tr exp(Ψ) > b at a node (admissible mean): the limiter pulls
+        // every node to tr C ≤ b; C = exp(Ψ) stays SPD for free; the Ψ-mean is conserved.
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 1, 1, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let lc = LogConfOldroydB::new(&mesh, 1.0, 1.0);
+        let mut psi = [vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]]; // Ψ=0 ⇒ C=I, tr=2
+        psi[0][0] = 3.0; // node 0: eigenvalues 3,0 ⇒ tr C = e³ + 1 ≈ 21
+        let b = 10.0;
+        let el = &mesh.elements[0];
+        let mean = |psi: &[Vec<f64>; 3], comp: usize| -> f64 {
+            let (mut ws, mut s) = (0.0, 0.0);
+            for k in 0..nn {
+                ws += el.geom.jw[k];
+                s += el.geom.jw[k] * psi[comp][k];
+            }
+            s / ws
+        };
+        let m0 = [mean(&psi, 0), mean(&psi, 1), mean(&psi, 2)];
+        limit_logconf_trace_bound(&mesh, &mut psi, b);
+        let c = lc.conformation(&psi);
+        for i in 0..ndof {
+            let tr = c[0][i] + c[2][i];
+            assert!(tr <= b * (1.0 + 1e-9), "node {i} tr C = {tr} > b = {b}");
+            assert!(c[0][i] * c[2][i] - c[1][i] * c[1][i] > 0.0, "C not SPD (impossible in log-conf)");
+        }
+        let m1 = [mean(&psi, 0), mean(&psi, 1), mean(&psi, 2)];
+        for v in 0..3 {
+            assert!((m1[v] - m0[v]).abs() < 1e-12, "Ψ-mean comp {v} not conserved");
+        }
+    }
+
+    #[test]
+    fn logconf_limiter_leaves_admissible_unchanged() {
+        let p = 3;
+        let mesh = Mesh2d::rectangular(p, 2, 2, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let mut psi = [vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let (x, y) = (el.geom.x[k], el.geom.y[k]);
+                let g = e * nn + k;
+                psi[0][g] = 0.3 * (x + y).sin(); // small Ψ ⇒ tr C ~ 2–3 ≪ b
+                psi[1][g] = 0.1 * x;
+                psi[2][g] = 0.2 * y;
+            }
+        }
+        let orig = psi.clone();
+        limit_logconf_trace_bound(&mesh, &mut psi, 50.0);
+        for v in 0..3 {
+            for i in 0..ndof {
+                assert!((psi[v][i] - orig[v][i]).abs() < 1e-15, "admissible Ψ altered at {v},{i}");
+            }
         }
     }
 
