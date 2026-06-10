@@ -265,6 +265,14 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         self
     }
 
+    /// Override the per-step elliptic-solve relative tolerance (default `1e-10`). In a
+    /// time-accurate run the solve only needs to be as accurate as the time-discretization
+    /// error, so a looser tol can cut iterations with no loss in the physical solution.
+    pub fn with_tol(mut self, tol: f64) -> Self {
+        self.tol = tol;
+        self
+    }
+
     /// Solver with **per-region** boundary conditions — the GPU analogue of
     /// `gale::dg::Stokes::with_bcs`. Each boundary tag is routed via `bcs` to the right
     /// pair of operator settings (no-slip/inflow ⇒ velocity-Dirichlet + pressure-Neumann;
@@ -676,6 +684,7 @@ pub struct GpuStokesIntegrator {
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
     mg_velx: RefCell<Option<GpuPoissonMg>>,
     mg_vely: RefCell<Option<GpuPoissonMg>>,
+    solve_tol: f64,
 }
 
 impl GpuStokesIntegrator {
@@ -694,6 +703,7 @@ impl GpuStokesIntegrator {
             mg_pressure: RefCell::new(None),
             mg_velx: RefCell::new(None),
             mg_vely: RefCell::new(None),
+            solve_tol: 1e-10,
         }
     }
 
@@ -705,6 +715,15 @@ impl GpuStokesIntegrator {
     ) -> Self {
         self.bc_u = Box::new(bc_u);
         self.bc_v = Box::new(bc_v);
+        self
+    }
+
+    /// Set the per-step elliptic-solve tolerance (default `1e-10`). For a time-accurate run set
+    /// this ~1–2 orders below the time-discretization error: the physical solution is unchanged
+    /// while iterations drop sharply (e.g. 1e-10→1e-4 cut a pressure solve 29→11 iters with the
+    /// trajectory error flat — see the `solve-tol-sweep` bin).
+    pub fn with_solve_tol(mut self, tol: f64) -> Self {
+        self.solve_tol = tol;
         self
     }
 }
@@ -728,7 +747,7 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
         let mg_handle = self.mg_pressure.borrow();
         let mg_vx = self.mg_velx.borrow();
         let mg_vy = self.mg_vely.borrow();
-        let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt);
+        let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt).with_tol(self.solve_tol);
         if let Some(h) = handle.as_ref() {
             stokes = stokes.with_handle(h);
         }
@@ -788,6 +807,7 @@ pub struct GpuDualSplitting {
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
     mg_velx: RefCell<Option<GpuPoissonMg>>,
     mg_vely: RefCell<Option<GpuPoissonMg>>,
+    solve_tol: f64,
 }
 
 impl GpuDualSplitting {
@@ -812,6 +832,7 @@ impl GpuDualSplitting {
             mg_pressure: RefCell::new(None),
             mg_velx: RefCell::new(None),
             mg_vely: RefCell::new(None),
+            solve_tol: 1e-10,
         }
     }
 
@@ -831,6 +852,14 @@ impl GpuDualSplitting {
     /// GPU flow step through [`GpuStokes::with_bcs`].
     pub fn boundary_conditions(mut self, bcs: BoundaryConditions) -> Self {
         self.bcs = Some(bcs);
+        self
+    }
+
+    /// Set the per-step elliptic-solve tolerance (default `1e-10`); see
+    /// [`GpuStokesIntegrator::with_solve_tol`]. In a time-accurate run a looser tol (~1–2 orders
+    /// below the time-discretization error) cuts iterations with no change to the trajectory.
+    pub fn with_solve_tol(mut self, tol: f64) -> Self {
+        self.solve_tol = tol;
         self
     }
 
@@ -886,7 +915,7 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
         let mg_vx = self.mg_velx.borrow();
         let mg_vy = self.mg_vely.borrow();
         let (nux, nuy) = if let Some(bcs) = &self.bcs {
-            let mut stokes = GpuStokes::with_bcs(&state.mesh, self.alpha, self.nu, self.dt, bcs);
+            let mut stokes = GpuStokes::with_bcs(&state.mesh, self.alpha, self.nu, self.dt, bcs).with_tol(self.solve_tol);
             stokes.convection_scheme = self.convection_scheme;
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
@@ -904,7 +933,7 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
                 .step_ns_forced_bc(&ux, &uy, t_new, bcs, &bx, &by)
                 .expect("gale-gpu: GpuDualSplitting BC step failed")
         } else {
-            let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt);
+            let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt).with_tol(self.solve_tol);
             stokes.convection_scheme = self.convection_scheme;
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
@@ -1098,6 +1127,7 @@ pub struct GpuViscoelasticDualSplitting {
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
     mg_velx: RefCell<Option<GpuPoissonMg>>,
     mg_vely: RefCell<Option<GpuPoissonMg>>,
+    solve_tol: f64,
 }
 
 impl GpuViscoelasticDualSplitting {
@@ -1134,7 +1164,16 @@ impl GpuViscoelasticDualSplitting {
             mg_pressure: RefCell::new(None),
             mg_velx: RefCell::new(None),
             mg_vely: RefCell::new(None),
+            solve_tol: 1e-10,
         }
+    }
+
+    /// Set the per-step elliptic-solve tolerance (default `1e-10`); see
+    /// [`GpuStokesIntegrator::with_solve_tol`]. Looser (matched to the time-discretization error)
+    /// cuts the velocity/pressure iterations with no change to the trajectory.
+    pub fn with_solve_tol(mut self, tol: f64) -> Self {
+        self.solve_tol = tol;
+        self
     }
 
     /// Set the Dirichlet velocity boundary conditions `(bc_u, bc_v)`.
@@ -1232,7 +1271,7 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             let mg_handle = self.mg_pressure.borrow();
             let mg_vx = self.mg_velx.borrow();
             let mg_vy = self.mg_vely.borrow();
-            let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.eta_s, self.dt);
+            let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.eta_s, self.dt).with_tol(self.solve_tol);
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
             }

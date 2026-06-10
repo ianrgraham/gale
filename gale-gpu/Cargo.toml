@@ -195,6 +195,11 @@ path = "src/bin/mg_wallclock_bench.rs"
 name = "mg-profile"
 path = "src/bin/mg_profile.rs"
 
+# Over-solving check: per-step solve tol vs time-discretization error + iteration cost.
+[[bin]]
+name = "solve-tol-sweep"
+path = "src/bin/solve_tol_sweep.rs"
+
 # Validates the persistent GpuPoisson solver handle (P4) vs the one-shot solvers.
 [[bin]]
 name = "poisson-handle-check"
