@@ -56,6 +56,10 @@ pub struct PMultigrid {
     pub orders: Vec<usize>,
     pub meshes: Vec<Mesh2d>,
     pub alpha: f64,
+    /// Helmholtz reaction `λ` (the `λM` term, `M = diag(jw)`). `0` ⇒ pure Poisson. The same
+    /// physical `λ` is used at every p-level (the per-order mass differs); applied via
+    /// `Poisson::with_reaction`, so the diagonal and smoother weights pick it up.
+    reaction: f64,
     interp: Vec<Vec<f64>>, // [L]: 1D interp from order[L+1] (coarse) → order[L] (fine)
     inv_diag: Vec<Vec<f64>>,
     lam_hi: Vec<f64>,
@@ -64,7 +68,18 @@ pub struct PMultigrid {
 }
 
 impl PMultigrid {
+    /// Pure-Poisson (Dirichlet) p-multigrid. For the viscous **Helmholtz** `(λM + A)` use
+    /// [`with_reaction`](Self::with_reaction).
     pub fn new(order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64) -> Self {
+        Self::with_reaction(order, nx, ny, xr, yr, alpha, 0.0)
+    }
+
+    /// p-multigrid for the Helmholtz operator `(reaction·M + A)` (Dirichlet). `reaction = 0`
+    /// is the pure-Poisson case [`new`](Self::new). Mirrors the per-level operator
+    /// `Poisson::with_reaction(mesh, alpha, reaction)`.
+    pub fn with_reaction(
+        order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64, reaction: f64,
+    ) -> Self {
         let orders = order_levels(order);
         let meshes: Vec<Mesh2d> =
             orders.iter().map(|&o| Mesh2d::rectangular(o, nx, ny, xr, yr)).collect();
@@ -75,6 +90,7 @@ impl PMultigrid {
             orders,
             meshes,
             alpha,
+            reaction,
             interp,
             inv_diag: Vec::new(),
             lam_hi: Vec::new(),
@@ -127,8 +143,14 @@ impl PMultigrid {
         (self.n_pre, self.n_post)
     }
 
+    /// Helmholtz reaction `λ` (0 for pure Poisson) — the GPU PCG driver passes this to the
+    /// device operator so the on-device V-cycle matches this setup.
+    pub fn reaction(&self) -> f64 {
+        self.reaction
+    }
+
     fn apply_level(&self, l: usize, u: &[f64]) -> Vec<f64> {
-        Poisson::new(&self.meshes[l], self.alpha).apply(u)
+        Poisson::with_reaction(&self.meshes[l], self.alpha, self.reaction).apply(u)
     }
 
     /// Operator diagonal via unit-vector probing (CPU prototype; the GPU port needs
@@ -364,6 +386,24 @@ mod tests {
         assert!(rel < 1e-7, "PCG vs CG solution rel diff {rel}");
         // Preconditioner does real work.
         assert!(it_pcg * 2 < it_cg, "PCG {it_pcg} not << CG {it_cg}");
+    }
+
+    #[test]
+    fn helmholtz_pcg_converges_and_cuts_iterations() {
+        // Helmholtz (λM + A), the flow velocity solve. p-MG with the reaction term must
+        // converge and beat plain CG, like the Poisson case.
+        let p = 4;
+        let lambda = 100.0;
+        let mg = PMultigrid::with_reaction(p, 4, 4, [0.0, 1.0], [0.0, 1.0], 5.0, lambda);
+        let hop = Poisson::with_reaction(&mg.meshes[0], mg.alpha, lambda);
+        let b = mms_rhs(&mg);
+        let (u_cg, it_cg, _) = hop.cg(&b, 1e-10, 20000);
+        let (u_pcg, it_pcg) = mg.pcg(&b, 1e-10, 2000);
+        let diff: Vec<f64> = u_pcg.iter().zip(&u_cg).map(|(a, b)| a - b).collect();
+        let rel = norm(&diff) / norm(&u_cg).max(1e-300);
+        eprintln!("Helmholtz λ={lambda}: CG {it_cg} iters, PCG {it_pcg} iters, rel {rel:.2e}");
+        assert!(rel < 1e-7, "Helmholtz PCG vs CG rel {rel}");
+        assert!(it_pcg * 2 < it_cg, "Helmholtz PCG {it_pcg} not << CG {it_cg}");
     }
 
     #[test]

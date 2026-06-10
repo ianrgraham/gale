@@ -954,13 +954,16 @@ pub fn poisson_pcg_solve(
         }};
     }
     // matvec: dst = A·src at level $l (src/dst external; gx/gy scratch from Vecs).
+    // Helmholtz reaction λ (0 ⇒ pure Poisson) — the per-level diagonal/omega in `mg` are
+    // already computed for this reaction, so the on-device V-cycle matches the CPU setup.
+    let reaction = mg.reaction();
     macro_rules! matvec {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
             module.gradient(&stream, cfg[l], &dl[l], $src, &rxl[l], &ryl[l], &sxl[l], &syl[l], n1v[l], &mut gxb[l], &mut gyb[l])?;
             module.operator(
                 &stream, cfg[l], &dl[l], $src, &gxb[l], &gyb[l], &rxl[l], &ryl[l], &sxl[l], &syl[l], &jwl[l], n1v[l],
-                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], 0.0, $dst,
+                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
             )?;
         }};
     }

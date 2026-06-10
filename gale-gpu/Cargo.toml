@@ -291,3 +291,8 @@ path = "src/bin/probe_signum.rs"
 [[bin]]
 name = "cg-iter-probe"
 path = "src/bin/cg_iter_probe.rs"
+
+# Validates p-multigrid PCG for the velocity Helmholtz (λM+A) + iteration win vs plain CG.
+[[bin]]
+name = "pcg-helmholtz-check"
+path = "src/bin/pcg_helmholtz_check.rs"
