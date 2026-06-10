@@ -862,14 +862,31 @@ pub fn poisson_pcg_solve(
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    // One-shot: create the context, load the module, run. For repeated solves on a fixed
+    // hierarchy use the persistent [`GpuPoissonMg`] handle (amortizes the ~0.3 s load).
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let module = kernels::load(&ctx)?;
+    pcg_run(&stream, &module, mg, rhs, tol, maxit)
+}
+
+/// The p-MG-PCG loop given an already-created stream + loaded module — shared by the
+/// one-shot [`poisson_pcg_solve`] and the persistent [`GpuPoissonMg`] handle. Per-level
+/// device arrays are (re)uploaded here (cheap, O(n) memcpy); the expensive context/module
+/// setup lives in the caller.
+fn pcg_run(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+    mg: &PMultigrid,
+    rhs: &[f64],
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
     let nlev = mg.n_levels();
     let (n_pre, n_post) = mg.smoothing();
     let nn0 = mg.mesh(0).refq.n_nodes();
     let n0 = mg.mesh(0).n_elements() * nn0;
     assert_eq!(rhs.len(), n0, "rhs length must match the finest level");
-
-    let ctx = CudaContext::new(0)?;
-    let stream = ctx.default_stream();
     let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
     let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
 
@@ -938,8 +955,6 @@ pub fn poisson_pcg_solve(
     // Multi-block reduction: partials sized for the finest level (the largest dot); each
     // dot launches dot_blocks($n) blocks and the host sums that many partials.
     let mut partial = DeviceBuffer::<f64>::zeroed(&stream, dot_blocks(n0))?;
-
-    let module = kernels::load(&ctx)?;
 
     macro_rules! dot {
         ($a:expr, $b:expr, $n:expr) => {{
@@ -1081,6 +1096,40 @@ pub fn poisson_pcg_solve(
     }
 
     Ok((psol.to_host_vec(&stream)?, iters))
+}
+
+/// Persistent p-multigrid-PCG handle: owns the CUDA context, the loaded device module, and
+/// the `PMultigrid` hierarchy, so repeated solves on a fixed mesh skip the ~0.3 s
+/// context/module setup (the per-level array upload — only ~ms — happens per solve). Drives
+/// the deflated singular-Neumann pressure (and Helmholtz velocity) elliptic solves through
+/// one V-cycle-preconditioned CG. The flow integrators hold one of these across timesteps.
+pub struct GpuPoissonMg {
+    // `stream` and `module` keep an `Arc<CudaContext>`, so the context outlives the handle.
+    stream: Arc<CudaStream>,
+    module: kernels::LoadedModule,
+    mg: PMultigrid,
+}
+
+impl GpuPoissonMg {
+    /// Build the handle for an already-set-up p-multigrid hierarchy (pressure: all-Neumann +
+    /// reaction 0 ⇒ deflated; velocity: reaction λ + the per-region neumann tags).
+    pub fn new(mg: PMultigrid) -> Result<Self, Box<dyn std::error::Error>> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let module = kernels::load(&ctx)?;
+        Ok(Self { stream, module, mg })
+    }
+
+    /// Degrees of freedom on the finest level (`n_elements · n_nodes`).
+    pub fn ndof(&self) -> usize {
+        self.mg.mesh(0).n_elements() * self.mg.mesh(0).refq.n_nodes()
+    }
+
+    /// Solve `A·x = rhs` (the hierarchy's operator) by p-MG-PCG; singular pure-Neumann
+    /// systems are auto-deflated. `rhs` is the finest-level RHS.
+    pub fn solve(&self, rhs: &[f64], tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+        pcg_run(&self.stream, &self.module, &self.mg, rhs, tol, maxit)
+    }
 }
 
 // ===== Roofline microbenchmark ====================================================

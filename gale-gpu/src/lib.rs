@@ -47,13 +47,16 @@ pub use operators::burgers::burgers_rhs;
 pub use operators::euler::euler_rhs;
 pub use operators::logconf::{logconf_implicit_relax, logconf_limit_trace, logconf_psi_rhs};
 #[cfg(feature = "autodiff")]
-pub use operators::logconf::logconf_implicit_relax_grad;
+pub use operators::logconf::{
+    logconf_fit_relax_params, logconf_implicit_relax_grad, logconf_implicit_relax_vjp,
+};
 pub use operators::logconf3d::logconf3d_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
 pub use operators::oldroyd3d::oldroyd3d_conf_rhs;
 pub use operators::poisson::{
     bench_poisson_kernels, helmholtz_cg_solve, helmholtz_cg_solve_tags, poisson_apply,
-    poisson_cg_solve, poisson_pcg_solve, pressure_cg_solve, GpuPoisson, KernelTime, PoissonBench,
+    poisson_cg_solve, poisson_pcg_solve, pressure_cg_solve, GpuPoisson, GpuPoissonMg, KernelTime,
+    PoissonBench,
 };
 pub use operators::poisson3d::{
     helmholtz3d_cg_solve, helmholtz3d_cg_solve_tags, poisson3d_apply, pressure3d_cg_solve,

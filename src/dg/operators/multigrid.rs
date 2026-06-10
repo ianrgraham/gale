@@ -137,6 +137,45 @@ impl PMultigrid {
         s
     }
 
+    /// Build a hierarchy whose finest level **reproduces** `mesh` (which must be a uniform
+    /// rectangular `Mesh2d::rectangular` grid), deriving `(order, nx, ny, xr, yr)` from its
+    /// element layout — so a flow solver holding only a `Mesh2d` can construct the matching
+    /// p-MG for its elliptic solves. Returns `None` if `mesh` is not a uniform tensor grid
+    /// (e.g. non-conforming/AMR), in which case the caller falls back to plain CG.
+    pub fn from_mesh(mesh: &Mesh2d, alpha: f64, reaction: f64, neumann_tags: Vec<u32>) -> Option<Self> {
+        let ne = mesh.n_elements();
+        let nn = mesh.refq.n_nodes();
+        if ne == 0 {
+            return None;
+        }
+        let (mut xmin, mut xmax, mut ymin, mut ymax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        let (mut xs, mut ys): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+        let push_uniq = |v: &mut Vec<f64>, c: f64| {
+            if !v.iter().any(|&u| (u - c).abs() < 1e-9 * (1.0 + c.abs())) {
+                v.push(c);
+            }
+        };
+        for el in &mesh.elements {
+            let (mut cx, mut cy) = (0.0, 0.0);
+            for k in 0..nn {
+                let (x, y) = (el.geom.x[k], el.geom.y[k]);
+                cx += x;
+                cy += y;
+                xmin = xmin.min(x);
+                xmax = xmax.max(x);
+                ymin = ymin.min(y);
+                ymax = ymax.max(y);
+            }
+            push_uniq(&mut xs, cx / nn as f64);
+            push_uniq(&mut ys, cy / nn as f64);
+        }
+        let (nx, ny) = (xs.len(), ys.len());
+        if nx * ny != ne {
+            return None; // not a uniform tensor grid (e.g. non-conforming)
+        }
+        Some(Self::with_bc(mesh.order, nx, ny, [xmin, xmax], [ymin, ymax], alpha, reaction, neumann_tags))
+    }
+
     fn ndof(&self, l: usize) -> usize {
         self.meshes[l].n_elements() * self.meshes[l].refq.n_nodes()
     }
