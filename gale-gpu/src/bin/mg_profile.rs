@@ -52,7 +52,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let _warmup = mg.solve(&rhs, tol, maxit)?; // JIT/caches — first solve, skip in analysis
-    let (_x, it) = mg.solve(&rhs, tol, maxit)?; // the solve to profile
-    println!("mg-profile: op={op} p={p} grid={g}² ndof={n0} iters={it}");
+    // MG_REPS repeated solves: 1 for a clean single-solve trace; many to sustain a GPU-busy
+    // window (so `watch nvidia-smi` / live sampling can confirm the process is on-device).
+    let reps = env_usize("MG_REPS", 1);
+    let mut it = 0;
+    for _ in 0..reps {
+        it = mg.solve(&rhs, tol, maxit)?.1;
+    }
+    println!("mg-profile: op={op} p={p} grid={g}² ndof={n0} iters={it} reps={reps}");
     Ok(())
 }

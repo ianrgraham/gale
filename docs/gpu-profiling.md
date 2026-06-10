@@ -80,3 +80,28 @@ ncu-ui /tmp/mg_ncu.ncu-rep      # roofline, occupancy, memory throughput per ker
 `--set full` gives the roofline + memory workload analysis; `--set basic` is faster. The Titan V
 peaks: FP64 ≈ 6.9 TFLOP/s, HBM2 ≈ 652.8 GB/s (ridge AI ≈ 10.6 FLOP/byte) — most DG kernels are
 memory-bound (see docs/gpu-roofline-and-optimization.md).
+
+Reading a report needs **no** GPU/permission — generate it as root, then analyse as your user:
+```
+sudo chmod 644 /tmp/op.ncu-rep
+ncu --import /tmp/op.ncu-rep --csv --metrics \
+  gpu__time_duration.avg,sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+  dram__throughput.avg.pct_of_peak_sustained_elapsed,dram__bytes.sum.per_second,\
+  sm__warps_active.avg.pct_of_peak_sustained_active
+```
+
+### First ncu findings (64² p=4, `gradient`/`operator` matvec)
+
+| kernel | DRAM BW | % of 652.8 peak | compute (SM) | achieved occ. | warps/sched (of 16) |
+|--------|---------|-----------------|--------------|---------------|---------------------|
+| gradient | 383 GB/s | 59% | 15% | 23% | 3.8 |
+| operator | 358 GB/s | 55% | 18% | 34% | 5.7 |
+
+Bandwidth is at ~55–59% of peak, but ncu's diagnosis is **latency-bound, not bandwidth-bound**
+("below 60% of peak typically indicate latency issues"): occupancy is only 23–34%, ~0.25–0.34
+*eligible* warps/cycle, ~65–73% of stalls are warps waiting on L1TEX (memory) with too few other
+warps to hide it. Root cause = the **launch config: one block per element, `nn` threads** (25 at
+p=4): 25 isn't a multiple of 32 (lane masking) and one ~25-thread block can't supply enough warps
+per SM. ncu's recommendation: 128–256 threads/block, multiple of 32. ⇒ the fix is **multi-element-
+per-block packing** of the matvec (the deferred "P5", now data-justified); also explains why the
+MG wall-clock win grew with p (more nodes/element ⇒ more warps ⇒ better latency hiding).

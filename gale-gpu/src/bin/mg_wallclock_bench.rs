@@ -94,7 +94,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ---- Opt-in LARGE sweep (MG-only) — find the launch-bound → bandwidth-bound crossover.
+    // Set MG_BIG=1. CG is omitted: at these sizes it needs ~1e4–5e4 iters (minutes/solve), which
+    // is itself the point (it doesn't scale). `~mem` is the working-set estimate ≈ 35·ndof·f64
+    // (≈35 ndof-sized device vectors across MG levels + scratch + PCG); validate vs nvidia-smi.
+    if std::env::var("MG_BIG").is_ok() {
+        println!("\nLARGE p=4 (MG-only; CG impractical here)  — GPU is 12 GB/Titan V");
+        println!("{:>6} {:>11} {:>11} {:>7} {:>10}", "grid", "ndof", "MG ms", "it", "~mem MB");
+        for &g in &[256usize, 512, 1024] {
+            let mesh = Mesh2d::rectangular(4, g, g, xr, xr);
+            let tags = mesh.boundary_tags();
+            let n0 = mesh.n_elements() * mesh.refq.n_nodes();
+            let rhs = Poisson::with_bc(&mesh, alpha, 0.0, tags.clone()).rhs_mixed(&broadband(&mesh), |_, _| 0.0, |_, _| 0.0);
+            let mg = GpuPoissonMg::new(PMultigrid::with_bc(4, g, g, xr, xr, alpha, 0.0, tags))?;
+            let (mg_ms, mg_it) = time_solve(reps, || Ok(mg.solve(&rhs, tol, maxit)?.1))?;
+            let mem_mb = 35.0 * n0 as f64 * 8.0 / 1.0e6;
+            println!("{:>5}² {:>11} {:>11.2} {:>7} {:>10.0}", g, n0, mg_ms, mg_it, mem_mb);
+        }
+    }
+
     println!("\n(wall× = CG ms / MG ms — the real speedup; iter× = iteration-count ratio.\n \
-              MG iters should stay ~flat across p AND grid if the smoother is p-robust.)");
+              MG iters should stay ~flat across p AND grid if the smoother is p-robust.\n \
+              MG_BIG=1 adds a large-size MG-only sweep for the launch/bandwidth crossover.)");
     Ok(())
 }
