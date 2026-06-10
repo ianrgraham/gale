@@ -435,6 +435,65 @@ mod kernels {
             }
         }
     }
+
+    /// **h-prolong** (2:1 geometric, order-1 both levels): one block per FINE element, 4
+    /// threads (the 4 fine nodes). The parent coarse element `ec` and child quadrant `q` are
+    /// derived from the fine element index and the two grid widths `nxf`/`nxc`; `pq` holds the
+    /// four 4×4 per-quadrant matrices `[q*16 + f*4 + a]`. `out[ef*4 + f]`. Matches the host
+    /// `PMultigrid::prolong_h`.
+    #[kernel]
+    pub fn h_prolong(pq: &[f64], coarse: &[f64], nxf: u32, nxc: u32, mut out: DisjointSlice<f64>) {
+        let ef = thread::blockIdx_x() as usize;
+        let f = thread::threadIdx_x() as usize;
+        if f >= 4 {
+            return;
+        }
+        let (nxf, nxc) = (nxf as usize, nxc as usize);
+        let (fx, fy) = (ef % nxf, ef / nxf);
+        let ec = (fx / 2) + (fy / 2) * nxc;
+        let q = (fx % 2) + 2 * (fy % 2);
+        let mut s = 0.0f64;
+        let mut a = 0usize;
+        while a < 4 {
+            s += pq[q * 16 + f * 4 + a] * coarse[ec * 4 + a];
+            a += 1;
+        }
+        // block_dim is 4 (order-1) ⇒ global 1D thread index == ef*4 + f.
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = s;
+        }
+    }
+
+    /// **h-restrict** (the transpose `Rᵀ` of [`h_prolong`]): one block per COARSE element, 4
+    /// threads (the 4 coarse nodes `a`). Each coarse element gathers its 4 fine children
+    /// (quadrants), accumulating `pqᵀ`-weighted child contributions. `out[ec*4 + a]`. Matches
+    /// the host `PMultigrid::restrict_h`.
+    #[kernel]
+    pub fn h_restrict(pq: &[f64], fine: &[f64], nxf: u32, nxc: u32, mut out: DisjointSlice<f64>) {
+        let ec = thread::blockIdx_x() as usize;
+        let a = thread::threadIdx_x() as usize;
+        if a >= 4 {
+            return;
+        }
+        let (nxf, nxc) = (nxf as usize, nxc as usize);
+        let (cx, cy) = (ec % nxc, ec / nxc);
+        let mut s = 0.0f64;
+        let mut q = 0usize;
+        while q < 4 {
+            let (qx, qy) = (q % 2, q / 2);
+            let ef = (2 * cx + qx) + (2 * cy + qy) * nxf;
+            let mut f = 0usize;
+            while f < 4 {
+                s += pq[q * 16 + f * 4 + a] * fine[ef * 4 + f];
+                f += 1;
+            }
+            q += 1;
+        }
+        // block_dim is 4 (order-1) ⇒ global 1D thread index == ec*4 + a.
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = s;
+        }
+    }
 }
 
 /// Per-element metrics + flattened face metadata for one mesh, ready to upload.
@@ -897,6 +956,13 @@ struct MgConst {
     ftau: Vec<DeviceBuffer<f64>>,
     omega: Vec<f64>,
     interp: Vec<DeviceBuffer<f64>>,
+    /// Per-transition (`len = nlev−1`): true ⇒ h-coarsening (2:1 geometric, the `h_prolong`/
+    /// `h_restrict` kernels + `pq`); false ⇒ p-coarsening (the tensor `interp` + restrict/prolong).
+    is_h: Vec<bool>,
+    /// Element-grid width `nx` per level (for the h-transfer kernels' index arithmetic).
+    nxv: Vec<u32>,
+    /// The four 2:1 geometric prolongation matrices (shared across all h-transfers), uploaded once.
+    pq: DeviceBuffer<f64>,
     cfg: Vec<LaunchConfig>,
     vcfg: Vec<LaunchConfig>,
     reaction: f64,
@@ -951,11 +1017,19 @@ impl MgConst {
             ftau.push(up(&ma.ftau)?);
             omega.push(mg.jacobi_omega(l));
         }
-        // transfer matrices (coarse l+1 → fine l)
+        // transfer operators (coarse l+1 → fine l): p-transfers carry a tensor interp matrix;
+        // h-transfers carry none (they use the shared `pq` + the kernels' index arithmetic),
+        // so a 1-elem dummy keeps the per-transition vec index-aligned.
         let mut interp = Vec::new();
+        let mut is_h = Vec::new();
         for l in 0..nlev - 1 {
-            interp.push(up(mg.interp_matrix(l))?);
+            let h = mg.is_h_transfer(l);
+            is_h.push(h);
+            let m = mg.interp_matrix(l);
+            interp.push(up(if h { &[1.0f64][..] } else { m })?);
         }
+        let nxv: Vec<u32> = (0..nlev).map(|l| mg.level_dims(l).0 as u32).collect();
+        let pq = up(&mg.quad_prolong()[..])?;
 
         // per-level launch configs
         let cfg: Vec<LaunchConfig> = (0..nlev)
@@ -994,6 +1068,9 @@ impl MgConst {
             ftau,
             omega,
             interp,
+            is_h,
+            nxv,
+            pq,
             cfg,
             vcfg,
             reaction: mg.reaction(),
@@ -1074,6 +1151,9 @@ fn pcg_solve_with(
         ref ftau,
         ref omega,
         ref interp,
+        ref is_h,
+        ref nxv,
+        ref pq,
         ref cfg,
         ref vcfg,
         reaction,
@@ -1188,9 +1268,17 @@ fn pcg_solve_with(
             )?;
         }};
     }
+    // Coarsest-level solve tolerance/cap. With h-coarsening the coarsest grid is TINY (a few
+    // elements), so a tight, near-exact solve is cheap (~handful of iters) and minimizes outer
+    // PCG iterations. Without it (odd / non-power-of-2 grids that can't h-coarsen, where the
+    // coarsest is still order-1 on the full grid) we keep the loose-tol band-aid: the coarse
+    // solve is just a preconditioner component, so a loose tol + low cap keeps the V-cycle cheap
+    // and the outer PCG absorbs the inexactness.
+    let coarse_small = ndofv[clast] <= 1024;
+    let coarse_tol = if coarse_small { 1e-9 } else { 1e-2 };
+    let coarse_cap = if coarse_small { 100 } else { 40 };
     // Coarsest-level CG, on-device scalars; the residual is polled to the host only every
-    // COARSE_CHECK iterations (this solve runs many iters — it is h-fine since p-MG coarsens
-    // order, not the element grid — so per-iter syncs dominated the whole PCG before).
+    // COARSE_CHECK iterations (no per-iter sync).
     macro_rules! coarse_cg {
         ($l:expr) => {{
             let l = $l;
@@ -1201,15 +1289,8 @@ fn pcg_solve_with(
             dcopy!(&tmpb[l], &rb[l], n);
             dot_to!(&rb[l], &rb[l], n, &mut d_rs);
             let bn = d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300); // 1 sync at solve start
-            // The coarse solve is a PRECONDITIONER component — p-MG leaves it h-fine (order 1
-            // on the full element grid), so a full solve to 1e-10 is hundreds of iters EVERY
-            // V-cycle and dominated the PCG. A loose relative tol + a low cap make the V-cycle
-            // cheap; the outer PCG absorbs the inexactness (costs a few extra outer iters, each
-            // far cheaper than a fully-converged coarse solve). Polled every COARSE_CHECK.
-            const COARSE_TOL: f64 = 1e-2;
-            const COARSE_CAP: usize = 40;
             const COARSE_CHECK: usize = 10;
-            for it in 0..COARSE_CAP {
+            for it in 0..coarse_cap {
                 matvec!(l, &tmpb[l], &mut apb[l]);
                 dot_to!(&tmpb[l], &apb[l], n, &mut d_pap_c);
                 module.cg_alpha(&stream, one, &d_rs, &d_pap_c, &mut d_alpha_c, &mut d_nalpha_c)?;
@@ -1217,8 +1298,8 @@ fn pcg_solve_with(
                 module.axpy_s(&stream, vcfg[l], &mut rb[l], &apb[l], &d_nalpha_c)?; // r −= α ap
                 deflate_c!(&mut rb[l]); // keep the coarse residual in the range each iter
                 dot_to!(&rb[l], &rb[l], n, &mut d_rsnew);
-                if (it + 1) % COARSE_CHECK == 0 || it + 1 == COARSE_CAP {
-                    if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bn < COARSE_TOL {
+                if (it + 1) % COARSE_CHECK == 0 || it + 1 == coarse_cap {
+                    if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bn < coarse_tol {
                         break;
                     }
                 }
@@ -1239,11 +1320,21 @@ fn pcg_solve_with(
                 }
                 matvec!(l, &xb[l], &mut apb[l]);
                 module.sub(&stream, vcfg[l], &mut rb[l], &bb[l], &apb[l])?;
-                module.restrict(&stream, cfg[l], &interp[l], &rb[l], n1v[l], n1v[l + 1], &mut bb[l + 1])?;
+                if is_h[l] {
+                    // h-restrict: one block per COARSE element (cfg[l+1]); grids nxv[l]→nxv[l+1].
+                    module.h_restrict(&stream, cfg[l + 1], pq, &rb[l], nxv[l], nxv[l + 1], &mut bb[l + 1])?;
+                } else {
+                    module.restrict(&stream, cfg[l], &interp[l], &rb[l], n1v[l], n1v[l + 1], &mut bb[l + 1])?;
+                }
             }
             coarse_cg!(last);
             for l in (0..last).rev() {
-                module.prolong(&stream, cfg[l], &interp[l], &xb[l + 1], n1v[l], n1v[l + 1], &mut tmpb[l])?;
+                if is_h[l] {
+                    // h-prolong: one block per FINE element (cfg[l]); coarse l+1 → fine l.
+                    module.h_prolong(&stream, cfg[l], pq, &xb[l + 1], nxv[l], nxv[l + 1], &mut tmpb[l])?;
+                } else {
+                    module.prolong(&stream, cfg[l], &interp[l], &xb[l + 1], n1v[l], n1v[l + 1], &mut tmpb[l])?;
+                }
                 module.axpy(&stream, vcfg[l], &mut xb[l], &tmpb[l], 1.0)?;
                 for _ in 0..n_post {
                     matvec!(l, &xb[l], &mut apb[l]);

@@ -52,6 +52,44 @@ fn lagrange_matrix(coarse: &[f64], fine: &[f64]) -> Vec<f64> {
     m
 }
 
+/// Inter-level transfer between consecutive multigrid levels.
+enum Transfer {
+    /// **p-transfer** (same element grid, order drops): tensor-product 1D Lagrange
+    /// interpolation (coarse → fine), restriction is its transpose. `interp` is the 1D
+    /// `fine × coarse` matrix.
+    P { interp: Vec<f64> },
+    /// **h-transfer** (order 1 on both, element grid halves 2:1): geometric prolongation —
+    /// each coarse element covers 4 fine children, a fine node takes the coarse bilinear
+    /// value at its position in the coarse reference square; restriction is the transpose.
+    /// The four 4×4 per-quadrant matrices are the shared [`PMultigrid::quad_prolong`].
+    H,
+}
+
+/// The four 2:1 geometric prolongation matrices (one per child quadrant `q = qx + 2·qy`),
+/// **4 fine nodes × 4 coarse nodes**, row-major `[q*16 + f*4 + a]`. A child quadrant occupies
+/// half of the coarse reference square per axis; fine node `f`'s child-reference coord maps to
+/// the coarse-reference coord `(r+2qx−1)/2`, evaluated in the order-1 (bilinear) coarse basis.
+/// Identical for every 2:1 level (reference-space geometry only), so built once and shared.
+fn quad_prolong_matrices() -> [f64; 64] {
+    let nd = [-1.0f64, 1.0]; // order-1 LGL reference nodes
+    let mut p = [0.0; 64];
+    for qy in 0..2 {
+        for qx in 0..2 {
+            let q = qx + 2 * qy;
+            for f in 0..4 {
+                let (rf, sf) = (nd[f % 2], nd[f / 2]);
+                let rc = (rf + (2.0 * qx as f64 - 1.0)) / 2.0;
+                let sc = (sf + (2.0 * qy as f64 - 1.0)) / 2.0;
+                for a in 0..4 {
+                    let (rca, sca) = (nd[a % 2], nd[a / 2]);
+                    p[q * 16 + f * 4 + a] = 0.25 * (1.0 + rc * rca) * (1.0 + sc * sca);
+                }
+            }
+        }
+    }
+    p
+}
+
 pub struct PMultigrid {
     pub orders: Vec<usize>,
     pub meshes: Vec<Mesh2d>,
@@ -66,15 +104,20 @@ pub struct PMultigrid {
     /// tags ⇒ the singular pure-Neumann pressure operator (deflate in the PCG, see
     /// `poisson_pcg_solve`).
     neumann_tags: Vec<u32>,
-    interp: Vec<Vec<f64>>, // [L]: 1D interp from order[L+1] (coarse) → order[L] (fine)
+    /// Per-transition transfer operator (`len = n_levels − 1`): p-coarsening (Lagrange) for
+    /// the order-dropping levels, then h-coarsening (2:1 geometric) for the grid-halving ones.
+    transfers: Vec<Transfer>,
+    /// Per-level element-grid dimensions `(nx, ny)`. The p-levels all share the finest grid;
+    /// the appended h-levels halve it (order 1 throughout), so the coarsest level is genuinely
+    /// small and its solve is cheap — the fix for p-multigrid's otherwise-h-fine coarse grid.
+    dims: Vec<(usize, usize)>,
+    /// Shared 2:1 geometric prolongation matrices (per quadrant) for the h-transfers.
+    quad_prolong: [f64; 64],
     inv_diag: Vec<Vec<f64>>,
     lam_hi: Vec<f64>,
     n_pre: usize,
     n_post: usize,
-    // Rectangular grid params, for the checkerboard element coloring used by the O(n·nn)
-    // diagonal probing.
-    nx: usize,
-    ny: usize,
+    // Domain extent, for the per-level checkerboard element coloring (cell size from dims[l]).
     xr: [f64; 2],
     yr: [f64; 2],
 }
@@ -104,11 +147,36 @@ impl PMultigrid {
         order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64, reaction: f64,
         neumann_tags: Vec<u32>,
     ) -> Self {
-        let orders = order_levels(order);
+        // Levels: p-coarsening [p, p/2, …, 1] on the full grid, then h-coarsening — order 1
+        // on a 2:1-halved grid each step, while both dims stay even, down to a tiny coarsest
+        // grid (so its CG solve is cheap and near-exact, not the hundreds of iters a p-only
+        // order-1-on-the-full-grid coarse level took).
+        let mut orders: Vec<usize> = Vec::new();
+        let mut dims: Vec<(usize, usize)> = Vec::new();
+        for &o in &order_levels(order) {
+            orders.push(o);
+            dims.push((nx, ny));
+        }
+        let (mut hx, mut hy) = (nx, ny);
+        while hx % 2 == 0 && hy % 2 == 0 && hx >= 2 && hy >= 2 {
+            hx /= 2;
+            hy /= 2;
+            orders.push(1);
+            dims.push((hx, hy));
+        }
         let meshes: Vec<Mesh2d> =
-            orders.iter().map(|&o| Mesh2d::rectangular(o, nx, ny, xr, yr)).collect();
-        let interp: Vec<Vec<f64>> = (0..orders.len() - 1)
-            .map(|l| lagrange_matrix(&meshes[l + 1].refq.line.nodes, &meshes[l].refq.line.nodes))
+            (0..orders.len()).map(|l| Mesh2d::rectangular(orders[l], dims[l].0, dims[l].1, xr, yr)).collect();
+        // p-transfer where the grid is unchanged (order drops), h-transfer where it halves.
+        let transfers: Vec<Transfer> = (0..orders.len() - 1)
+            .map(|l| {
+                if dims[l] == dims[l + 1] {
+                    Transfer::P {
+                        interp: lagrange_matrix(&meshes[l + 1].refq.line.nodes, &meshes[l].refq.line.nodes),
+                    }
+                } else {
+                    Transfer::H
+                }
+            })
             .collect();
         let mut s = Self {
             orders,
@@ -116,13 +184,13 @@ impl PMultigrid {
             alpha,
             reaction,
             neumann_tags,
-            interp,
+            transfers,
+            dims,
+            quad_prolong: quad_prolong_matrices(),
             inv_diag: Vec::new(),
             lam_hi: Vec::new(),
             n_pre: 3,
             n_post: 3,
-            nx,
-            ny,
             xr,
             yr,
         };
@@ -194,9 +262,29 @@ impl PMultigrid {
     pub fn mesh(&self, l: usize) -> &Mesh2d {
         &self.meshes[l]
     }
-    /// 1D interpolation matrix (coarse `l+1` → fine `l`), `fine × coarse`, row-major.
+    /// 1D interpolation matrix (coarse `l+1` → fine `l`), `fine × coarse`, row-major — for a
+    /// **p-transfer** level. Empty for an h-transfer (use [`is_h_transfer`](Self::is_h_transfer)
+    /// + [`quad_prolong`](Self::quad_prolong) there).
     pub fn interp_matrix(&self, l: usize) -> &[f64] {
-        &self.interp[l]
+        match &self.transfers[l] {
+            Transfer::P { interp } => interp,
+            Transfer::H => &[],
+        }
+    }
+    /// Element-grid dimensions `(nx, ny)` at level `l`.
+    pub fn level_dims(&self, l: usize) -> (usize, usize) {
+        self.dims[l]
+    }
+    /// Whether the transfer from level `l` to `l+1` is **h-coarsening** (2:1 geometric on the
+    /// element grid) rather than p-coarsening. The GPU driver dispatches its restrict/prolong
+    /// accordingly.
+    pub fn is_h_transfer(&self, l: usize) -> bool {
+        matches!(self.transfers[l], Transfer::H)
+    }
+    /// The four per-quadrant 2:1 geometric prolongation matrices (4 fine × 4 coarse nodes,
+    /// `[q*16 + f*4 + a]`), shared by every h-transfer.
+    pub fn quad_prolong(&self) -> &[f64; 64] {
+        &self.quad_prolong
     }
     /// Inverse operator diagonal at level `l`.
     pub fn inv_diagonal(&self, l: usize) -> &[f64] {
@@ -239,6 +327,7 @@ impl PMultigrid {
     /// neighbours (which differ by ±1 in one cell index ⇒ opposite parity), so two
     /// same-parity elements never couple — the key to the colored diagonal below.
     fn elem_color(&self, l: usize, e: usize) -> usize {
+        let (nxl, nyl) = self.dims[l];
         let g = &self.meshes[l].elements[e].geom;
         let nn = self.meshes[l].refq.n_nodes();
         let (mut xc, mut yc) = (0.0, 0.0);
@@ -248,8 +337,8 @@ impl PMultigrid {
         }
         xc /= nn as f64;
         yc /= nn as f64;
-        let cx = (((xc - self.xr[0]) / ((self.xr[1] - self.xr[0]) / self.nx as f64)) as usize).min(self.nx - 1);
-        let cy = (((yc - self.yr[0]) / ((self.yr[1] - self.yr[0]) / self.ny as f64)) as usize).min(self.ny - 1);
+        let cx = (((xc - self.xr[0]) / ((self.xr[1] - self.xr[0]) / nxl as f64)) as usize).min(nxl - 1);
+        let cy = (((yc - self.yr[0]) / ((self.yr[1] - self.yr[0]) / nyl as f64)) as usize).min(nyl - 1);
         (cx + cy) % 2
     }
 
@@ -315,9 +404,70 @@ impl PMultigrid {
         }
     }
 
-    /// Prolong a coarse (level `l+1`) field to fine (level `l`), per element, tensor.
+    /// Prolong a coarse (level `l+1`) field to fine (level `l`), dispatching on the transfer.
     fn prolong(&self, l: usize, coarse: &[f64]) -> Vec<f64> {
-        let i = &self.interp[l];
+        match &self.transfers[l] {
+            Transfer::P { interp } => self.prolong_p(l, coarse, interp),
+            Transfer::H => self.prolong_h(l, coarse),
+        }
+    }
+    /// Restrict a fine (level `l`) field to coarse (level `l+1`) — transpose of prolong.
+    fn restrict(&self, l: usize, fine: &[f64]) -> Vec<f64> {
+        match &self.transfers[l] {
+            Transfer::P { interp } => self.restrict_p(l, fine, interp),
+            Transfer::H => self.restrict_h(l, fine),
+        }
+    }
+
+    /// 2:1 geometric prolongation (coarse order-1 → fine order-1, grid doubled). Each fine
+    /// element takes its parent coarse element's bilinear value at the fine nodes' positions
+    /// (the per-quadrant [`quad_prolong`](Self::quad_prolong) matrices).
+    fn prolong_h(&self, l: usize, coarse: &[f64]) -> Vec<f64> {
+        let (nxc, _) = self.dims[l + 1];
+        let (nxf, _) = self.dims[l];
+        let ne_f = self.meshes[l].n_elements();
+        let pq = &self.quad_prolong;
+        let mut out = vec![0.0; ne_f * 4];
+        for ef in 0..ne_f {
+            let (fx, fy) = (ef % nxf, ef / nxf);
+            let ec = (fx / 2) + (fy / 2) * nxc;
+            let q = (fx % 2) + 2 * (fy % 2);
+            for f in 0..4 {
+                let mut s = 0.0;
+                for a in 0..4 {
+                    s += pq[q * 16 + f * 4 + a] * coarse[ec * 4 + a];
+                }
+                out[ef * 4 + f] = s;
+            }
+        }
+        out
+    }
+
+    /// 2:1 geometric restriction = transpose of [`prolong_h`](Self::prolong_h): each coarse
+    /// element accumulates the `Pᵀ`-weighted contributions of its 4 fine children.
+    fn restrict_h(&self, l: usize, fine: &[f64]) -> Vec<f64> {
+        let (nxc, _) = self.dims[l + 1];
+        let (nxf, _) = self.dims[l];
+        let ne_f = self.meshes[l].n_elements();
+        let pq = &self.quad_prolong;
+        let mut out = vec![0.0; self.meshes[l + 1].n_elements() * 4];
+        for ef in 0..ne_f {
+            let (fx, fy) = (ef % nxf, ef / nxf);
+            let ec = (fx / 2) + (fy / 2) * nxc;
+            let q = (fx % 2) + 2 * (fy % 2);
+            for a in 0..4 {
+                let mut s = 0.0;
+                for f in 0..4 {
+                    s += pq[q * 16 + f * 4 + a] * fine[ef * 4 + f];
+                }
+                out[ec * 4 + a] += s;
+            }
+        }
+        out
+    }
+
+    /// Prolong a coarse (level `l+1`) field to fine (level `l`), per element, tensor.
+    fn prolong_p(&self, l: usize, coarse: &[f64], i: &[f64]) -> Vec<f64> {
         let ncc = self.orders[l + 1] + 1;
         let nff = self.orders[l] + 1;
         let ne = self.meshes[l].n_elements();
@@ -348,9 +498,8 @@ impl PMultigrid {
         out
     }
 
-    /// Restrict a fine (level `l`) field to coarse (level `l+1`) — transpose of prolong.
-    fn restrict(&self, l: usize, fine: &[f64]) -> Vec<f64> {
-        let i = &self.interp[l];
+    /// Restrict a fine (level `l`) field to coarse (level `l+1`), per element, tensor.
+    fn restrict_p(&self, l: usize, fine: &[f64], i: &[f64]) -> Vec<f64> {
         let ncc = self.orders[l + 1] + 1;
         let nff = self.orders[l] + 1;
         let ne = self.meshes[l].n_elements();
@@ -545,5 +694,46 @@ mod tests {
         for (a, b) in pcg_iters.iter().zip(&cg_iters) {
             assert!(a < b, "PCG {a} not < CG {b}");
         }
+    }
+
+    #[test]
+    fn h_coarsening_is_mesh_independent_and_coarsens_to_tiny() {
+        // With h-coarsening appended below order 1, the coarsest grid must be TINY (so its
+        // solve is cheap, not the hundreds of iters an order-1-on-the-full-grid coarse level
+        // took) AND the PCG iteration count must stay bounded as the FINE grid refines — the
+        // mesh-independence that p-only multigrid lacked.
+        let p = 2;
+        let grids = [8usize, 16, 32];
+        let mut iters = Vec::new();
+        for &g in &grids {
+            let mg = PMultigrid::new(p, g, g, [0.0, 1.0], [0.0, 1.0], 5.0);
+            let (cx, cy) = mg.level_dims(mg.n_levels() - 1);
+            assert!(cx * cy <= 4, "coarsest grid not small at g={g}: {cx}×{cy}");
+            assert!(mg.is_h_transfer(mg.n_levels() - 2), "no h-transfer present at g={g}");
+            let b = mms_rhs(&mg);
+            let (_x, it) = mg.pcg(&b, 1e-10, 2000);
+            iters.push(it);
+        }
+        eprintln!("h-MG PCG iters at g={grids:?}: {iters:?}");
+        assert!(iters.iter().all(|&n| n < 40), "h-MG iters not bounded: {iters:?}");
+        // Roughly flat — does not grow the O(1/h) way unpreconditioned CG would.
+        assert!(iters[2] <= iters[0] + 8, "h-MG iters grew with refinement: {iters:?}");
+    }
+
+    #[test]
+    fn h_restrict_is_transpose_of_prolong() {
+        // R = Pᵀ for the geometric h-transfer: ⟨P c, f⟩_fine = ⟨c, R f⟩_coarse for all c, f.
+        let mg = PMultigrid::new(1, 4, 4, [0.0, 1.0], [0.0, 1.0], 5.0);
+        let l = mg.n_levels() - 2; // an h-transfer level (4→2 here)
+        assert!(mg.is_h_transfer(l));
+        let nf = mg.meshes[l].n_elements() * 4;
+        let nc = mg.meshes[l + 1].n_elements() * 4;
+        let c: Vec<f64> = (0..nc).map(|i| 1.0 + (i % 5) as f64 * 0.3).collect();
+        let f: Vec<f64> = (0..nf).map(|i| 0.7 - (i % 3) as f64 * 0.2).collect();
+        let pc = mg.prolong(l, &c);
+        let rf = mg.restrict(l, &f);
+        let lhs = dot(&pc, &f);
+        let rhs = dot(&c, &rf);
+        assert!((lhs - rhs).abs() < 1e-12, "R ≠ Pᵀ: ⟨Pc,f⟩={lhs} ⟨c,Rf⟩={rhs}");
     }
 }
