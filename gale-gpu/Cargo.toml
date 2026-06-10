@@ -185,6 +185,11 @@ path = "src/bin/flow_nc_bc_check.rs"
 name = "roofline-poisson"
 path = "src/bin/roofline_poisson.rs"
 
+# Wall-clock profile: p-MG-PCG vs persistent CG, ms/solve across refinement (perf pass).
+[[bin]]
+name = "mg-wallclock-bench"
+path = "src/bin/mg_wallclock_bench.rs"
+
 # Validates the persistent GpuPoisson solver handle (P4) vs the one-shot solvers.
 [[bin]]
 name = "poisson-handle-check"

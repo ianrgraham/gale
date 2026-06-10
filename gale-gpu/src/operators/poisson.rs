@@ -1109,16 +1109,38 @@ fn pcg_solve_with(
     let pz = DeviceBuffer::<f64>::zeroed(stream, n0)?;
     let mut pap = DeviceBuffer::<f64>::zeroed(stream, n0)?;
     let rhs_dev = DeviceBuffer::from_host(stream, rhs)?;
-    // Multi-block reduction: partials sized for the finest level (the largest dot); each
-    // dot launches dot_blocks($n) blocks and the host sums that many partials.
+    // Multi-block reduction partials, sized for the finest level (the largest dot).
     let mut partial = DeviceBuffer::<f64>::zeroed(stream, dot_blocks(n0))?;
+    // CG/PCG scalars kept **on device** (length-1 buffers) so neither the outer PCG nor the
+    // coarse-grid CG issues a host sync per iteration — the dominant cost of the previous
+    // host-readback `dot` (a V-cycle's coarse solve runs hundreds of iters, each formerly a
+    // `to_host_vec`). The OUTER pool must survive a V-cycle (rz spans the preconditioner
+    // call), so it is disjoint from the COARSE pool the V-cycle clobbers.
+    let mut d_rz = DeviceBuffer::<f64>::zeroed(stream, 1)?; // outer: r·z (PCG)
+    let mut d_rznew = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_pap_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_alpha_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_nalpha_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_beta_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_rr = DeviceBuffer::<f64>::zeroed(stream, 1)?; // outer residual ‖r‖²
+    let mut d_nmean_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_rs = DeviceBuffer::<f64>::zeroed(stream, 1)?; // coarse: r·r (CG)
+    let mut d_rsnew = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_pap_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_alpha_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_nalpha_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_beta_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let mut d_nmean_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
 
-    macro_rules! dot {
-        ($a:expr, $b:expr, $n:expr) => {{
+    // Fully on-device dot a·b → device scalar `$out` (dot_partial → reduce_scalar), no sync.
+    macro_rules! dot_to {
+        ($a:expr, $b:expr, $n:expr, $out:expr) => {{
             let nbl = dot_blocks($n);
             let redcfg = LaunchConfig { grid_dim: (nbl as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+            let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
             module.dot_partial(&stream, redcfg, $a, $b, $n as u64, &mut partial)?;
-            partial.to_host_vec(&stream)?[..nbl].iter().sum::<f64>()
+            module.reduce_scalar(&stream, red1, &partial, nbl as u64, $out)?;
         }};
     }
     macro_rules! dcopy {
@@ -1132,12 +1154,13 @@ fn pcg_solve_with(
     // residual onto the range (subtract its mean) in the OUTER PCG and in the COARSEST solve;
     // the SPD V-cycle preconditioner itself is unmodified (see docs/research-pressure-multigrid.md).
     // `deflate`, `ones0`, `ones_c`, `ninv0`, `ninv_c`, `clast` all come from `dev` (above).
-    // Subtract the mean of a finest-level vector (range projection for the singular system).
+    // The mean is removed on-device (dot → cg_negmean(−mean) → axpy_s), no host round-trip.
     macro_rules! deflate0 {
         ($v:expr) => {{
             if deflate {
-                let mean = dot!($v, &ones0, n0) * ninv0;
-                module.axpy(&stream, vcfg[0], $v, &ones0, -mean)?;
+                dot_to!($v, &ones0, n0, &mut d_nmean_o);
+                module.cg_negmean(&stream, one, &mut d_nmean_o, ninv0)?;
+                module.axpy_s(&stream, vcfg[0], $v, &ones0, &d_nmean_o)?;
             }
         }};
     }
@@ -1145,8 +1168,9 @@ fn pcg_solve_with(
     macro_rules! deflate_c {
         ($v:expr) => {{
             if deflate {
-                let mean = dot!($v, &ones_c, ndofv[clast]) * ninv_c;
-                module.axpy(&stream, vcfg[clast], $v, &ones_c, -mean)?;
+                dot_to!($v, &ones_c, ndofv[clast], &mut d_nmean_c);
+                module.cg_negmean(&stream, one, &mut d_nmean_c, ninv_c)?;
+                module.axpy_s(&stream, vcfg[clast], $v, &ones_c, &d_nmean_c)?;
             }
         }};
     }
@@ -1164,6 +1188,9 @@ fn pcg_solve_with(
             )?;
         }};
     }
+    // Coarsest-level CG, on-device scalars; the residual is polled to the host only every
+    // COARSE_CHECK iterations (this solve runs many iters — it is h-fine since p-MG coarsens
+    // order, not the element grid — so per-iter syncs dominated the whole PCG before).
     macro_rules! coarse_cg {
         ($l:expr) => {{
             let l = $l;
@@ -1172,22 +1199,31 @@ fn pcg_solve_with(
             dcopy!(&rb[l], &bb[l], n);
             deflate_c!(&mut rb[l]); // project the coarse RHS onto the range (singular op)
             dcopy!(&tmpb[l], &rb[l], n);
-            let bn = dot!(&rb[l], &rb[l], n).sqrt().max(1e-300);
-            let mut rs = dot!(&rb[l], &rb[l], n);
-            for _ in 0..300 {
+            dot_to!(&rb[l], &rb[l], n, &mut d_rs);
+            let bn = d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300); // 1 sync at solve start
+            // The coarse solve is a PRECONDITIONER component — p-MG leaves it h-fine (order 1
+            // on the full element grid), so a full solve to 1e-10 is hundreds of iters EVERY
+            // V-cycle and dominated the PCG. A loose relative tol + a low cap make the V-cycle
+            // cheap; the outer PCG absorbs the inexactness (costs a few extra outer iters, each
+            // far cheaper than a fully-converged coarse solve). Polled every COARSE_CHECK.
+            const COARSE_TOL: f64 = 1e-2;
+            const COARSE_CAP: usize = 40;
+            const COARSE_CHECK: usize = 10;
+            for it in 0..COARSE_CAP {
                 matvec!(l, &tmpb[l], &mut apb[l]);
-                let pap_d = dot!(&tmpb[l], &apb[l], n);
-                let alpha = rs / pap_d;
-                module.axpy(&stream, vcfg[l], &mut xb[l], &tmpb[l], alpha)?;
-                module.axpy(&stream, vcfg[l], &mut rb[l], &apb[l], -alpha)?;
+                dot_to!(&tmpb[l], &apb[l], n, &mut d_pap_c);
+                module.cg_alpha(&stream, one, &d_rs, &d_pap_c, &mut d_alpha_c, &mut d_nalpha_c)?;
+                module.axpy_s(&stream, vcfg[l], &mut xb[l], &tmpb[l], &d_alpha_c)?; // x += α p
+                module.axpy_s(&stream, vcfg[l], &mut rb[l], &apb[l], &d_nalpha_c)?; // r −= α ap
                 deflate_c!(&mut rb[l]); // keep the coarse residual in the range each iter
-                let rsn = dot!(&rb[l], &rb[l], n);
-                if rsn.sqrt() / bn < 1e-10 {
-                    break;
+                dot_to!(&rb[l], &rb[l], n, &mut d_rsnew);
+                if (it + 1) % COARSE_CHECK == 0 || it + 1 == COARSE_CAP {
+                    if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bn < COARSE_TOL {
+                        break;
+                    }
                 }
-                let beta = rsn / rs;
-                module.xpby(&stream, vcfg[l], &mut tmpb[l], &rb[l], beta)?;
-                rs = rsn;
+                module.cg_beta(&stream, one, &d_rsnew, &mut d_rs, &mut d_beta_c)?; // β=rsnew/rs; rs←rsnew
+                module.xpby_s(&stream, vcfg[l], &mut tmpb[l], &rb[l], &d_beta_c)?; // p = r + β p
             }
         }};
     }
@@ -1217,27 +1253,31 @@ fn pcg_solve_with(
         }};
     }
 
-    // preconditioned CG on the device
+    // Preconditioned CG on the device. α/β and the deflation mean stay on-device; only the
+    // outer residual norm is polled — once per outer iter, which is cheap (PCG converges in
+    // ~tens of iters), unlike the coarse solve's hundreds.
     module.scal(&stream, vcfg[0], &mut psol, 0.0)?;
     deflate0!(&mut pres); // project the initial residual (=RHS) onto the range
     dcopy!(&bb[0], &pres, n0);
     vcycle!();
     dcopy!(&pz, &xb[0], n0);
     dcopy!(&pp, &pz, n0);
-    let bn = dot!(&rhs_dev, &rhs_dev, n0).sqrt().max(1e-300);
-    let mut rz = dot!(&pres, &pz, n0);
+    dot_to!(&rhs_dev, &rhs_dev, n0, &mut d_rr);
+    let bn = d_rr.to_host_vec(&stream)?[0].sqrt().max(1e-300);
+    dot_to!(&pres, &pz, n0, &mut d_rz);
     let mut iters = 0;
     let mut converged = false;
     let mut rel = 1.0;
     for it in 0..maxit {
         matvec!(0, &pp, &mut pap);
-        let pap_d = dot!(&pp, &pap, n0);
-        let alpha = rz / pap_d;
-        module.axpy(&stream, vcfg[0], &mut psol, &pp, alpha)?;
-        module.axpy(&stream, vcfg[0], &mut pres, &pap, -alpha)?;
+        dot_to!(&pp, &pap, n0, &mut d_pap_o);
+        module.cg_alpha(&stream, one, &d_rz, &d_pap_o, &mut d_alpha_o, &mut d_nalpha_o)?;
+        module.axpy_s(&stream, vcfg[0], &mut psol, &pp, &d_alpha_o)?; // x += α p
+        module.axpy_s(&stream, vcfg[0], &mut pres, &pap, &d_nalpha_o)?; // r −= α Ap
         deflate0!(&mut pres); // keep the residual in the range each iteration
         iters = it + 1;
-        rel = dot!(&pres, &pres, n0).sqrt() / bn;
+        dot_to!(&pres, &pres, n0, &mut d_rr);
+        rel = d_rr.to_host_vec(&stream)?[0].sqrt() / bn;
         if rel < tol {
             converged = true;
             break;
@@ -1245,10 +1285,9 @@ fn pcg_solve_with(
         dcopy!(&bb[0], &pres, n0);
         vcycle!();
         dcopy!(&pz, &xb[0], n0);
-        let rz_new = dot!(&pres, &pz, n0);
-        let beta = rz_new / rz;
-        module.xpby(&stream, vcfg[0], &mut pp, &pz, beta)?;
-        rz = rz_new;
+        dot_to!(&pres, &pz, n0, &mut d_rznew);
+        module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β=rznew/rz; rz←rznew
+        module.xpby_s(&stream, vcfg[0], &mut pp, &pz, &d_beta_o)?; // p = z + β p
     }
     let kind = if deflate { "singular-Neumann pressure" } else { "Helmholtz" };
     warn_unconverged(&format!("p-MG-PCG ({kind})"), converged, iters, maxit, rel, tol);
