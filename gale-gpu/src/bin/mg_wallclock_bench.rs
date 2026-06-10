@@ -44,49 +44,57 @@ fn broadband(fine: &Mesh2d) -> Vec<f64> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (p, alpha, tol, maxit, reps) = (4usize, 5.0, 1e-10, 100_000usize, 5usize);
+    let (alpha, tol, maxit, reps) = (5.0, 1e-10, 100_000usize, 3usize);
     let xr = [0.0, 1.0];
     let lambda = 100.0; // velocity Helmholtz reaction λ = 1/(νΔt), the ve-check value
+    // (order, grids): large grids at low order (cheap CG reference); high order capped at 64²
+    // since the unpreconditioned-CG reference grows expensive (and that's the regime MG wins).
+    let configs: [(usize, &[usize]); 4] =
+        [(2, &[32, 64, 128]), (4, &[32, 64, 128]), (6, &[32, 64]), (8, &[32, 64])];
 
-    println!("=== Wall-clock: p-MG-PCG vs persistent CG, ms/solve (p={p}, Titan V) ===\n");
+    println!("=== Wall-clock: p-MG-PCG vs persistent CG, ms/solve, p-sweep (Titan V) ===");
+    let hdr = || println!("{:>3} {:>6} {:>9} {:>11} {:>7} {:>11} {:>7} {:>9} {:>9}",
+                          "p", "grid", "ndof", "CG ms", "it", "MG ms", "it", "wall×", "iter×");
 
     // ---- Pressure: singular pure-Neumann, deflated ----------------------------------
-    println!("PRESSURE  (singular pure-Neumann, deflated)");
-    println!("{:>6} {:>9} {:>11} {:>7} {:>11} {:>7} {:>9} {:>9}",
-             "grid", "ndof", "CG ms", "it", "MG ms", "it", "wall×", "iter×");
-    for &g in &[32usize, 64, 128] {
-        let mesh = Mesh2d::rectangular(p, g, g, xr, xr);
-        let tags = mesh.boundary_tags();
-        let n0 = mesh.n_elements() * mesh.refq.n_nodes();
-        let rhs = Poisson::with_bc(&mesh, alpha, 0.0, tags.clone()).rhs_mixed(&broadband(&mesh), |_, _| 0.0, |_, _| 0.0);
+    println!("\nPRESSURE  (singular pure-Neumann, deflated)");
+    hdr();
+    for &(p, grids) in &configs {
+        for &g in grids {
+            let mesh = Mesh2d::rectangular(p, g, g, xr, xr);
+            let tags = mesh.boundary_tags();
+            let n0 = mesh.n_elements() * mesh.refq.n_nodes();
+            let rhs = Poisson::with_bc(&mesh, alpha, 0.0, tags.clone()).rhs_mixed(&broadband(&mesh), |_, _| 0.0, |_, _| 0.0);
 
-        let cg = GpuPoisson::new(&mesh, alpha)?;
-        let mg = GpuPoissonMg::new(PMultigrid::with_bc(p, g, g, xr, xr, alpha, 0.0, tags.clone()))?;
-        let (cg_ms, cg_it) = time_solve(reps, || Ok(cg.solve(&rhs, 0.0, &tags, true, tol, maxit)?.1))?;
-        let (mg_ms, mg_it) = time_solve(reps, || Ok(mg.solve(&rhs, tol, maxit)?.1))?;
-        println!("{:>5}² {:>9} {:>11.2} {:>7} {:>11.2} {:>7} {:>8.1}× {:>8.1}×",
-                 g, n0, cg_ms, cg_it, mg_ms, mg_it, cg_ms / mg_ms, cg_it as f64 / mg_it.max(1) as f64);
+            let cg = GpuPoisson::new(&mesh, alpha)?;
+            let mg = GpuPoissonMg::new(PMultigrid::with_bc(p, g, g, xr, xr, alpha, 0.0, tags.clone()))?;
+            let (cg_ms, cg_it) = time_solve(reps, || Ok(cg.solve(&rhs, 0.0, &tags, true, tol, maxit)?.1))?;
+            let (mg_ms, mg_it) = time_solve(reps, || Ok(mg.solve(&rhs, tol, maxit)?.1))?;
+            println!("{:>3} {:>5}² {:>9} {:>11.2} {:>7} {:>11.2} {:>7} {:>8.1}× {:>8.1}×",
+                     p, g, n0, cg_ms, cg_it, mg_ms, mg_it, cg_ms / mg_ms, cg_it as f64 / mg_it.max(1) as f64);
+        }
     }
 
     // ---- Velocity Helmholtz: all-Dirichlet, non-singular -----------------------------
     println!("\nVELOCITY  (Helmholtz λ={lambda}, all-Dirichlet)");
-    println!("{:>6} {:>9} {:>11} {:>7} {:>11} {:>7} {:>9} {:>9}",
-             "grid", "ndof", "CG ms", "it", "MG ms", "it", "wall×", "iter×");
-    for &g in &[32usize, 64, 128] {
-        let mesh = Mesh2d::rectangular(p, g, g, xr, xr);
-        let n0 = mesh.n_elements() * mesh.refq.n_nodes();
-        // A smooth RHS for the (mass-dominated) Helmholtz, assembled with all-Dirichlet data.
-        let rhs = Poisson::with_reaction(&mesh, alpha, lambda).rhs(&broadband(&mesh), |_, _| 0.0);
+    hdr();
+    for &(p, grids) in &configs {
+        for &g in grids {
+            let mesh = Mesh2d::rectangular(p, g, g, xr, xr);
+            let n0 = mesh.n_elements() * mesh.refq.n_nodes();
+            // A smooth RHS for the (mass-dominated) Helmholtz, assembled with all-Dirichlet data.
+            let rhs = Poisson::with_reaction(&mesh, alpha, lambda).rhs(&broadband(&mesh), |_, _| 0.0);
 
-        let cg = GpuPoisson::new(&mesh, alpha)?;
-        let mg = GpuPoissonMg::new(PMultigrid::with_reaction(p, g, g, xr, xr, alpha, lambda))?;
-        let (cg_ms, cg_it) = time_solve(reps, || Ok(cg.solve(&rhs, lambda, &[], false, tol, maxit)?.1))?;
-        let (mg_ms, mg_it) = time_solve(reps, || Ok(mg.solve(&rhs, tol, maxit)?.1))?;
-        println!("{:>5}² {:>9} {:>11.2} {:>7} {:>11.2} {:>7} {:>8.1}× {:>8.1}×",
-                 g, n0, cg_ms, cg_it, mg_ms, mg_it, cg_ms / mg_ms, cg_it as f64 / mg_it.max(1) as f64);
+            let cg = GpuPoisson::new(&mesh, alpha)?;
+            let mg = GpuPoissonMg::new(PMultigrid::with_reaction(p, g, g, xr, xr, alpha, lambda))?;
+            let (cg_ms, cg_it) = time_solve(reps, || Ok(cg.solve(&rhs, lambda, &[], false, tol, maxit)?.1))?;
+            let (mg_ms, mg_it) = time_solve(reps, || Ok(mg.solve(&rhs, tol, maxit)?.1))?;
+            println!("{:>3} {:>5}² {:>9} {:>11.2} {:>7} {:>11.2} {:>7} {:>8.1}× {:>8.1}×",
+                     p, g, n0, cg_ms, cg_it, mg_ms, mg_it, cg_ms / mg_ms, cg_it as f64 / mg_it.max(1) as f64);
+        }
     }
 
     println!("\n(wall× = CG ms / MG ms — the real speedup; iter× = iteration-count ratio.\n \
-              A wall× far below iter× means the MG V-cycle's per-dot host sync is eating the win.)");
+              MG iters should stay ~flat across p AND grid if the smoother is p-robust.)");
     Ok(())
 }
