@@ -117,6 +117,33 @@ fn ensure_mg_velocity_handle(
     }
 }
 
+/// Ensure the pair of velocity-Helmholtz MG handles, **sharing a single hierarchy across
+/// both components when their Neumann-tag sets are identical** — the common case, since the
+/// closed-box all-Dirichlet path gives both components an empty tag set, and the per-region
+/// path usually tags the same walls for `u` and `v`. Only when the tags genuinely differ
+/// (e.g. a symmetry plane that is tangential to one component but normal to the other) does
+/// the second component get its own hierarchy; otherwise `vely_slot` is left `None` and the
+/// step reuses the `velx` handle for both, halving the velocity MG setup + device memory.
+fn ensure_mg_velocity_handles(
+    velx_slot: &RefCell<Option<GpuPoissonMg>>,
+    vely_slot: &RefCell<Option<GpuPoissonMg>>,
+    mesh: &Mesh2d,
+    alpha: f64,
+    lambda: f64,
+    velx_tags: Vec<u32>,
+    vely_tags: Vec<u32>,
+) {
+    let share = velx_tags == vely_tags;
+    ensure_mg_velocity_handle(velx_slot, mesh, alpha, lambda, velx_tags);
+    if share {
+        // Both components solve the same operator ⇒ reuse the velx hierarchy (see the
+        // `unwrap_or(vx)` at the apply site); keep the second slot empty.
+        *vely_slot.borrow_mut() = None;
+    } else {
+        ensure_mg_velocity_handle(vely_slot, mesh, alpha, lambda, vely_tags);
+    }
+}
+
 type StepResult = Result<(Vec<f64>, Vec<f64>), Box<dyn std::error::Error>>;
 
 /// GPU unsteady-Stokes stepper. Holds the host `Poisson` operators used only for SIPG
@@ -692,10 +719,10 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
         ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, state.mesh.boundary_tags());
-        // Closed box ⇒ all-Dirichlet velocity (empty Neumann-tag set); reaction λ = 1/(νΔt).
+        // Closed box ⇒ all-Dirichlet velocity (empty Neumann-tag set, identical for both
+        // components ⇒ one shared MG hierarchy); reaction λ = 1/(νΔt).
         let lambda = 1.0 / (self.nu * self.dt);
-        ensure_mg_velocity_handle(&self.mg_velx, &state.mesh, self.alpha, lambda, Vec::new());
-        ensure_mg_velocity_handle(&self.mg_vely, &state.mesh, self.alpha, lambda, Vec::new());
+        ensure_mg_velocity_handles(&self.mg_velx, &self.mg_vely, &state.mesh, self.alpha, lambda, Vec::new(), Vec::new());
         let handle = self.poisson.borrow();
         let nc_handle = self.poisson_nc.borrow();
         let mg_handle = self.mg_pressure.borrow();
@@ -711,8 +738,9 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
         if let Some(h) = mg_handle.as_ref() {
             stokes = stokes.with_mg_pressure(h);
         }
-        if let (Some(vx), Some(vy)) = (mg_vx.as_ref(), mg_vy.as_ref()) {
-            stokes = stokes.with_mg_velocity(vx, vy);
+        if let Some(vx) = mg_vx.as_ref() {
+            // vely shares the velx hierarchy unless its tags differed (then it has its own).
+            stokes = stokes.with_mg_velocity(vx, mg_vy.as_ref().unwrap_or(vx));
         }
         let (ux, uy) = {
             let v = state.fields.by_id(self.velocity);
@@ -851,8 +879,7 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
         ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, pres_tags);
-        ensure_mg_velocity_handle(&self.mg_velx, &state.mesh, self.alpha, lambda, velx_tags);
-        ensure_mg_velocity_handle(&self.mg_vely, &state.mesh, self.alpha, lambda, vely_tags);
+        ensure_mg_velocity_handles(&self.mg_velx, &self.mg_vely, &state.mesh, self.alpha, lambda, velx_tags, vely_tags);
         let handle = self.poisson.borrow();
         let nc_handle = self.poisson_nc.borrow();
         let mg_handle = self.mg_pressure.borrow();
@@ -870,8 +897,8 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             if let Some(h) = mg_handle.as_ref() {
                 stokes = stokes.with_mg_pressure(h);
             }
-            if let (Some(vx), Some(vy)) = (mg_vx.as_ref(), mg_vy.as_ref()) {
-                stokes = stokes.with_mg_velocity(vx, vy);
+            if let Some(vx) = mg_vx.as_ref() {
+                stokes = stokes.with_mg_velocity(vx, mg_vy.as_ref().unwrap_or(vx));
             }
             stokes
                 .step_ns_forced_bc(&ux, &uy, t_new, bcs, &bx, &by)
@@ -888,8 +915,8 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             if let Some(h) = mg_handle.as_ref() {
                 stokes = stokes.with_mg_pressure(h);
             }
-            if let (Some(vx), Some(vy)) = (mg_vx.as_ref(), mg_vy.as_ref()) {
-                stokes = stokes.with_mg_velocity(vx, vy);
+            if let Some(vx) = mg_vx.as_ref() {
+                stokes = stokes.with_mg_velocity(vx, mg_vy.as_ref().unwrap_or(vx));
             }
             stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
@@ -1195,11 +1222,11 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
             ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
             ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, state.mesh.boundary_tags());
-            // Closed box ⇒ all-Dirichlet velocity; the viscous reaction uses the SOLVENT
-            // viscosity η_s (the coefficient `GpuStokes::new` is given below): λ = 1/(η_s Δt).
+            // Closed box ⇒ all-Dirichlet velocity (both components share one MG hierarchy);
+            // the viscous reaction uses the SOLVENT viscosity η_s (the coefficient given to
+            // `GpuStokes::new` below): λ = 1/(η_s Δt).
             let lambda = 1.0 / (self.eta_s * self.dt);
-            ensure_mg_velocity_handle(&self.mg_velx, &state.mesh, self.alpha, lambda, Vec::new());
-            ensure_mg_velocity_handle(&self.mg_vely, &state.mesh, self.alpha, lambda, Vec::new());
+            ensure_mg_velocity_handles(&self.mg_velx, &self.mg_vely, &state.mesh, self.alpha, lambda, Vec::new(), Vec::new());
             let handle = self.poisson.borrow();
             let nc_handle = self.poisson_nc.borrow();
             let mg_handle = self.mg_pressure.borrow();
@@ -1215,8 +1242,8 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             if let Some(h) = mg_handle.as_ref() {
                 stokes = stokes.with_mg_pressure(h);
             }
-            if let (Some(vx), Some(vy)) = (mg_vx.as_ref(), mg_vy.as_ref()) {
-                stokes = stokes.with_mg_velocity(vx, vy);
+            if let Some(vx) = mg_vx.as_ref() {
+                stokes = stokes.with_mg_velocity(vx, mg_vy.as_ref().unwrap_or(vx));
             }
             let (nux, nuy) = stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
