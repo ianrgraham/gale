@@ -93,6 +93,30 @@ fn ensure_mg_pressure_handle(
     }
 }
 
+/// Lazily (re)build a persistent **p-multigrid-PCG velocity-Helmholtz** handle in `slot`:
+/// built with reaction `lambda = 1/(νΔt)` and the given per-component velocity-Neumann
+/// tags. The companion to [`ensure_mg_pressure_handle`] for the non-singular viscous solve.
+/// Rebuilt when the dof count changes (remesh) **or** when `lambda` changes (a Δt change),
+/// since the reaction is baked into every level's diagonal/smoother; cleared (⇒ CG fallback)
+/// for non-conforming or non-rectangular meshes.
+fn ensure_mg_velocity_handle(
+    slot: &RefCell<Option<GpuPoissonMg>>,
+    mesh: &Mesh2d,
+    alpha: f64,
+    lambda: f64,
+    neumann_tags: Vec<u32>,
+) {
+    let mut cur = slot.borrow_mut();
+    if mesh_is_nonconforming(mesh) {
+        *cur = None;
+        return;
+    }
+    let ndof = mesh.n_elements() * mesh.refq.n_nodes();
+    if cur.as_ref().map_or(true, |h| h.ndof() != ndof || h.reaction() != lambda) {
+        *cur = PMultigrid::from_mesh(mesh, alpha, lambda, neumann_tags).and_then(|mg| GpuPoissonMg::new(mg).ok());
+    }
+}
+
 type StepResult = Result<(Vec<f64>, Vec<f64>), Box<dyn std::error::Error>>;
 
 /// GPU unsteady-Stokes stepper. Holds the host `Poisson` operators used only for SIPG
@@ -119,6 +143,13 @@ pub struct GpuStokes<'m, 'p> {
     /// at 64²). Built by the integrator from the (conforming, rectangular) flow mesh with
     /// the pressure neumann-tags; `None` ⇒ the CG path. Set via [`with_mg_pressure`].
     mg_pressure: Option<&'p GpuPoissonMg>,
+    /// Optional persistent **p-multigrid-PCG** handles for the viscous velocity Helmholtz
+    /// solves (`(λM + A)`, reaction `λ = 1/(νΔt)`), one per component since `velx`/`vely`
+    /// can carry different Neumann-tag sets (symmetry/slip). Like [`mg_pressure`] but
+    /// non-singular (no deflation); `None` ⇒ the persistent-`GpuPoisson`/CG path. Set via
+    /// [`with_mg_velocity`].
+    mg_velx: Option<&'p GpuPoissonMg>,
+    mg_vely: Option<&'p GpuPoissonMg>,
     /// Pressure-Poisson assembly (pure Neumann, singular).
     pressure: Poisson<'m>,
     /// Velocity Helmholtz assembly `(λM + A)`, one per component (differ only in their
@@ -152,6 +183,8 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             poisson: None,
             poisson_nc: None,
             mg_pressure: None,
+            mg_velx: None,
+            mg_vely: None,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
             velocity_x: Poisson::with_reaction(mesh, alpha, lambda),
             velocity_y: Poisson::with_reaction(mesh, alpha, lambda),
@@ -194,6 +227,17 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         self
     }
 
+    /// Route the two **viscous velocity Helmholtz** solves through persistent p-multigrid-PCG
+    /// handles (`velx`/`vely`, each built with reaction `λ = 1/(νΔt)` and that component's
+    /// velocity-Neumann tags). MG-PCG is p-robust and mesh-independent where the Helmholtz CG
+    /// still grows with refinement; non-singular, so no deflation. Conforming rectangular
+    /// meshes only; bit-equivalent to the CG it replaces (validated by pcg-helmholtz-check).
+    pub fn with_mg_velocity(mut self, velx: &'p GpuPoissonMg, vely: &'p GpuPoissonMg) -> Self {
+        self.mg_velx = Some(velx);
+        self.mg_vely = Some(vely);
+        self
+    }
+
     /// Solver with **per-region** boundary conditions — the GPU analogue of
     /// `gale::dg::Stokes::with_bcs`. Each boundary tag is routed via `bcs` to the right
     /// pair of operator settings (no-slip/inflow ⇒ velocity-Dirichlet + pressure-Neumann;
@@ -213,6 +257,8 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             poisson: None,
             poisson_nc: None,
             mg_pressure: None,
+            mg_velx: None,
+            mg_vely: None,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, pres_neumann.clone()),
             velocity_x: Poisson::with_bc(mesh, alpha, lambda, velx_neumann.clone()),
             velocity_y: Poisson::with_bc(mesh, alpha, lambda, vely_neumann.clone()),
@@ -414,13 +460,16 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let bx = self.velocity_x.rhs(&fxv, |x, y| bc_u(x, y, t));
         let by = self.velocity_y.rhs(&fyv, |x, y| bc_v(x, y, t));
-        let solve_vel = |b: &[f64], neu: &[u32]| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+        let solve_vel = |b: &[f64], neu: &[u32], mg: Option<&GpuPoissonMg>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
             Ok(if nc {
                 if let Some(h) = self.poisson_nc {
                     h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
                 } else {
                     poisson_nc_cg_solve(mesh, b, self.alpha, lambda, self.tol, self.maxit)?.0
                 }
+            } else if let Some(h) = mg {
+                // p-MG-PCG Helmholtz (reaction λ baked in; non-singular ⇒ no deflation).
+                h.solve(b, self.tol, self.maxit)?.0
             } else if let Some(h) = self.poisson {
                 // All-Dirichlet velocity Helmholtz (closed box ⇒ empty Neumann-tag set).
                 h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
@@ -428,8 +477,8 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
                 helmholtz_cg_solve(mesh, b, self.alpha, lambda, self.tol, self.maxit)?.0
             })
         };
-        let uxn = solve_vel(&bx, &self.velx_neumann)?;
-        let uyn = solve_vel(&by, &self.vely_neumann)?;
+        let uxn = solve_vel(&bx, &self.velx_neumann, self.mg_velx)?;
+        let uyn = solve_vel(&by, &self.vely_neumann, self.mg_vely)?;
         Ok((uxn, uyn))
     }
 
@@ -554,21 +603,24 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let bx = self.velocity_x.rhs_tagged(&fxv, |tag, x, y| vel_dir(tag, x, y).0, |_, _, _| 0.0);
         let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y| vel_dir(tag, x, y).1, |_, _, _| 0.0);
-        let solve_vel = |b: &[f64], neu: &[u32]| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+        let solve_vel = |b: &[f64], neu: &[u32], mg: Option<&GpuPoissonMg>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
             Ok(if nc {
                 if let Some(h) = self.poisson_nc {
                     h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
                 } else {
                     helmholtz_nc_cg_solve_tags(mesh, b, self.alpha, lambda, neu, self.tol, self.maxit)?.0
                 }
+            } else if let Some(h) = mg {
+                // p-MG-PCG Helmholtz (reaction λ + this component's Neumann tags baked in).
+                h.solve(b, self.tol, self.maxit)?.0
             } else if let Some(h) = self.poisson {
                 h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
             } else {
                 helmholtz_cg_solve_tags(mesh, b, self.alpha, lambda, neu, self.tol, self.maxit)?.0
             })
         };
-        let uxn = solve_vel(&bx, &self.velx_neumann)?;
-        let uyn = solve_vel(&by, &self.vely_neumann)?;
+        let uxn = solve_vel(&bx, &self.velx_neumann, self.mg_velx)?;
+        let uyn = solve_vel(&by, &self.vely_neumann, self.mg_vely)?;
         Ok((uxn, uyn))
     }
 
@@ -595,6 +647,8 @@ pub struct GpuStokesIntegrator {
     poisson: RefCell<Option<GpuPoisson>>,
     poisson_nc: RefCell<Option<GpuPoissonNc>>,
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
+    mg_velx: RefCell<Option<GpuPoissonMg>>,
+    mg_vely: RefCell<Option<GpuPoissonMg>>,
 }
 
 impl GpuStokesIntegrator {
@@ -611,6 +665,8 @@ impl GpuStokesIntegrator {
             poisson: RefCell::new(None),
             poisson_nc: RefCell::new(None),
             mg_pressure: RefCell::new(None),
+            mg_velx: RefCell::new(None),
+            mg_vely: RefCell::new(None),
         }
     }
 
@@ -636,9 +692,15 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
         ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, state.mesh.boundary_tags());
+        // Closed box ⇒ all-Dirichlet velocity (empty Neumann-tag set); reaction λ = 1/(νΔt).
+        let lambda = 1.0 / (self.nu * self.dt);
+        ensure_mg_velocity_handle(&self.mg_velx, &state.mesh, self.alpha, lambda, Vec::new());
+        ensure_mg_velocity_handle(&self.mg_vely, &state.mesh, self.alpha, lambda, Vec::new());
         let handle = self.poisson.borrow();
         let nc_handle = self.poisson_nc.borrow();
         let mg_handle = self.mg_pressure.borrow();
+        let mg_vx = self.mg_velx.borrow();
+        let mg_vy = self.mg_vely.borrow();
         let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt);
         if let Some(h) = handle.as_ref() {
             stokes = stokes.with_handle(h);
@@ -648,6 +710,9 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
         }
         if let Some(h) = mg_handle.as_ref() {
             stokes = stokes.with_mg_pressure(h);
+        }
+        if let (Some(vx), Some(vy)) = (mg_vx.as_ref(), mg_vy.as_ref()) {
+            stokes = stokes.with_mg_velocity(vx, vy);
         }
         let (ux, uy) = {
             let v = state.fields.by_id(self.velocity);
@@ -693,6 +758,8 @@ pub struct GpuDualSplitting {
     poisson: RefCell<Option<GpuPoisson>>,
     poisson_nc: RefCell<Option<GpuPoissonNc>>,
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
+    mg_velx: RefCell<Option<GpuPoissonMg>>,
+    mg_vely: RefCell<Option<GpuPoissonMg>>,
 }
 
 impl GpuDualSplitting {
@@ -715,6 +782,8 @@ impl GpuDualSplitting {
             poisson: RefCell::new(None),
             poisson_nc: RefCell::new(None),
             mg_pressure: RefCell::new(None),
+            mg_velx: RefCell::new(None),
+            mg_vely: RefCell::new(None),
         }
     }
 
@@ -772,12 +841,23 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             Some(bcs) => bcs.pressure_neumann_tags(&state.mesh),
             None => state.mesh.boundary_tags(),
         };
+        // Per-component velocity-Neumann tags for the MG Helmholtz handles (outflow +
+        // symmetry/slip with BCs, empty for the closed-box all-Dirichlet path).
+        let (velx_tags, vely_tags) = match &self.bcs {
+            Some(bcs) => (bcs.velocity_neumann_tags(&state.mesh, 0), bcs.velocity_neumann_tags(&state.mesh, 1)),
+            None => (Vec::new(), Vec::new()),
+        };
+        let lambda = 1.0 / (self.nu * self.dt);
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
         ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, pres_tags);
+        ensure_mg_velocity_handle(&self.mg_velx, &state.mesh, self.alpha, lambda, velx_tags);
+        ensure_mg_velocity_handle(&self.mg_vely, &state.mesh, self.alpha, lambda, vely_tags);
         let handle = self.poisson.borrow();
         let nc_handle = self.poisson_nc.borrow();
         let mg_handle = self.mg_pressure.borrow();
+        let mg_vx = self.mg_velx.borrow();
+        let mg_vy = self.mg_vely.borrow();
         let (nux, nuy) = if let Some(bcs) = &self.bcs {
             let mut stokes = GpuStokes::with_bcs(&state.mesh, self.alpha, self.nu, self.dt, bcs);
             stokes.convection_scheme = self.convection_scheme;
@@ -789,6 +869,9 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             }
             if let Some(h) = mg_handle.as_ref() {
                 stokes = stokes.with_mg_pressure(h);
+            }
+            if let (Some(vx), Some(vy)) = (mg_vx.as_ref(), mg_vy.as_ref()) {
+                stokes = stokes.with_mg_velocity(vx, vy);
             }
             stokes
                 .step_ns_forced_bc(&ux, &uy, t_new, bcs, &bx, &by)
@@ -804,6 +887,9 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             }
             if let Some(h) = mg_handle.as_ref() {
                 stokes = stokes.with_mg_pressure(h);
+            }
+            if let (Some(vx), Some(vy)) = (mg_vx.as_ref(), mg_vy.as_ref()) {
+                stokes = stokes.with_mg_velocity(vx, vy);
             }
             stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
@@ -983,6 +1069,8 @@ pub struct GpuViscoelasticDualSplitting {
     poisson: RefCell<Option<GpuPoisson>>,
     poisson_nc: RefCell<Option<GpuPoissonNc>>,
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
+    mg_velx: RefCell<Option<GpuPoissonMg>>,
+    mg_vely: RefCell<Option<GpuPoissonMg>>,
 }
 
 impl GpuViscoelasticDualSplitting {
@@ -1017,6 +1105,8 @@ impl GpuViscoelasticDualSplitting {
             poisson: RefCell::new(None),
             poisson_nc: RefCell::new(None),
             mg_pressure: RefCell::new(None),
+            mg_velx: RefCell::new(None),
+            mg_vely: RefCell::new(None),
         }
     }
 
@@ -1105,9 +1195,16 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
             ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
             ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, state.mesh.boundary_tags());
+            // Closed box ⇒ all-Dirichlet velocity; the viscous reaction uses the SOLVENT
+            // viscosity η_s (the coefficient `GpuStokes::new` is given below): λ = 1/(η_s Δt).
+            let lambda = 1.0 / (self.eta_s * self.dt);
+            ensure_mg_velocity_handle(&self.mg_velx, &state.mesh, self.alpha, lambda, Vec::new());
+            ensure_mg_velocity_handle(&self.mg_vely, &state.mesh, self.alpha, lambda, Vec::new());
             let handle = self.poisson.borrow();
             let nc_handle = self.poisson_nc.borrow();
             let mg_handle = self.mg_pressure.borrow();
+            let mg_vx = self.mg_velx.borrow();
+            let mg_vy = self.mg_vely.borrow();
             let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.eta_s, self.dt);
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
@@ -1117,6 +1214,9 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             }
             if let Some(h) = mg_handle.as_ref() {
                 stokes = stokes.with_mg_pressure(h);
+            }
+            if let (Some(vx), Some(vy)) = (mg_vx.as_ref(), mg_vy.as_ref()) {
+                stokes = stokes.with_mg_velocity(vx, vy);
             }
             let (nux, nuy) = stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)

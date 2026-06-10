@@ -35,6 +35,21 @@ fn dot_blocks(ndof: usize) -> usize {
     ndof.div_ceil(RED).clamp(1, 1024)
 }
 
+/// Convergence guard for the iterative elliptic solves (CG and MG-PCG alike): emit a
+/// one-line stderr warning when a solve exhausts `maxit` without reaching `tol`, so a
+/// pathological / under-resolved solve **surfaces** instead of silently feeding an
+/// inaccurate velocity or pressure back into the time integrator. `rel` is the achieved
+/// relative residual `‖r‖/‖b‖` at the last iteration. Non-fatal (the last iterate is
+/// still returned) — parity with the prior behaviour, but now observable.
+fn warn_unconverged(label: &str, converged: bool, iters: usize, maxit: usize, rel: f64, tol: f64) {
+    if !converged {
+        eprintln!(
+            "gale-gpu: WARNING: {label} did not converge — {iters}/{maxit} iters, \
+             rel residual {rel:.3e} (tol {tol:.1e}); returning the last iterate."
+        );
+    }
+}
+
 #[cuda_module]
 mod kernels {
     use super::*;
@@ -717,6 +732,7 @@ fn cg_solve_impl(
     dot_to!(&r, &r, &mut d_rs);
     let bnorm = d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300);
     let mut iters = 0;
+    let mut converged = false;
     for it in 0..maxit {
         apply!(&p, &mut ap);
         dot_to!(&p, &ap, &mut d_pap);
@@ -727,12 +743,15 @@ fn cg_solve_impl(
         iters = it + 1;
         if (it + 1) % CHECK == 0 || it + 1 == maxit {
             if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bnorm < tol {
+                converged = true;
                 break;
             }
         }
         module.cg_beta(&stream, one, &d_rsnew, &mut d_rs, &mut d_beta)?; // β = rsnew/rs; rs ← rsnew
         module.xpby_s(&stream, vec_cfg, &mut p, &r, &d_beta)?; // p = r + β p
     }
+    let rel = d_rsnew.to_host_vec(&stream)?[0].sqrt() / bnorm;
+    warn_unconverged("Helmholtz/Poisson CG", converged, iters, maxit, rel, tol);
 
     Ok((x.to_host_vec(&stream)?, iters))
 }
@@ -825,6 +844,8 @@ pub fn pressure_cg_solve(
     let bn = dot!(&r, &r).sqrt().max(1e-300);
     let mut rs = dot!(&r, &r);
     let mut iters = 0;
+    let mut converged = false;
+    let mut rel = (rs.sqrt() / bn).min(1.0);
     for it in 0..maxit {
         apply!(&p, &mut ap);
         let pap = dot!(&p, &ap);
@@ -834,14 +855,156 @@ pub fn pressure_cg_solve(
         deflate!(&mut r);
         let rs_new = dot!(&r, &r);
         iters = it + 1;
-        if rs_new.sqrt() / bn < tol {
+        rel = rs_new.sqrt() / bn;
+        if rel < tol {
+            converged = true;
             break;
         }
         let beta = rs_new / rs;
         module.xpby(&stream, vec_cfg, &mut p, &r, beta)?; // p = r + β p
         rs = rs_new;
     }
+    warn_unconverged("deflated pressure CG", converged, iters, maxit, rel, tol);
     Ok((x.to_host_vec(&stream)?, iters))
+}
+
+/// All **constant** per-level device state for one fixed p-multigrid hierarchy: the
+/// uploaded mesh metrics + SIPG face metadata, inverse diagonals, transfer matrices,
+/// launch configs, and the deflation constants for a singular pure-Neumann operator.
+/// Built once (`MgConst::build`) and reused across every [`pcg_solve_with`] call, so
+/// repeated solves on a fixed mesh skip the host `flatten_mesh` + H2D uploads (~ms per
+/// level). Only `rhs` and the per-solve scratch move thereafter.
+struct MgConst {
+    nlev: usize,
+    n_pre: usize,
+    n_post: usize,
+    n0: usize,
+    n1v: Vec<u32>,
+    nev: Vec<u32>,
+    ndofv: Vec<usize>,
+    dl: Vec<DeviceBuffer<f64>>,
+    rxl: Vec<DeviceBuffer<f64>>,
+    ryl: Vec<DeviceBuffer<f64>>,
+    sxl: Vec<DeviceBuffer<f64>>,
+    syl: Vec<DeviceBuffer<f64>>,
+    jwl: Vec<DeviceBuffer<f64>>,
+    invd: Vec<DeviceBuffer<f64>>,
+    fvl: Vec<DeviceBuffer<u32>>,
+    fnbr: Vec<DeviceBuffer<u32>>,
+    fnx: Vec<DeviceBuffer<f64>>,
+    fny: Vec<DeviceBuffer<f64>>,
+    fsw: Vec<DeviceBuffer<f64>>,
+    ftau: Vec<DeviceBuffer<f64>>,
+    omega: Vec<f64>,
+    interp: Vec<DeviceBuffer<f64>>,
+    cfg: Vec<LaunchConfig>,
+    vcfg: Vec<LaunchConfig>,
+    reaction: f64,
+    deflate: bool,
+    ones0: DeviceBuffer<f64>,
+    ones_c: DeviceBuffer<f64>,
+    ninv0: f64,
+    ninv_c: f64,
+    clast: usize,
+}
+
+impl MgConst {
+    /// Flatten + upload every level of `mg` once. `stream` owns the CUDA context the
+    /// buffers live in; it must be the same stream later passed to [`pcg_solve_with`].
+    fn build(stream: &CudaStream, mg: &PMultigrid) -> Result<Self, Box<dyn std::error::Error>> {
+        let nlev = mg.n_levels();
+        let (n_pre, n_post) = mg.smoothing();
+        let n0 = mg.mesh(0).n_elements() * mg.mesh(0).refq.n_nodes();
+        let up = |v: &[f64]| DeviceBuffer::from_host(stream, v);
+        let upu = |v: &[u32]| DeviceBuffer::from_host(stream, v);
+
+        let mut n1v = Vec::new();
+        let mut nev = Vec::new();
+        let mut ndofv = Vec::new();
+        let (mut dl, mut rxl, mut ryl, mut sxl, mut syl, mut jwl, mut invd) =
+            (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+        let (mut fvl, mut fnbr) = (vec![], vec![]);
+        let (mut fnx, mut fny, mut fsw, mut ftau) = (vec![], vec![], vec![], vec![]);
+        let mut omega = Vec::new();
+
+        // Per-region Neumann tags (rediscretized at every level) — all-tags + reaction 0 is
+        // the singular pressure operator (auto-deflated below); empty is all-Dirichlet.
+        let neumann_tags = mg.neumann_tags();
+        for l in 0..nlev {
+            let m = mg.mesh(l);
+            let ma = flatten_mesh(m, mg.alpha, neumann_tags);
+            n1v.push(ma.n1);
+            nev.push(ma.ne as u32);
+            ndofv.push(ma.ndof);
+            dl.push(up(&ma.diff)?);
+            rxl.push(up(&ma.rx)?);
+            ryl.push(up(&ma.ry)?);
+            sxl.push(up(&ma.sx)?);
+            syl.push(up(&ma.sy)?);
+            jwl.push(up(&ma.jw)?);
+            invd.push(up(mg.inv_diagonal(l))?);
+            fvl.push(upu(&ma.fvl)?);
+            fnbr.push(upu(&ma.fnbr)?);
+            fnx.push(up(&ma.fnx)?);
+            fny.push(up(&ma.fny)?);
+            fsw.push(up(&ma.fsw)?);
+            ftau.push(up(&ma.ftau)?);
+            omega.push(mg.jacobi_omega(l));
+        }
+        // transfer matrices (coarse l+1 → fine l)
+        let mut interp = Vec::new();
+        for l in 0..nlev - 1 {
+            interp.push(up(mg.interp_matrix(l))?);
+        }
+
+        // per-level launch configs
+        let cfg: Vec<LaunchConfig> = (0..nlev)
+            .map(|l| LaunchConfig { grid_dim: (nev[l], 1, 1), block_dim: (n1v[l] * n1v[l], 1, 1), shared_mem_bytes: 0 })
+            .collect();
+        let vcfg: Vec<LaunchConfig> = ndofv.iter().map(|&n| LaunchConfig::for_num_elems(n as u32)).collect();
+
+        // Singular pure-Neumann pressure operator (constant nullspace) ⇒ deflate: project the
+        // residual onto the range (subtract its mean) in the OUTER PCG and in the COARSEST
+        // solve; the SPD V-cycle preconditioner itself is unmodified (see the research note).
+        let clast = nlev - 1;
+        let deflate = mg.is_singular(&mg.mesh(0).boundary_tags());
+        let ones0 = up(&vec![1.0f64; n0])?;
+        let ones_c = up(&vec![1.0f64; ndofv[clast]])?;
+        let ninv_c = 1.0 / ndofv[clast] as f64;
+        Ok(Self {
+            nlev,
+            n_pre,
+            n_post,
+            n0,
+            n1v,
+            nev,
+            ndofv,
+            dl,
+            rxl,
+            ryl,
+            sxl,
+            syl,
+            jwl,
+            invd,
+            fvl,
+            fnbr,
+            fnx,
+            fny,
+            fsw,
+            ftau,
+            omega,
+            interp,
+            cfg,
+            vcfg,
+            reaction: mg.reaction(),
+            deflate,
+            ones0,
+            ones_c,
+            ninv0: 1.0 / n0 as f64,
+            ninv_c,
+            clast,
+        })
+    }
 }
 
 /// Solve the SIPG Poisson system `A·u = rhs` by **p-multigrid-preconditioned CG,
@@ -862,99 +1025,93 @@ pub fn poisson_pcg_solve(
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    // One-shot: create the context, load the module, run. For repeated solves on a fixed
-    // hierarchy use the persistent [`GpuPoissonMg`] handle (amortizes the ~0.3 s load).
+    // One-shot: create the context, load the module, upload, run. For repeated solves on a
+    // fixed hierarchy use the persistent [`GpuPoissonMg`] handle (amortizes the ~0.3 s load
+    // AND the per-level uploads).
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
-    pcg_run(&stream, &module, mg, rhs, tol, maxit)
+    let dev = MgConst::build(&stream, mg)?;
+    pcg_solve_with(&stream, &module, &dev, rhs, tol, maxit)
 }
 
-/// The p-MG-PCG loop given an already-created stream + loaded module — shared by the
-/// one-shot [`poisson_pcg_solve`] and the persistent [`GpuPoissonMg`] handle. Per-level
-/// device arrays are (re)uploaded here (cheap, O(n) memcpy); the expensive context/module
-/// setup lives in the caller.
-fn pcg_run(
+/// The p-MG-PCG loop given an already-created stream + loaded module + uploaded
+/// hierarchy (`MgConst`) — shared by the one-shot [`poisson_pcg_solve`] and the
+/// persistent [`GpuPoissonMg`] handle. The constant per-level device arrays live in
+/// `dev`; only the per-solve scratch (V-cycle work vectors + PCG vectors) is allocated
+/// here, and only `rhs` is uploaded.
+fn pcg_solve_with(
     stream: &CudaStream,
     module: &kernels::LoadedModule,
-    mg: &PMultigrid,
+    dev: &MgConst,
     rhs: &[f64],
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-    let nlev = mg.n_levels();
-    let (n_pre, n_post) = mg.smoothing();
-    let nn0 = mg.mesh(0).refq.n_nodes();
-    let n0 = mg.mesh(0).n_elements() * nn0;
+    // Bind the constant per-level state to bare locals (disjoint immutable borrows of
+    // `dev`) so the matvec/V-cycle/deflation macros below read exactly as the original
+    // single-function loop did.
+    let MgConst {
+        nlev,
+        n_pre,
+        n_post,
+        n0,
+        ref n1v,
+        ref nev,
+        ref ndofv,
+        ref dl,
+        ref rxl,
+        ref ryl,
+        ref sxl,
+        ref syl,
+        ref jwl,
+        ref invd,
+        ref fvl,
+        ref fnbr,
+        ref fnx,
+        ref fny,
+        ref fsw,
+        ref ftau,
+        ref omega,
+        ref interp,
+        ref cfg,
+        ref vcfg,
+        reaction,
+        deflate,
+        ref ones0,
+        ref ones_c,
+        ninv0,
+        ninv_c,
+        clast,
+    } = *dev;
+    let _ = nev; // captured into `cfg` at build time; kept for parity with the SoA layout
     assert_eq!(rhs.len(), n0, "rhs length must match the finest level");
-    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
-    let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
 
-    // device buffers (struct-of-arrays per level)
-    let mut n1v = Vec::new();
-    let mut nev = Vec::new();
-    let mut ndofv = Vec::new();
-    let (mut dl, mut rxl, mut ryl, mut sxl, mut syl, mut jwl, mut invd) =
-        (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-    let (mut fvl, mut fnbr) = (vec![], vec![]);
-    let (mut fnx, mut fny, mut fsw, mut ftau) = (vec![], vec![], vec![], vec![]);
-    let mut omega = Vec::new();
+    // Per-solve scratch: V-cycle work vectors (struct-of-arrays per level) — allocated
+    // fresh each solve (cheap device zeroed-malloc; the expensive uploads live in `dev`).
     let (mut xb, mut bb, mut rb, mut apb, mut gxb, mut gyb, mut tmpb) =
         (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-
-    // Per-region Neumann tags (rediscretized at every level) — all-tags + reaction 0 is the
-    // singular pressure operator (auto-deflated below); empty is all-Dirichlet.
-    let neumann_tags = mg.neumann_tags();
     for l in 0..nlev {
-        let m = mg.mesh(l);
-        let ma = flatten_mesh(m, mg.alpha, neumann_tags);
-        n1v.push(ma.n1);
-        nev.push(ma.ne as u32);
-        ndofv.push(ma.ndof);
-        dl.push(up(&ma.diff)?);
-        rxl.push(up(&ma.rx)?);
-        ryl.push(up(&ma.ry)?);
-        sxl.push(up(&ma.sx)?);
-        syl.push(up(&ma.sy)?);
-        jwl.push(up(&ma.jw)?);
-        invd.push(up(mg.inv_diagonal(l))?);
-        fvl.push(upu(&ma.fvl)?);
-        fnbr.push(upu(&ma.fnbr)?);
-        fnx.push(up(&ma.fnx)?);
-        fny.push(up(&ma.fny)?);
-        fsw.push(up(&ma.fsw)?);
-        ftau.push(up(&ma.ftau)?);
-        omega.push(mg.jacobi_omega(l));
-        xb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
-        bb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
-        rb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
-        apb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
-        gxb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
-        gyb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
-        tmpb.push(DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?);
+        let nd = ndofv[l];
+        xb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        bb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        rb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        apb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        gxb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        gyb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        tmpb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
     }
-    // transfer matrices (coarse l+1 → fine l)
-    let mut interp = Vec::new();
-    for l in 0..nlev - 1 {
-        interp.push(up(mg.interp_matrix(l))?);
-    }
-
-    // per-level launch configs
-    let cfg: Vec<LaunchConfig> = (0..nlev)
-        .map(|l| LaunchConfig { grid_dim: (nev[l], 1, 1), block_dim: (n1v[l] * n1v[l], 1, 1), shared_mem_bytes: 0 })
-        .collect();
-    let vcfg: Vec<LaunchConfig> = ndofv.iter().map(|&n| LaunchConfig::for_num_elems(n as u32)).collect();
 
     // PCG vectors (finest level, separate from V-cycle scratch).
-    let mut psol = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
-    let mut pres = up(rhs)?;
-    let mut pp = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
-    let pz = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
-    let mut pap = DeviceBuffer::<f64>::zeroed(&stream, n0)?;
-    let rhs_dev = up(rhs)?;
+    let mut psol = DeviceBuffer::<f64>::zeroed(stream, n0)?;
+    let mut pres = DeviceBuffer::from_host(stream, rhs)?;
+    let mut pp = DeviceBuffer::<f64>::zeroed(stream, n0)?;
+    let pz = DeviceBuffer::<f64>::zeroed(stream, n0)?;
+    let mut pap = DeviceBuffer::<f64>::zeroed(stream, n0)?;
+    let rhs_dev = DeviceBuffer::from_host(stream, rhs)?;
     // Multi-block reduction: partials sized for the finest level (the largest dot); each
     // dot launches dot_blocks($n) blocks and the host sums that many partials.
-    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, dot_blocks(n0))?;
+    let mut partial = DeviceBuffer::<f64>::zeroed(stream, dot_blocks(n0))?;
 
     macro_rules! dot {
         ($a:expr, $b:expr, $n:expr) => {{
@@ -974,11 +1131,7 @@ fn pcg_run(
     // Singular pure-Neumann pressure operator (constant nullspace) ⇒ deflate: project the
     // residual onto the range (subtract its mean) in the OUTER PCG and in the COARSEST solve;
     // the SPD V-cycle preconditioner itself is unmodified (see docs/research-pressure-multigrid.md).
-    let deflate = mg.is_singular(&mg.mesh(0).boundary_tags());
-    let ones0 = up(&vec![1.0f64; n0])?;
-    let ones_c = up(&vec![1.0f64; ndofv[nlev - 1]])?;
-    let ninv0 = 1.0 / n0 as f64;
-    let ninv_c = 1.0 / ndofv[nlev - 1] as f64;
+    // `deflate`, `ones0`, `ones_c`, `ninv0`, `ninv_c`, `clast` all come from `dev` (above).
     // Subtract the mean of a finest-level vector (range projection for the singular system).
     macro_rules! deflate0 {
         ($v:expr) => {{
@@ -989,7 +1142,6 @@ fn pcg_run(
         }};
     }
     // Coarsest-level range projection (nullspace-consistent coarse solve, Kaasschieter).
-    let clast = nlev - 1;
     macro_rules! deflate_c {
         ($v:expr) => {{
             if deflate {
@@ -999,9 +1151,9 @@ fn pcg_run(
         }};
     }
     // matvec: dst = A·src at level $l (src/dst external; gx/gy scratch from Vecs).
-    // Helmholtz reaction λ (0 ⇒ pure Poisson) — the per-level diagonal/omega in `mg` are
-    // already computed for this reaction, so the on-device V-cycle matches the CPU setup.
-    let reaction = mg.reaction();
+    // Helmholtz reaction λ (0 ⇒ pure Poisson) — `reaction` comes from `dev`; the per-level
+    // diagonal/omega were computed for it at build time, so the on-device V-cycle matches
+    // the CPU setup.
     macro_rules! matvec {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
@@ -1075,6 +1227,8 @@ fn pcg_run(
     let bn = dot!(&rhs_dev, &rhs_dev, n0).sqrt().max(1e-300);
     let mut rz = dot!(&pres, &pz, n0);
     let mut iters = 0;
+    let mut converged = false;
+    let mut rel = 1.0;
     for it in 0..maxit {
         matvec!(0, &pp, &mut pap);
         let pap_d = dot!(&pp, &pap, n0);
@@ -1083,7 +1237,9 @@ fn pcg_run(
         module.axpy(&stream, vcfg[0], &mut pres, &pap, -alpha)?;
         deflate0!(&mut pres); // keep the residual in the range each iteration
         iters = it + 1;
-        if dot!(&pres, &pres, n0).sqrt() / bn < tol {
+        rel = dot!(&pres, &pres, n0).sqrt() / bn;
+        if rel < tol {
+            converged = true;
             break;
         }
         dcopy!(&bb[0], &pres, n0);
@@ -1094,41 +1250,54 @@ fn pcg_run(
         module.xpby(&stream, vcfg[0], &mut pp, &pz, beta)?;
         rz = rz_new;
     }
+    let kind = if deflate { "singular-Neumann pressure" } else { "Helmholtz" };
+    warn_unconverged(&format!("p-MG-PCG ({kind})"), converged, iters, maxit, rel, tol);
 
     Ok((psol.to_host_vec(&stream)?, iters))
 }
 
 /// Persistent p-multigrid-PCG handle: owns the CUDA context, the loaded device module, and
-/// the `PMultigrid` hierarchy, so repeated solves on a fixed mesh skip the ~0.3 s
-/// context/module setup (the per-level array upload — only ~ms — happens per solve). Drives
-/// the deflated singular-Neumann pressure (and Helmholtz velocity) elliptic solves through
-/// one V-cycle-preconditioned CG. The flow integrators hold one of these across timesteps.
+/// the **uploaded** p-multigrid hierarchy ([`MgConst`]), so repeated solves on a fixed mesh
+/// skip both the ~0.3 s context/module setup AND the per-level `flatten_mesh` + H2D uploads.
+/// Each solve only uploads `rhs`, allocates the V-cycle/PCG scratch, and downloads the
+/// solution. Drives the deflated singular-Neumann pressure (and Helmholtz velocity) elliptic
+/// solves through one V-cycle-preconditioned CG. The flow integrators hold these across
+/// timesteps (one per distinct operator: pressure + per-component velocity Helmholtz).
 pub struct GpuPoissonMg {
-    // `stream` and `module` keep an `Arc<CudaContext>`, so the context outlives the handle.
+    // `stream` and `module` keep an `Arc<CudaContext>`, so the context outlives the handle;
+    // `dev`'s device buffers live in that same context.
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
-    mg: PMultigrid,
+    dev: MgConst,
 }
 
 impl GpuPoissonMg {
     /// Build the handle for an already-set-up p-multigrid hierarchy (pressure: all-Neumann +
-    /// reaction 0 ⇒ deflated; velocity: reaction λ + the per-region neumann tags).
+    /// reaction 0 ⇒ deflated; velocity: reaction λ + the per-region neumann tags). Uploads
+    /// every level once; `mg` is consumed (its device-side image lives in `dev` thereafter).
     pub fn new(mg: PMultigrid) -> Result<Self, Box<dyn std::error::Error>> {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
-        Ok(Self { stream, module, mg })
+        let dev = MgConst::build(&stream, &mg)?;
+        Ok(Self { stream, module, dev })
     }
 
     /// Degrees of freedom on the finest level (`n_elements · n_nodes`).
     pub fn ndof(&self) -> usize {
-        self.mg.mesh(0).n_elements() * self.mg.mesh(0).refq.n_nodes()
+        self.dev.n0
+    }
+
+    /// The Helmholtz reaction `λ` baked into this hierarchy (0 for the pure-Poisson
+    /// pressure operator). Lets a caller detect a `Δt` change (⇒ rebuild) for velocity.
+    pub fn reaction(&self) -> f64 {
+        self.dev.reaction
     }
 
     /// Solve `A·x = rhs` (the hierarchy's operator) by p-MG-PCG; singular pure-Neumann
     /// systems are auto-deflated. `rhs` is the finest-level RHS.
     pub fn solve(&self, rhs: &[f64], tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-        pcg_run(&self.stream, &self.module, &self.mg, rhs, tol, maxit)
+        pcg_solve_with(&self.stream, &self.module, &self.dev, rhs, tol, maxit)
     }
 }
 
@@ -1454,6 +1623,7 @@ impl GpuPoisson {
         dot_to!(&r, &r, &mut d_rs);
         let bnorm = d_rs.to_host_vec(stream)?[0].sqrt().max(1e-300);
         let mut iters = 0;
+        let mut converged = false;
         for it in 0..maxit {
             apply!(&p, &mut ap);
             dot_to!(&p, &ap, &mut d_pap);
@@ -1465,12 +1635,16 @@ impl GpuPoisson {
             iters = it + 1;
             if (it + 1) % CHECK == 0 || it + 1 == maxit {
                 if d_rsnew.to_host_vec(stream)?[0].sqrt() / bnorm < tol {
+                    converged = true;
                     break;
                 }
             }
             module.cg_beta(stream, one, &d_rsnew, &mut d_rs, &mut d_beta)?; // β = rsnew/rs; rs ← rsnew
             module.xpby_s(stream, vec_cfg, &mut p, &r, &d_beta)?; // p = r + β p
         }
+        let rel = d_rsnew.to_host_vec(stream)?[0].sqrt() / bnorm;
+        let label = if deflate { "GpuPoisson deflated-pressure CG" } else { "GpuPoisson CG" };
+        warn_unconverged(label, converged, iters, maxit, rel, tol);
         Ok((x.to_host_vec(stream)?, iters))
     }
 }

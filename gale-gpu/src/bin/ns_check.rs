@@ -7,8 +7,9 @@
 //!
 //! Run: cargo oxide run --bin ns-check
 
-use gale::dg::{ConvectionScheme, Mesh2d, Stokes};
+use gale::dg::{ConvectionScheme, Mesh2d, PMultigrid, Stokes};
 use gale::sim::{Simulation, State};
+use gale_gpu::GpuPoissonMg;
 use std::f64::consts::PI;
 
 fn nodal(mesh: &Mesh2d, f: impl Fn(f64, f64) -> f64) -> Vec<f64> {
@@ -88,7 +89,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fux = sim.state.field("velocity").component(0).to_vec();
     let fuy = sim.state.field("velocity").component(1).to_vec();
 
-    let mut gst = gale_gpu::GpuStokes::new(&mesh, alpha, nu, dt);
+    // Mirror the framework integrator's solver choice exactly: it auto-enables the
+    // persistent p-MG-PCG handles for the pressure and the two velocity-Helmholtz solves,
+    // so the direct loop must too — otherwise the two iterative solvers, both converged to
+    // the same 1e-10 tolerance, disagree at ~1e-10 (> the 1e-12 framework-vs-direct gate).
+    let lambda = 1.0 / (nu * dt);
+    let mgp = GpuPoissonMg::new(PMultigrid::from_mesh(&mesh, alpha, 0.0, mesh.boundary_tags()).unwrap())?;
+    let mgv = GpuPoissonMg::new(PMultigrid::from_mesh(&mesh, alpha, lambda, Vec::new()).unwrap())?;
+    let mut gst = gale_gpu::GpuStokes::new(&mesh, alpha, nu, dt)
+        .with_mg_pressure(&mgp)
+        .with_mg_velocity(&mgv, &mgv);
     gst.convection_scheme = ConvectionScheme::Nodal;
     let mut dux = nodal(&mesh, |x, y| eu(x, y, 0.0));
     let mut duy = nodal(&mesh, |x, y| ev(x, y, 0.0));

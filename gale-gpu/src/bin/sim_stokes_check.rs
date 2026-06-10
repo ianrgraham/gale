@@ -6,8 +6,9 @@
 //!
 //! Run: cargo oxide run --bin sim-stokes-check
 
-use gale::dg::Mesh2d;
+use gale::dg::{Mesh2d, PMultigrid};
 use gale::sim::{Simulation, State};
+use gale_gpu::GpuPoissonMg;
 use std::f64::consts::PI;
 
 fn nodal(mesh: &Mesh2d, f: impl Fn(f64, f64) -> f64) -> Vec<f64> {
@@ -51,7 +52,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fuy = sim.state.field("velocity").component(1).to_vec();
 
     // Direct GpuStokes loop (identical setup) — framework must reproduce it exactly.
-    let gst = gale_gpu::GpuStokes::new(&mesh, alpha, nu, dt);
+    // The integrator auto-enables the persistent p-MG-PCG handles for the pressure and the
+    // two velocity-Helmholtz solves, so the direct loop wires the same handles (else the two
+    // iterative solvers, both at 1e-10 tol, disagree at ~1e-10 > the 1e-12 fidelity gate).
+    let lambda = 1.0 / (nu * dt);
+    let mgp = GpuPoissonMg::new(PMultigrid::from_mesh(&mesh, alpha, 0.0, mesh.boundary_tags()).unwrap())?;
+    let mgv = GpuPoissonMg::new(PMultigrid::from_mesh(&mesh, alpha, lambda, Vec::new()).unwrap())?;
+    let gst = gale_gpu::GpuStokes::new(&mesh, alpha, nu, dt)
+        .with_mg_pressure(&mgp)
+        .with_mg_velocity(&mgv, &mgv);
     let mut dux = nodal(&mesh, |x, y| eu(x, y, 0.0));
     let mut duy = nodal(&mesh, |x, y| ev(x, y, 0.0));
     let zero = |_: f64, _: f64, _: f64| 0.0;
