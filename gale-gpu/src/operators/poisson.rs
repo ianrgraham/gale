@@ -27,6 +27,37 @@ const RED: usize = 256; // reduction block size
 const BND: u32 = u32::MAX; // sentinel: Dirichlet boundary face (SIPG consistency+penalty)
 const NEU: u32 = u32::MAX - 1; // sentinel: Neumann boundary face (natural BC ⇒ no contribution)
 
+/// Storage scalar for the matvec / V-cycle, with widen/narrow to the f64 accumulation type. The
+/// matvec is **f32-storage / f64-accumulate**: field vectors live in `T` (halving DRAM traffic when
+/// `T = f32`) but every contraction accumulates in f64. `T = f64` ⇒ both casts are the identity, so
+/// the `::<f64>` instantiation is **bit-for-bit the original FP64 kernel** — the across-the-board
+/// FP64 path stays first-class and mixed precision is an opt-in (`T = f32`), never a requirement.
+/// (Feasibility + generic-#[kernel] monomorphization proven by probe-mixed-precision / probe-generic-kernel.)
+pub trait Scalar: Copy {
+    fn to_f64(self) -> f64;
+    fn from_f64(x: f64) -> Self;
+}
+impl Scalar for f64 {
+    #[inline(always)]
+    fn to_f64(self) -> f64 {
+        self
+    }
+    #[inline(always)]
+    fn from_f64(x: f64) -> Self {
+        x
+    }
+}
+impl Scalar for f32 {
+    #[inline(always)]
+    fn to_f64(self) -> f64 {
+        self as f64
+    }
+    #[inline(always)]
+    fn from_f64(x: f64) -> Self {
+        x as f32
+    }
+}
+
 /// Number of blocks for the multi-block `dot_partial` reduction: enough to stream the
 /// vector across all SMs (one block-partial each), capped so the host-side final sum of
 /// the partials stays trivial. `RED` threads per block. Volta has 80 SMs; 1024 blocks ×
@@ -83,10 +114,12 @@ mod kernels {
 
     #[kernel]
     #[allow(clippy::too_many_arguments)]
-    pub fn gradient(
-        d: &[f64], u: &[f64], rx: f64, sy: f64, n1: u32, ne: u32,
-        mut gx: DisjointSlice<f64>, mut gy: DisjointSlice<f64>,
+    pub fn gradient<T: Scalar>(
+        d: &[f64], u: &[T], rx: f64, sy: f64, n1: u32, ne: u32,
+        mut gx: DisjointSlice<T>, mut gy: DisjointSlice<T>,
     ) {
+        // Storage `T`, accumulate f64: the diff matrix + shared tile are f64; only the global
+        // field reads/writes carry `T`. `T = f64` ⇒ to_f64/from_f64 are identity (bit-exact).
         let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | US(epb·nn) ]
         let n1 = n1 as usize;
         let nn = n1 * n1;
@@ -102,7 +135,7 @@ mod kernels {
                 *sm.add(t) = d[t]; // shared diff matrix, loaded once per block
             }
             if active {
-                *sm.add(us + m) = u[e * nn + m];
+                *sm.add(us + m) = u[e * nn + m].to_f64();
             }
         }
         thread::sync_threads();
@@ -126,20 +159,23 @@ mod kernels {
         let gyv = sy * uss;
         // block_dim = epb·nn ⇒ global 1D thread index == e·nn + m.
         if let Some(o) = gx.get_mut(thread::index_1d()) {
-            *o = gxv;
+            *o = T::from_f64(gxv);
         }
         if let Some(o) = gy.get_mut(thread::index_1d()) {
-            *o = gyv;
+            *o = T::from_f64(gyv);
         }
     }
 
     #[kernel]
     #[allow(clippy::too_many_arguments)]
-    pub fn operator(
-        d: &[f64], u: &[f64], gx: &[f64], gy: &[f64], mass: &[f64], n1: u32, ne: u32, rx: f64,
+    pub fn operator<T: Scalar>(
+        d: &[f64], u: &[T], gx: &[T], gy: &[T], mass: &[f64], n1: u32, ne: u32, rx: f64,
         sy: f64, jac: f64, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
-        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<f64>,
+        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<T>,
     ) {
+        // Storage `T`, accumulate f64 (shared PR/PS, metrics, mass all f64). The global field
+        // reads (gx/gy/u, own + neighbor) widen via to_f64; the result narrows via from_f64.
+        // `T = f64` ⇒ identity casts ⇒ bit-for-bit the original FP64 operator.
         let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | PR(epb·nn) | PS(epb·nn) ]
         let n1 = n1 as usize;
         let nn = n1 * n1;
@@ -162,8 +198,8 @@ mod kernels {
         let mut rf = 0.0f64;
         if active {
             unsafe {
-                let wx = jw_b * gx[b];
-                let wy = jw_b * gy[b];
+                let wx = jw_b * gx[b].to_f64();
+                let wy = jw_b * gy[b].to_f64();
                 *sm.add(pr + m) = rx * wx; // ry = 0
                 *sm.add(ps + m) = sy * wy; // sx = 0
             }
@@ -197,13 +233,13 @@ mod kernels {
                         let nx = face_nx[idx];
                         let ny = face_ny[idx];
                         let sw = face_sw[idx];
-                        let dun_e = nx * gx[b] + ny * gy[b];
-                        let ug = u[b];
+                        let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
+                        let ug = u[b].to_f64();
                         let (avg, jump, gfac) = if nbr == BND {
                             (dun_e, ug, 1.0)
                         } else {
                             let ng = nbr as usize;
-                            (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
+                            (0.5 * (dun_e + nx * gx[ng].to_f64() + ny * gy[ng].to_f64()), ug - u[ng].to_f64(), 0.5)
                         };
                         let g = gfac * sw * jump;
                         rf += -sw * avg + tau * sw * jump;
@@ -236,7 +272,7 @@ mod kernels {
         if let Some(o) = out.get_mut(thread::index_1d()) {
             // SIPG stiffness `A·u` plus the Helmholtz reaction `λ·M·u` (diagonal GLL
             // mass `M = diag(jw)`). `λ = 0` ⇒ pure Poisson, bit-identical to before.
-            *o = acc + rf + lambda * jw_b * u[b];
+            *o = T::from_f64(acc + rf + lambda * jw_b * u[b].to_f64());
         }
     }
 
@@ -695,8 +731,8 @@ pub fn poisson_apply(
     let module = kernels::load(&ctx)?;
     let nev = ma.ne as u32;
     let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
-    module.gradient(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, ma.n1, nev, &mut gx_dev, &mut gy_dev)?;
-    module.operator(
+    module.gradient::<f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, ma.n1, nev, &mut gx_dev, &mut gy_dev)?;
+    module.operator::<f64>(
         &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &mass_dev, ma.n1, nev, ma.rx, ma.sy, ma.jac,
         &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out_dev,
     )?;
@@ -820,8 +856,8 @@ fn cg_solve_impl(
     }
     macro_rules! apply {
         ($field:expr, $dst:expr) => {{
-            module.gradient(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
-            module.operator(
+            module.gradient::<f64>(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
+            module.operator::<f64>(
                 &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, reaction, $dst,
             )?;
@@ -926,8 +962,8 @@ pub fn pressure_cg_solve(
     }
     macro_rules! apply {
         ($field:expr, $dst:expr) => {{
-            module.gradient(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
-            module.operator(
+            module.gradient::<f64>(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
+            module.operator::<f64>(
                 &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, $dst,
             )?;
@@ -1299,8 +1335,8 @@ fn pcg_solve_with(
     macro_rules! matvec {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
-            module.gradient(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
-            module.operator(
+            module.gradient::<f64>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
+            module.operator::<f64>(
                 &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
                 &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
             )?;
@@ -1557,10 +1593,10 @@ pub fn bench_poisson_kernels(
     }
 
     let grad_ms = timed!({
-        module.gradient(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
+        module.gradient::<f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
     });
     let op_ms = timed!({
-        module.operator(
+        module.operator::<f64>(
             &stream, ocfg, &d_dev, &u_dev, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
             &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out,
         )?;
@@ -1771,8 +1807,8 @@ impl GpuPoisson {
         }
         macro_rules! apply {
             ($field:expr, $dst:expr) => {{
-                module.gradient(stream, gcfg, &self.d_dev, $field, self.rx, self.sy, n1, nev, &mut gx, &mut gy)?;
-                module.operator(
+                module.gradient::<f64>(stream, gcfg, &self.d_dev, $field, self.rx, self.sy, n1, nev, &mut gx, &mut gy)?;
+                module.operator::<f64>(
                     stream, ocfg, &self.d_dev, $field, &gx, &gy, &self.mass_dev, n1, nev, self.rx, self.sy, self.jac,
                     &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, &fnbr_dev, &self.ftau_dev, reaction, $dst,
                 )?;
