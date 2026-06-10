@@ -1,5 +1,6 @@
 //! `gale-gpu` — GPU device kernels + host launch wrappers for gale's DG operators,
 //! as **reusable library components** (not one-off binaries).
+#![cfg_attr(feature = "autodiff", feature(autodiff))]
 //!
 //! This crate carries the `#[cuda_module]` device code, so it must be built with
 //! the cuda-oxide codegen backend (`cargo oxide`). It depends on the pure-host
@@ -45,6 +46,8 @@ pub use operators::advection3d::advection3d_rhs;
 pub use operators::burgers::burgers_rhs;
 pub use operators::euler::euler_rhs;
 pub use operators::logconf::{logconf_implicit_relax, logconf_limit_trace, logconf_psi_rhs};
+#[cfg(feature = "autodiff")]
+pub use operators::logconf::logconf_implicit_relax_grad;
 pub use operators::logconf3d::logconf3d_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
 pub use operators::oldroyd3d::oldroyd3d_conf_rhs;

@@ -13,6 +13,15 @@ edition = "2024"
 name = "gale_gpu"
 path = "src/lib.rs"
 
+[features]
+# Differentiable GPU kernels via std::autodiff (`#[autodiff_forward]`) → Enzyme,
+# wired through `cargo oxide`. OFF by default: when enabled, the whole device
+# bundle is built through the opaque-IR → LLVMEnzyme → llc → ptxas path (needs an
+# LLVM-21 + LLVMEnzyme-21 + ptxas toolchain), so normal builds stay on the fast
+# default NVVM path. Enable with `cargo oxide run --features autodiff …`.
+autodiff = []
+default = ["autodiff"]
+
 [dependencies]
 gale = { path = ".." }
 cuda-device = { workspace = true }
@@ -43,6 +52,18 @@ path = "src/bin/sim_gpu_check.rs"
 [[bin]]
 name = "vecadd"
 path = "src/bin/vecadd.rs"
+
+# std::autodiff → cargo-oxide → cuda-host end-to-end probe (needs `autodiff`).
+[[bin]]
+name = "ad-probe-check"
+path = "src/bin/ad_probe_check.rs"
+required-features = ["autodiff"]
+
+# gale's REAL implicit_relax differentiated via the automated path (needs `autodiff`).
+[[bin]]
+name = "implicit-relax-grad-check"
+path = "src/bin/implicit_relax_grad_check.rs"
+required-features = ["autodiff"]
 
 # Milestone-1 sm_70 (Volta) probe: device inventory, FP64 arithmetic + libdevice
 # sqrt, FP64 shared-memory cooperation, and multi-GPU peer-to-peer.

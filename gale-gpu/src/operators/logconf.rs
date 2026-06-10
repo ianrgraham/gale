@@ -11,6 +11,8 @@
 //!   ∂ₜΨ = −(u·∇)Ψ + (ΩΨ − ΨΩ) + 2B + (1/λ)(e^{−Ψ} − I).
 
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+#[cfg(feature = "autodiff")]
+use cuda_device::device;
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
 use gale::dg::{LogConfOldroydB, Mesh2d};
@@ -20,6 +22,8 @@ const NN_MAX: usize = 81;
 #[cuda_module]
 mod kernels {
     use super::*;
+    #[cfg(feature = "autodiff")]
+    use core::autodiff::autodiff_forward;
 
     /// `∂ₜΨ` for one element per block, one node per thread.
     #[kernel]
@@ -282,6 +286,116 @@ mod kernels {
         }
     }
 
+    /// Differentiable `#[device]` core of [`implicit_relax`] for std::autodiff →
+    /// Enzyme (via `cargo oxide --features autodiff`). Identical math, but over
+    /// **raw pointers** — the `&[f64]`/`DisjointSlice` ABI is mistranslated under
+    /// differentiation (`<[T]>::get_mut` → discarded stack copy; `o[i]=` is an
+    /// unsupported 2-level write). `inv_lambda` (1/λ) is the `Dual` differentiation
+    /// target; the three outputs carry the tangent shadow. `index_1d()` =
+    /// blockIdx·blockDim + threadIdx = the node `b` (block_dim = nn, as launched).
+    /// The pipeline synthesizes `d_implicit_relax_core` + `d_implicit_relax_core_primal`.
+    #[cfg(feature = "autodiff")]
+    #[device]
+    #[autodiff_forward(
+        d_implicit_relax_core,
+        Const, Const, Const, Const, Dual, Const, Const, Dual, Dual, Dual
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn implicit_relax_core(
+        bxx: *const f64, bxy: *const f64, byy: *const f64,
+        gamma: f64, inv_lambda: f64, alpha: f64, ext: f64,
+        oxx: *mut f64, oxy: *mut f64, oyy: *mut f64,
+    ) {
+        let off = thread::index_1d().get() * 8;
+        let (p, q, r) = unsafe {
+            (
+                *((bxx as usize).wrapping_add(off) as *const f64),
+                *((bxy as usize).wrapping_add(off) as *const f64),
+                *((byy as usize).wrapping_add(off) as *const f64),
+            )
+        };
+        // Eigendecompose B (atan2-free, identical to `implicit_relax`).
+        let tr = 0.5 * (p + r);
+        let diff = p - r;
+        let rad = (0.25 * diff * diff + q * q).sqrt();
+        let mu1 = tr + rad;
+        let mu2 = tr - rad;
+        let mu1r = mu1 - r;
+        let nrm = (mu1r * mu1r + q * q).sqrt();
+        let (c0, s0) = if nrm > 1e-300 { (mu1r / nrm, q / nrm) } else { (0.0, 1.0) };
+        let gl = gamma * inv_lambda;
+        let mut psi1 = mu1;
+        let mut psi2 = mu2;
+        if ext < 1e300 {
+            let mut lo = 1e-12;
+            let mut hi = ext * (1.0 - 1e-12);
+            let mut it = 0usize;
+            while it < 80 {
+                let t = 0.5 * (lo + hi);
+                let ff = (1.0 - 2.0 / ext) / (1.0 - t / ext);
+                let beta1 = mu1 - gl * ff;
+                let mut q1 = mu1;
+                let mut j1 = 0usize;
+                while j1 < 50 {
+                    let e = (-q1).exp();
+                    let st = (q1 - gl * e - beta1) / (1.0 + gl * e);
+                    q1 -= st;
+                    if st.abs() < 1e-14 {
+                        break;
+                    }
+                    j1 += 1;
+                }
+                let beta2 = mu2 - gl * ff;
+                let mut q2 = mu2;
+                let mut j2 = 0usize;
+                while j2 < 50 {
+                    let e = (-q2).exp();
+                    let st = (q2 - gl * e - beta2) / (1.0 + gl * e);
+                    q2 -= st;
+                    if st.abs() < 1e-14 {
+                        break;
+                    }
+                    j2 += 1;
+                }
+                psi1 = q1;
+                psi2 = q2;
+                if q1.exp() + q2.exp() - t > 0.0 {
+                    lo = t;
+                } else {
+                    hi = t;
+                }
+                it += 1;
+            }
+        } else {
+            let mut it = 0usize;
+            while it < 60 {
+                let em1 = (-psi1).exp();
+                let ep1 = psi1.exp();
+                let w1 = ep1 - 1.0;
+                let g1 = psi1 + gl * (1.0 - em1) + gl * alpha * w1 * w1 * em1 - mu1;
+                let gp1 = 1.0 + gl * em1 * (1.0 + alpha * (ep1 * ep1 - 1.0));
+                let step1 = g1 / gp1;
+                psi1 -= step1;
+                let em2 = (-psi2).exp();
+                let ep2 = psi2.exp();
+                let w2 = ep2 - 1.0;
+                let g2 = psi2 + gl * (1.0 - em2) + gl * alpha * w2 * w2 * em2 - mu2;
+                let gp2 = 1.0 + gl * em2 * (1.0 + alpha * (ep2 * ep2 - 1.0));
+                let step2 = g2 / gp2;
+                psi2 -= step2;
+                if step1.abs() < 1e-14 && step2.abs() < 1e-14 {
+                    break;
+                }
+                it += 1;
+            }
+        }
+        unsafe {
+            *((oxx as usize).wrapping_add(off) as *mut f64) = c0 * c0 * psi1 + s0 * s0 * psi2;
+            *((oxy as usize).wrapping_add(off) as *mut f64) = c0 * s0 * (psi1 - psi2);
+            *((oyy as usize).wrapping_add(off) as *mut f64) = s0 * s0 * psi1 + c0 * c0 * psi2;
+        }
+    }
+
     /// `tr exp(Ψ)` for a symmetric 2×2 `Ψ=[a,b,d]` (atan2-free eigenvalues `tr±rad`).
     fn tr_exp2(a: f64, b: f64, d: f64) -> f64 {
         let tr = 0.5 * (a + d);
@@ -481,6 +595,91 @@ pub fn logconf_implicit_relax(
         &mut oxx, &mut oxy, &mut oyy,
     )?;
     Ok([oxx.to_host_vec(&stream)?, oxy.to_host_vec(&stream)?, oyy.to_host_vec(&stream)?])
+}
+
+/// Differentiate the implicit relaxation w.r.t. `1/λ`: returns `[∂Ψxx, ∂Ψxy, ∂Ψyy]
+/// / ∂(1/λ)` per node, computed by Enzyme forward-mode through the
+/// pipeline-synthesized `d_implicit_relax_core` kernel, launched via the **normal
+/// cuda-host bundle loader**. The headline differentiable-gale primitive (inverse
+/// rheology / parameter inference), now produced by `cargo oxide --features
+/// autodiff` with no manual scripts. Needs the `autodiff` feature.
+#[cfg(feature = "autodiff")]
+pub fn logconf_implicit_relax_grad(
+    mesh: &Mesh2d,
+    lc: &LogConfOldroydB,
+    b: &[Vec<f64>; 3],
+    gamma: f64,
+) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
+    use std::ffi::c_void;
+    let nn = mesh.refq.n_nodes();
+    let ne = mesh.n_elements();
+    let ndof = ne * nn;
+    for c in b {
+        assert_eq!(c.len(), ndof, "B component length must be n_elements·n_nodes");
+    }
+    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let bxx = DeviceBuffer::from_host(&stream, &b[0])?;
+    let bxy = DeviceBuffer::from_host(&stream, &b[1])?;
+    let byy = DeviceBuffer::from_host(&stream, &b[2])?;
+    // Primal outputs (discarded) + tangent shadows (the gradient), zero-seeded.
+    let oxx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let oxy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let oyy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let doxx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let doxy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let doyy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+
+    let module = kernels::load(&ctx)?;
+    let func = module.as_cuda_module().load_function("d_implicit_relax_core")?;
+
+    // d_implicit_relax_core(bxx, bxy, byy, gamma, inv_lambda[seed=1], alpha, ext,
+    //                       oxx, doxx, oxy, doxy, oyy, doyy)
+    let mut a_bxx = bxx.cu_deviceptr();
+    let mut a_bxy = bxy.cu_deviceptr();
+    let mut a_byy = byy.cu_deviceptr();
+    let mut a_gamma = gamma;
+    let mut a_invlam = lc.lambda.recip();
+    let mut a_alpha = lc.mobility;
+    let mut a_ext = lc.extensibility;
+    let mut a_oxx = oxx.cu_deviceptr();
+    let mut a_doxx = doxx.cu_deviceptr();
+    let mut a_oxy = oxy.cu_deviceptr();
+    let mut a_doxy = doxy.cu_deviceptr();
+    let mut a_oyy = oyy.cu_deviceptr();
+    let mut a_doyy = doyy.cu_deviceptr();
+    let mut args: Vec<*mut c_void> = vec![
+        &mut a_bxx as *mut _ as *mut c_void,
+        &mut a_bxy as *mut _ as *mut c_void,
+        &mut a_byy as *mut _ as *mut c_void,
+        &mut a_gamma as *mut _ as *mut c_void,
+        &mut a_invlam as *mut _ as *mut c_void,
+        &mut a_alpha as *mut _ as *mut c_void,
+        &mut a_ext as *mut _ as *mut c_void,
+        &mut a_oxx as *mut _ as *mut c_void,
+        &mut a_doxx as *mut _ as *mut c_void,
+        &mut a_oxy as *mut _ as *mut c_void,
+        &mut a_doxy as *mut _ as *mut c_void,
+        &mut a_oyy as *mut _ as *mut c_void,
+        &mut a_doyy as *mut _ as *mut c_void,
+    ];
+    unsafe {
+        cuda_core::launch_kernel_on_stream(
+            &func,
+            (ne as u32, 1, 1),
+            (nn as u32, 1, 1),
+            0,
+            &stream,
+            &mut args,
+        )?;
+    }
+    Ok([
+        doxx.to_host_vec(&stream)?,
+        doxy.to_host_vec(&stream)?,
+        doyy.to_host_vec(&stream)?,
+    ])
 }
 
 /// GPU log-conformation FENE-P trace-bound limiter (Phase 4): enforce `tr exp(Ψ) ≤ b_max` on the
