@@ -190,6 +190,11 @@ path = "src/bin/roofline_poisson.rs"
 name = "mg-wallclock-bench"
 path = "src/bin/mg_wallclock_bench.rs"
 
+# Minimal single MG-PCG solve — clean target for Nsight (nsys timeline / ncu per-kernel).
+[[bin]]
+name = "mg-profile"
+path = "src/bin/mg_profile.rs"
+
 # Validates the persistent GpuPoisson solver handle (P4) vs the one-shot solvers.
 [[bin]]
 name = "poisson-handle-check"
