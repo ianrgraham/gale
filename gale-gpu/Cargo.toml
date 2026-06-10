@@ -57,6 +57,11 @@ path = "src/bin/vecadd.rs"
 name = "probe-mixed-precision"
 path = "src/bin/probe_mixed_precision.rs"
 
+# Probe: one generic #[kernel] over a Scalar trait ⇒ both f64 (opt-out) and f32 instantiations.
+[[bin]]
+name = "probe-generic-kernel"
+path = "src/bin/probe_generic_kernel.rs"
+
 # std::autodiff → cargo-oxide → cuda-host end-to-end probe (needs `autodiff`).
 [[bin]]
 name = "ad-probe-check"
