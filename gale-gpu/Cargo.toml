@@ -52,6 +52,11 @@ path = "src/bin/sim_gpu_check.rs"
 name = "vecadd"
 path = "src/bin/vecadd.rs"
 
+# Codegen probe: mixed f32/f64 single kernel (FP32-storage/FP64-accumulate feasibility).
+[[bin]]
+name = "probe-mixed-precision"
+path = "src/bin/probe_mixed_precision.rs"
+
 # std::autodiff → cargo-oxide → cuda-host end-to-end probe (needs `autodiff`).
 [[bin]]
 name = "ad-probe-check"
