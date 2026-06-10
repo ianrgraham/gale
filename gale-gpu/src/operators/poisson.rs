@@ -885,9 +885,12 @@ pub fn poisson_pcg_solve(
     let (mut xb, mut bb, mut rb, mut apb, mut gxb, mut gyb, mut tmpb) =
         (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
 
+    // Per-region Neumann tags (rediscretized at every level) — all-tags + reaction 0 is the
+    // singular pressure operator (auto-deflated below); empty is all-Dirichlet.
+    let neumann_tags = mg.neumann_tags();
     for l in 0..nlev {
         let m = mg.mesh(l);
-        let ma = flatten_mesh(m, mg.alpha, &[]);
+        let ma = flatten_mesh(m, mg.alpha, neumann_tags);
         n1v.push(ma.n1);
         nev.push(ma.ne as u32);
         ndofv.push(ma.ndof);
@@ -953,6 +956,33 @@ pub fn poisson_pcg_solve(
             }
         }};
     }
+    // Singular pure-Neumann pressure operator (constant nullspace) ⇒ deflate: project the
+    // residual onto the range (subtract its mean) in the OUTER PCG and in the COARSEST solve;
+    // the SPD V-cycle preconditioner itself is unmodified (see docs/research-pressure-multigrid.md).
+    let deflate = mg.is_singular(&mg.mesh(0).boundary_tags());
+    let ones0 = up(&vec![1.0f64; n0])?;
+    let ones_c = up(&vec![1.0f64; ndofv[nlev - 1]])?;
+    let ninv0 = 1.0 / n0 as f64;
+    let ninv_c = 1.0 / ndofv[nlev - 1] as f64;
+    // Subtract the mean of a finest-level vector (range projection for the singular system).
+    macro_rules! deflate0 {
+        ($v:expr) => {{
+            if deflate {
+                let mean = dot!($v, &ones0, n0) * ninv0;
+                module.axpy(&stream, vcfg[0], $v, &ones0, -mean)?;
+            }
+        }};
+    }
+    // Coarsest-level range projection (nullspace-consistent coarse solve, Kaasschieter).
+    let clast = nlev - 1;
+    macro_rules! deflate_c {
+        ($v:expr) => {{
+            if deflate {
+                let mean = dot!($v, &ones_c, ndofv[clast]) * ninv_c;
+                module.axpy(&stream, vcfg[clast], $v, &ones_c, -mean)?;
+            }
+        }};
+    }
     // matvec: dst = A·src at level $l (src/dst external; gx/gy scratch from Vecs).
     // Helmholtz reaction λ (0 ⇒ pure Poisson) — the per-level diagonal/omega in `mg` are
     // already computed for this reaction, so the on-device V-cycle matches the CPU setup.
@@ -973,8 +1003,9 @@ pub fn poisson_pcg_solve(
             let n = ndofv[l];
             module.scal(&stream, vcfg[l], &mut xb[l], 0.0)?;
             dcopy!(&rb[l], &bb[l], n);
-            dcopy!(&tmpb[l], &bb[l], n);
-            let bn = dot!(&bb[l], &bb[l], n).sqrt().max(1e-300);
+            deflate_c!(&mut rb[l]); // project the coarse RHS onto the range (singular op)
+            dcopy!(&tmpb[l], &rb[l], n);
+            let bn = dot!(&rb[l], &rb[l], n).sqrt().max(1e-300);
             let mut rs = dot!(&rb[l], &rb[l], n);
             for _ in 0..300 {
                 matvec!(l, &tmpb[l], &mut apb[l]);
@@ -982,6 +1013,7 @@ pub fn poisson_pcg_solve(
                 let alpha = rs / pap_d;
                 module.axpy(&stream, vcfg[l], &mut xb[l], &tmpb[l], alpha)?;
                 module.axpy(&stream, vcfg[l], &mut rb[l], &apb[l], -alpha)?;
+                deflate_c!(&mut rb[l]); // keep the coarse residual in the range each iter
                 let rsn = dot!(&rb[l], &rb[l], n);
                 if rsn.sqrt() / bn < 1e-10 {
                     break;
@@ -1020,6 +1052,7 @@ pub fn poisson_pcg_solve(
 
     // preconditioned CG on the device
     module.scal(&stream, vcfg[0], &mut psol, 0.0)?;
+    deflate0!(&mut pres); // project the initial residual (=RHS) onto the range
     dcopy!(&bb[0], &pres, n0);
     vcycle!();
     dcopy!(&pz, &xb[0], n0);
@@ -1033,6 +1066,7 @@ pub fn poisson_pcg_solve(
         let alpha = rz / pap_d;
         module.axpy(&stream, vcfg[0], &mut psol, &pp, alpha)?;
         module.axpy(&stream, vcfg[0], &mut pres, &pap, -alpha)?;
+        deflate0!(&mut pres); // keep the residual in the range each iteration
         iters = it + 1;
         if dot!(&pres, &pres, n0).sqrt() / bn < tol {
             break;

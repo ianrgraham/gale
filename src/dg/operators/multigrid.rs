@@ -58,8 +58,14 @@ pub struct PMultigrid {
     pub alpha: f64,
     /// Helmholtz reaction `λ` (the `λM` term, `M = diag(jw)`). `0` ⇒ pure Poisson. The same
     /// physical `λ` is used at every p-level (the per-order mass differs); applied via
-    /// `Poisson::with_reaction`, so the diagonal and smoother weights pick it up.
+    /// `Poisson::with_bc`, so the diagonal and smoother weights pick it up.
     reaction: f64,
+    /// Natural (Neumann) boundary tags, applied at **every** p-level by rediscretization
+    /// (`Poisson::with_bc`) — NOT Galerkin coarsening (which doesn't reliably inherit DG
+    /// BCs; see docs/research-pressure-multigrid.md). Empty ⇒ all-Dirichlet; all boundary
+    /// tags ⇒ the singular pure-Neumann pressure operator (deflate in the PCG, see
+    /// `poisson_pcg_solve`).
+    neumann_tags: Vec<u32>,
     interp: Vec<Vec<f64>>, // [L]: 1D interp from order[L+1] (coarse) → order[L] (fine)
     inv_diag: Vec<Vec<f64>>,
     lam_hi: Vec<f64>,
@@ -81,10 +87,22 @@ impl PMultigrid {
     }
 
     /// p-multigrid for the Helmholtz operator `(reaction·M + A)` (Dirichlet). `reaction = 0`
-    /// is the pure-Poisson case [`new`](Self::new). Mirrors the per-level operator
-    /// `Poisson::with_reaction(mesh, alpha, reaction)`.
+    /// is the pure-Poisson case [`new`](Self::new).
     pub fn with_reaction(
         order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64, reaction: f64,
+    ) -> Self {
+        Self::with_bc(order, nx, ny, xr, yr, alpha, reaction, Vec::new())
+    }
+
+    /// p-multigrid for `(reaction·M + A)` with **per-region boundary conditions**: tags in
+    /// `neumann_tags` are natural (Neumann) at every level, the rest Dirichlet SIPG. For the
+    /// dual-splitting **pressure** solve use `reaction = 0` and all boundary tags (the
+    /// singular pure-Neumann operator) — then drive it with the deflated
+    /// [`poisson_pcg_solve`]. The coarse operators are **rediscretized** per level (research
+    /// shows Galerkin RAP does not reliably inherit DG BCs/penalty).
+    pub fn with_bc(
+        order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64, reaction: f64,
+        neumann_tags: Vec<u32>,
     ) -> Self {
         let orders = order_levels(order);
         let meshes: Vec<Mesh2d> =
@@ -97,6 +115,7 @@ impl PMultigrid {
             meshes,
             alpha,
             reaction,
+            neumann_tags,
             interp,
             inv_diag: Vec::new(),
             lam_hi: Vec::new(),
@@ -159,8 +178,21 @@ impl PMultigrid {
         self.reaction
     }
 
+    /// Natural (Neumann) boundary tags applied at every level (empty ⇒ all-Dirichlet). The
+    /// GPU PCG driver flattens each level's operator with these so the device matvec carries
+    /// the matching `NEU` sentinels.
+    pub fn neumann_tags(&self) -> &[u32] {
+        &self.neumann_tags
+    }
+
+    /// Whether the operator is **singular** (constant nullspace): pure Poisson (reaction 0)
+    /// with every boundary natural (Neumann). Such a solve must be deflated.
+    pub fn is_singular(&self, mesh_boundary_tags: &[u32]) -> bool {
+        self.reaction == 0.0 && mesh_boundary_tags.iter().all(|t| self.neumann_tags.contains(t))
+    }
+
     fn apply_level(&self, l: usize, u: &[f64]) -> Vec<f64> {
-        Poisson::with_reaction(&self.meshes[l], self.alpha, self.reaction).apply(u)
+        Poisson::with_bc(&self.meshes[l], self.alpha, self.reaction, self.neumann_tags.clone()).apply(u)
     }
 
     /// Checkerboard parity of element `e` on the rectangular `nx×ny` grid, from its
