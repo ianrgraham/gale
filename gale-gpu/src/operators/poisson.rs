@@ -17,7 +17,7 @@
 //! Libdevice-free ⇒ the embedded path works on sm_70.
 
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
-use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
+use cuda_device::{kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
 use std::sync::Arc;
 use cuda_host::cuda_module;
 use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid};
@@ -33,6 +33,22 @@ const NEU: u32 = u32::MAX - 1; // sentinel: Neumann boundary face (natural BC �
 /// 256 threads saturates occupancy while summing only 1024 doubles on the host.
 fn dot_blocks(ndof: usize) -> usize {
     ndof.div_ceil(RED).clamp(1, 1024)
+}
+
+/// Launch configs for the multi-element-per-block matvec (`gradient`, `operator`) over `ne`
+/// elements at order `n1-1`. Packs `epb` elements per block targeting ~192 threads (≥1), so the
+/// block runs enough warps to hide memory latency (the ncu-identified fix: one element = `nn`
+/// threads = 25 at p=4 starved the schedulers). Dynamic shared = the diff matrix `DS[nn]` (once)
+/// plus per-element tiles: `gradient` needs `US` (1 tile/elem), `operator` needs `PR`+`PS` (2).
+/// Returns `(gradient_cfg, operator_cfg)` — same grid/block, different `shared_mem_bytes`.
+fn matvec_cfgs(ne: usize, n1: u32) -> (LaunchConfig, LaunchConfig) {
+    let nn = (n1 as usize) * (n1 as usize);
+    let epb = 192usize.div_ceil(nn).max(1);
+    let grid = ne.div_ceil(epb) as u32;
+    let block = (epb * nn) as u32;
+    let g = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: ((nn + epb * nn) * 8) as u32 };
+    let o = LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: ((nn + 2 * epb * nn) * 8) as u32 };
+    (g, o)
 }
 
 /// Convergence guard for the iterative elliptic solves (CG and MG-PCG alike): emit a
@@ -54,38 +70,61 @@ fn warn_unconverged(label: &str, converged: bool, iters: usize, maxit: usize, re
 mod kernels {
     use super::*;
 
+    // ===== matvec (gradient → operator), MULTI-ELEMENT-PER-BLOCK ============================
+    //
+    // Each block processes `epb = blockDim_x / nn` elements (≥1), so the block runs ~128–256
+    // threads (a multiple-ish of the warp size) instead of one element's `nn` (=25 at p=4) — the
+    // ncu-identified fix for the latency/occupancy ceiling (one-element blocks left the SM
+    // schedulers starved with too few warps to hide memory stalls). Thread `t` ↦ element-in-block
+    // `el = t/nn`, node `m = t%nn`, global element `e = blockIdx·epb + el`. Dynamic shared holds
+    // the (element-independent) diff matrix `DS[nn]` once plus one per-element tile per buffer.
+    // `ne` guards the partial final block; inactive threads still reach `sync_threads`. Per-element
+    // arithmetic is unchanged ⇒ bit-for-bit identical to the one-element kernels.
+
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn gradient(
-        d: &[f64], u: &[f64], rx: &[f64], ry: &[f64], sx: &[f64], sy: &[f64], n1: u32,
+        d: &[f64], u: &[f64], rx: &[f64], ry: &[f64], sx: &[f64], sy: &[f64], n1: u32, ne: u32,
         mut gx: DisjointSlice<f64>, mut gy: DisjointSlice<f64>,
     ) {
-        static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut US: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | US(epb·nn) ]
         let n1 = n1 as usize;
         let nn = n1 * n1;
-        let e = thread::blockIdx_x() as usize;
-        let m = thread::threadIdx_x() as usize;
-        let base = e * nn;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let active = e < ne as usize;
+        let us = nn + el * nn; // this element's US tile base
         unsafe {
-            DS[m] = d[m];
-            US[m] = u[base + m];
+            if t < nn {
+                *sm.add(t) = d[t]; // shared diff matrix, loaded once per block
+            }
+            if active {
+                *sm.add(us + m) = u[e * nn + m];
+            }
         }
         thread::sync_threads();
+        if !active {
+            return; // no further barrier in this kernel ⇒ safe to bail
+        }
+        let base = e * nn;
         let i = m % n1;
         let j = m / n1;
         let mut ur = 0.0f64;
-        let mut us = 0.0f64;
+        let mut uss = 0.0f64;
         let mut k = 0usize;
         while k < n1 {
             unsafe {
-                ur += DS[i * n1 + k] * US[k + j * n1];
-                us += DS[j * n1 + k] * US[i + k * n1];
+                ur += *sm.add(i * n1 + k) * *sm.add(us + k + j * n1);
+                uss += *sm.add(j * n1 + k) * *sm.add(us + i + k * n1);
             }
             k += 1;
         }
-        let gxv = rx[base + m] * ur + sx[base + m] * us;
-        let gyv = ry[base + m] * ur + sy[base + m] * us;
+        let gxv = rx[base + m] * ur + sx[base + m] * uss;
+        let gyv = ry[base + m] * ur + sy[base + m] * uss;
+        // block_dim = epb·nn ⇒ global 1D thread index == base + m.
         if let Some(o) = gx.get_mut(thread::index_1d()) {
             *o = gxv;
         }
@@ -98,87 +137,97 @@ mod kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn operator(
         d: &[f64], u: &[f64], gx: &[f64], gy: &[f64], rx: &[f64], ry: &[f64], sx: &[f64],
-        sy: &[f64], jw: &[f64], n1: u32, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
+        sy: &[f64], jw: &[f64], n1: u32, ne: u32, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
         face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<f64>,
     ) {
-        static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut PR: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut PS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | PR(epb·nn) | PS(epb·nn) ]
         let n1 = n1 as usize;
         let nn = n1 * n1;
-        let e = thread::blockIdx_x() as usize;
-        let m = thread::threadIdx_x() as usize;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let active = e < ne as usize;
+        let pr = nn + el * nn; // this element's PR tile base
+        let ps = nn + epb * nn + el * nn; // this element's PS tile base
         let b = e * nn + m;
         unsafe {
-            DS[m] = d[m];
-            let wx = jw[b] * gx[b];
-            let wy = jw[b] * gy[b];
-            PR[m] = rx[b] * wx + ry[b] * wy;
-            PS[m] = sx[b] * wx + sy[b] * wy;
-        }
-        // Face contribution by **gather** (race-free, fully parallel): thread `m` owns
-        // node `m`, scans the element's 4·n1 face entries for the ones at this node
-        // (`face_vl == m`; corners match on two faces), and accumulates the SIPG
-        // consistency/penalty `rf` and the symmetry-lift `hx,hy` into registers — so no
-        // shared `RF/HX/HY` and no inter-thread races (each node written by one thread).
-        // Since `face_vl == m`, the interior trace is `gx[b]`/`gy[b]`/`u[b]`.
-        // Node m = (ii, jj) lies on at most 2 of the 4 faces (it's an element corner at
-        // most). Its face position `a` follows the tensor face-node convention (see
-        // `quad_faces`): South/North run along i (a=ii), East/West along j (a=jj). So we
-        // visit only the ≤2 faces this node is on — no scan over all 4·n1 entries. The
-        // bit-for-bit operator validator confirms the convention. `face_vl[idx] == m`.
-        let ii = m % n1;
-        let jj = m / n1;
-        let mut rf = 0.0f64;
-        let mut hx = 0.0f64;
-        let mut hy = 0.0f64;
-        let mut t = 0usize;
-        while t < 4 {
-            let (on, a) = if t == 0 {
-                (jj == 0, ii) // South
-            } else if t == 1 {
-                (ii == n1 - 1, jj) // East
-            } else if t == 2 {
-                (jj == n1 - 1, ii) // North
-            } else {
-                (ii == 0, jj) // West
-            };
-            if on {
-                let idx = (e * 4 + t) * n1 + a;
-                let nbr = face_nbr[idx];
-                if nbr != NEU {
-                    let tau = face_tau[e * 4 + t];
-                    let nx = face_nx[idx];
-                    let ny = face_ny[idx];
-                    let sw = face_sw[idx];
-                    let dun_e = nx * gx[b] + ny * gy[b];
-                    let ug = u[b];
-                    let (avg, jump, gfac) = if nbr == BND {
-                        (dun_e, ug, 1.0)
-                    } else {
-                        let ng = nbr as usize;
-                        (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
-                    };
-                    let g = gfac * sw * jump;
-                    rf += -sw * avg + tau * sw * jump;
-                    hx += g * nx;
-                    hy += g * ny;
-                }
+            if t < nn {
+                *sm.add(t) = d[t]; // shared diff matrix, loaded once per block
             }
-            t += 1;
         }
-        unsafe {
-            PR[m] -= rx[b] * hx + ry[b] * hy;
-            PS[m] -= sx[b] * hx + sy[b] * hy;
+        let mut rf = 0.0f64;
+        if active {
+            unsafe {
+                let wx = jw[b] * gx[b];
+                let wy = jw[b] * gy[b];
+                *sm.add(pr + m) = rx[b] * wx + ry[b] * wy;
+                *sm.add(ps + m) = sx[b] * wx + sy[b] * wy;
+            }
+            // Face contribution by **gather** (race-free, fully parallel): thread `m` owns
+            // node `m`, visits the ≤2 faces it lies on (corner ⇒ 2), and accumulates the SIPG
+            // consistency/penalty `rf` and the symmetry-lift `hx,hy` into registers — so no
+            // shared `RF/HX/HY` and no inter-thread races (each node written by one thread).
+            // Node m = (ii, jj)'s face position `a` follows the tensor face-node convention (see
+            // `quad_faces`): South/North run along i (a=ii), East/West along j (a=jj). The
+            // bit-for-bit operator validator confirms the convention.
+            let ii = m % n1;
+            let jj = m / n1;
+            let mut hx = 0.0f64;
+            let mut hy = 0.0f64;
+            let mut t4 = 0usize;
+            while t4 < 4 {
+                let (on, a) = if t4 == 0 {
+                    (jj == 0, ii) // South
+                } else if t4 == 1 {
+                    (ii == n1 - 1, jj) // East
+                } else if t4 == 2 {
+                    (jj == n1 - 1, ii) // North
+                } else {
+                    (ii == 0, jj) // West
+                };
+                if on {
+                    let idx = (e * 4 + t4) * n1 + a;
+                    let nbr = face_nbr[idx];
+                    if nbr != NEU {
+                        let tau = face_tau[e * 4 + t4];
+                        let nx = face_nx[idx];
+                        let ny = face_ny[idx];
+                        let sw = face_sw[idx];
+                        let dun_e = nx * gx[b] + ny * gy[b];
+                        let ug = u[b];
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0)
+                        } else {
+                            let ng = nbr as usize;
+                            (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
+                        };
+                        let g = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * nx;
+                        hy += g * ny;
+                    }
+                }
+                t4 += 1;
+            }
+            unsafe {
+                *sm.add(pr + m) -= rx[b] * hx + ry[b] * hy;
+                *sm.add(ps + m) -= sx[b] * hx + sy[b] * hy;
+            }
         }
-        thread::sync_threads();
+        thread::sync_threads(); // ALL threads (active + inactive padding) reach this barrier
+        if !active {
+            return;
+        }
         let i = m % n1;
         let j = m / n1;
         let mut acc = 0.0f64;
         let mut k = 0usize;
         while k < n1 {
             unsafe {
-                acc += DS[k * n1 + i] * PR[k + j * n1] + DS[k * n1 + j] * PS[i + k * n1];
+                acc += *sm.add(k * n1 + i) * *sm.add(pr + k + j * n1)
+                    + *sm.add(k * n1 + j) * *sm.add(ps + i + k * n1);
             }
             k += 1;
         }
@@ -635,18 +684,15 @@ pub fn poisson_apply(
     let mut out_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
 
     let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig {
-        grid_dim: (ma.ne as u32, 1, 1),
-        block_dim: (ma.nn as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let nev = ma.ne as u32;
+    let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
     module.gradient(
-        &stream, cfg, &d_dev, &u_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev, ma.n1,
+        &stream, gcfg, &d_dev, &u_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev, ma.n1, nev,
         &mut gx_dev, &mut gy_dev,
     )?;
     module.operator(
-        &stream, cfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev,
-        &jw_dev, ma.n1, &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev,
+        &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev,
+        &jw_dev, ma.n1, nev, &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev,
         0.0, &mut out_dev,
     )?;
     Ok(out_dev.to_host_vec(&stream)?)
@@ -754,11 +800,8 @@ fn cg_solve_impl(
     let mut d_beta = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
 
     let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig {
-        grid_dim: (ma.ne as u32, 1, 1),
-        block_dim: (ma.nn as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let nev = ma.ne as u32;
+    let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
     let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
@@ -776,9 +819,9 @@ fn cg_solve_impl(
     }
     macro_rules! apply {
         ($field:expr, $dst:expr) => {{
-            module.gradient(&stream, cfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
+            module.gradient(&stream, gcfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, nev, &mut gx, &mut gy)?;
             module.operator(
-                &stream, cfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
+                &stream, ocfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1, nev,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, reaction, $dst,
             )?;
         }};
@@ -862,11 +905,8 @@ pub fn pressure_cg_solve(
     let ones = up(&vec![1.0f64; ndof])?;
 
     let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig {
-        grid_dim: (ma.ne as u32, 1, 1),
-        block_dim: (ma.nn as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
+    let nev = ma.ne as u32;
+    let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
     let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
@@ -889,9 +929,9 @@ pub fn pressure_cg_solve(
     }
     macro_rules! apply {
         ($field:expr, $dst:expr) => {{
-            module.gradient(&stream, cfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
+            module.gradient(&stream, gcfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, nev, &mut gx, &mut gy)?;
             module.operator(
-                &stream, cfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
+                &stream, ocfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1, nev,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, $dst,
             )?;
         }};
@@ -1164,7 +1204,10 @@ fn pcg_solve_with(
         ninv_c,
         clast,
     } = *dev;
-    let _ = nev; // captured into `cfg` at build time; kept for parity with the SoA layout
+    // Per-level packed matvec launch configs (gradient_cfg, operator_cfg) — derived from the
+    // element count + order at each level; the transfer/vector kernels keep `cfg`/`vcfg`.
+    let mvcfg: Vec<(LaunchConfig, LaunchConfig)> =
+        (0..nlev).map(|l| matvec_cfgs(nev[l] as usize, n1v[l])).collect();
     assert_eq!(rhs.len(), n0, "rhs length must match the finest level");
 
     // Per-solve scratch: V-cycle work vectors (struct-of-arrays per level) — allocated
@@ -1261,9 +1304,9 @@ fn pcg_solve_with(
     macro_rules! matvec {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
-            module.gradient(&stream, cfg[l], &dl[l], $src, &rxl[l], &ryl[l], &sxl[l], &syl[l], n1v[l], &mut gxb[l], &mut gyb[l])?;
+            module.gradient(&stream, mvcfg[l].0, &dl[l], $src, &rxl[l], &ryl[l], &sxl[l], &syl[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
             module.operator(
-                &stream, cfg[l], &dl[l], $src, &gxb[l], &gyb[l], &rxl[l], &ryl[l], &sxl[l], &syl[l], &jwl[l], n1v[l],
+                &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &rxl[l], &ryl[l], &sxl[l], &syl[l], &jwl[l], n1v[l], nev[l],
                 &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
             )?;
         }};
@@ -1495,7 +1538,8 @@ pub fn bench_poisson_kernels(
     let mut partial = DeviceBuffer::<f64>::zeroed(&stream, nb)?;
 
     let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig { grid_dim: (ma.ne as u32, 1, 1), block_dim: (ma.nn as u32, 1, 1), shared_mem_bytes: 0 };
+    let nev = ma.ne as u32;
+    let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
     let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
     let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
     let n1 = ma.n1;
@@ -1522,11 +1566,11 @@ pub fn bench_poisson_kernels(
     }
 
     let grad_ms = timed!({
-        module.gradient(&stream, cfg, &d_dev, &u_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
+        module.gradient(&stream, gcfg, &d_dev, &u_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, nev, &mut gx, &mut gy)?;
     });
     let op_ms = timed!({
         module.operator(
-            &stream, cfg, &d_dev, &u_dev, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
+            &stream, ocfg, &d_dev, &u_dev, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1, nev,
             &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out,
         )?;
     });
@@ -1586,7 +1630,6 @@ pub struct GpuPoisson {
     // `stream` and `module` each hold an `Arc<CudaContext>`, keeping the context alive.
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
-    nn: usize,
     ne: usize,
     ndof: usize,
     n1: u32,
@@ -1635,7 +1678,6 @@ impl GpuPoisson {
 
         Ok(Self {
             module: kernels::load(&ctx)?,
-            nn: ma.nn,
             ne: ma.ne,
             ndof: ma.ndof,
             n1: ma.n1,
@@ -1711,7 +1753,8 @@ impl GpuPoisson {
         let mut d_nmean = DeviceBuffer::<f64>::zeroed(stream, 1)?;
         let ones = up(&vec![1.0f64; ndof])?;
 
-        let cfg = LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: (self.nn as u32, 1, 1), shared_mem_bytes: 0 };
+        let nev = self.ne as u32;
+        let (gcfg, ocfg) = matvec_cfgs(self.ne, self.n1);
         let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
         let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
         let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
@@ -1739,9 +1782,9 @@ impl GpuPoisson {
         }
         macro_rules! apply {
             ($field:expr, $dst:expr) => {{
-                module.gradient(stream, cfg, &self.d_dev, $field, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, n1, &mut gx, &mut gy)?;
+                module.gradient(stream, gcfg, &self.d_dev, $field, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, n1, nev, &mut gx, &mut gy)?;
                 module.operator(
-                    stream, cfg, &self.d_dev, $field, &gx, &gy, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, &self.jw_dev, n1,
+                    stream, ocfg, &self.d_dev, $field, &gx, &gy, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, &self.jw_dev, n1, nev,
                     &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, &fnbr_dev, &self.ftau_dev, reaction, $dst,
                 )?;
             }};
