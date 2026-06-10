@@ -343,3 +343,102 @@ emits typed `i8*` + the legacy NVVM datalayout and matches the CPU `Hyperbolic3d
 operator to **5.078e-16** on the 2× Titan V. This is a clean upstream contribution
 (PR-ready, following the §1/§2 typed-pointer fixes). The 3D GPU operator — and thus
 the 3D multi-GPU path — is unblocked.
+
+---
+
+## 5. Generic kernels & closures are **monomorphized** (mechanism + gale implications)
+
+**Verified against the v0.2.0 tree (2026-06-08).** Relevant when we consider making
+device kernels generic over a physics trait (e.g. a `conf_rhs<M: ConstitutiveModel>`
+that swaps Oldroyd-B / Giesekus / FENE-P), or accepting host closures à la the
+`host_closure` example. The mechanism is **standard Rust monomorphization**, not
+runtime trait-object dispatch or an on-device interpreter.
+
+### Evidence (cuda-oxide source)
+
+- The backend consumes **rustc's already-monomorphized mono-items**:
+  `rustc-codegen-cuda/src/lib.rs:471` calls `tcx.collect_and_partition_mono_items(())`.
+  By the time codegen runs, every generic is resolved to a concrete `Instance`.
+- It only emits **fully-monomorphized** functions: `collector.rs:319-321` gates on
+  `MonoItem::Fn(instance)` with `is_fully_monomorphized(tcx, *instance)`
+  (`collector.rs:376` = "no unresolved type parameters"). A generic kernel with open
+  type params is **never codegen'd** — only concrete instantiations are.
+- **Each monomorphization gets its own export name.** `collector.rs:180-181`:
+  non-generic kernel → `base_name`; generic kernel with N type args →
+  `base_name + "_TID_" + hex32`, where `compute_kernel_export_name`
+  (`collector.rs:206`) hashes the instance's concrete type args into the `hex32`.
+  So `conf_rhs<OldroydB>` and `conf_rhs<Giesekus>` become **two distinct cubin
+  symbols** — which automatically satisfies our crate-wide unique-export-name device
+  bundle constraint.
+- **Closures** (`host_closure/src/main.rs`): the closure value is pushed as a single
+  **byval `.param` struct** (the captures, as runtime bytes), while `F` binds to the
+  closure's anonymous type at the call site (`module.map::<f32, _>`). Distinct closure
+  type ⇒ distinct `F` ⇒ distinct monomorphization. `FnMut`/`FnOnce` dispatch through
+  `<F as FnMut>::call_mut` etc., still monomorphized per `F`.
+
+### The reachability subtlety (why it's compile-time, not runtime-pluggable)
+
+rustc only monomorphizes **reachable** instances, so a generic `#[kernel]` must
+actually be instantiated to exist in the cubin — either by a real typed-launch call
+site (`module.map::<f32, _>` forces it) or via the macro's explicit instantiation
+list (`cuda-macros/src/lib.rs:100-101`: `instantiate_types: Vec<Type>`, "Types to
+instantiate generic kernels for", + `INSTANTIATE_PREFIX`). That hook is how we'd
+force `{OldroydB, Giesekus, FENE-P}` to compile before any call site exists.
+
+### Net for gale
+
+- **You get one compiled kernel per concrete type-set you instantiate**, each
+  uniquely named by a hash of its type args. The split is: **structure = compile-time
+  type parameter; numeric coefficients = runtime kernel args** (scalars). For a
+  constitutive model that's a clean fit — the model *family* is the type `M`, and
+  `λ, η_p, Giesekus α, FENE L²` are just scalar `.param`s, so **no heap-closure
+  serialization is needed**.
+- **Bound:** the model set is fixed at build time. There is no "user passes an
+  arbitrary closure at runtime without recompiling" — a closure/model type that
+  doesn't exist at compile time can't become a kernel.
+- **Why this is attractive architecturally:** making the device kernel generic over
+  the *same* `ConstitutiveModel` / `ConservationLaw` traits the host uses (or a
+  device-compatible subset) collapses the current hand-duplicated GPU Oldroyd kernel
+  (`gale-gpu/src/operators/oldroyd.rs`, a copy of the host `OldroydB`) into one source
+  of truth — keeping the bit-for-bit CPU oracle aligned with the GPU by construction.
+- **Caveat:** on sm_70 all of this still rides the pre-Blackwell typed-pointer path
+  (§1/§4), so it inherits the fork's typed-pointer dependency.
+
+> **Where closures actually pay off** (host-sampled-to-array vs device functor):
+> a quantity that depends only on `(x,y,t)` should stay host-sampled (current pattern
+> for BCs in `src/dg/operators/bc.rs`, ICs in `src/sim/state.rs`, forcing in
+> `src/sim/term.rs`). Push it into the kernel as a monomorphized functor **only when
+> it's evaluated per-thread on per-thread runtime state** — the constitutive
+> relaxation term `f(C)` is the prime example; the `ConservationLaw` flux/Riemann
+> choice is second; a device-side moving-particle indicator `χ(x,y,t)` for many-body
+> IBM is third. BC *values* are the weakest case (cheap to host-sample, no state
+> dependence).
+
+### Correction: monomorphization is the *validated* path, not the only conceivable one
+
+The "fixed compile-time set" bound above is about **what's proven in cuda-oxide**,
+not a CUDA or Rust-language limit. CUDA C/C++ supports runtime device-side
+indirection three ways — `__device__` function-pointer tables, virtual dispatch on
+device-constructed objects, and dynamic parallelism — and Rust has `fn` pointers and
+`dyn` too. What cuda-oxide actually lowers (verified against v0.2.0):
+
+- **Function pointers / indirect calls — plumbed, unproven.** The MIR frontend
+  translates fn-pointer reification + closure→fn coercion casts
+  (`mir-importer/src/translator/rvalue.rs:529-549`,
+  `dialect-mir/src/attributes.rs:38-40`), and the LLVM exporter has an indirect-call
+  path (`CallOpCallable::Indirect`, `llvm-export/src/export/ops.rs:809`). So a
+  `__device__` fn-pointer-table style runtime dispatch is *representable end-to-end*,
+  but **no example exercises it and it is unverified on sm_70** (and likely fragile on
+  the pre-Blackwell typed-pointer path).
+- **Virtual `dyn` dispatch on device — no evidence.** Every `dyn`/vtable hit is the
+  compiler's own internal architecture, not lowering of user trait objects; the only
+  user-facing trace is a fall-through comment for trait-object Unsize coercions
+  (`mir-lower/src/convert/ops/cast.rs:328`). Treat as unsupported/unverified.
+- **Dynamic parallelism — absent.** Zero `cudaLaunchDevice` / device-launch hits.
+
+**Practical stance:** default to monomorphization (the only validated path). If we
+ever want runtime model selection without recompiling, the better lever is the
+*orchestration* layer (Python launches / numba co-execution —
+[`python-interop-strategy.md`](./python-interop-strategy.md) §5), not device-side
+indirection. A device fn-pointer probe on the Titan V is the only way to turn
+"plumbed, unproven" into a real yes/no, if it ever matters.

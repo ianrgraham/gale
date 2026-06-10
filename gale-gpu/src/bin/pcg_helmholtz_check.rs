@@ -18,9 +18,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== p-multigrid PCG for velocity Helmholtz (λ={lambda}, p={p}) — iters vs plain CG ===\n");
     println!("{:>7} {:>8} {:>10} {:>10} {:>9}", "grid", "ndof", "CG iters", "PCG iters", "speedup");
 
+    // Grids capped at 32²: the CPU PMultigrid setup probes the operator diagonal with `n`
+    // matvecs (O(n²)) — fine here, but impractical at 64²+ until an analytic/colored O(n)
+    // diagonal lands (see multigrid.rs). The iteration trend (flat PCG vs growing CG) is
+    // already conclusive at these sizes.
     let mut worst_rel = 0.0f64;
-    for &g in &[16usize, 32, 64] {
-        eprintln!("[grid {g}²] starting...");
+    for &g in &[16usize, 32] {
         let mg = PMultigrid::with_reaction(p, g, g, [0.0, 1.0], [0.0, 1.0], alpha, lambda);
         let fine = mg.mesh(0);
         let nn = fine.refq.n_nodes();
@@ -40,9 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rhs = hop.rhs(&fxv, |_, _| 0.0);
 
         let (u_cg, it_cg) = helmholtz_cg_solve(fine, &rhs, alpha, lambda, tol, maxit)?;
-        eprintln!("[grid {g}²] plain CG done: {it_cg} iters; starting PCG...");
         let (u_pcg, it_pcg) = poisson_pcg_solve(&mg, &rhs, tol, maxit)?;
-        eprintln!("[grid {g}²] PCG done: {it_pcg} iters");
 
         // Same system ⇒ solutions must agree.
         let diff: f64 = u_pcg.iter().zip(&u_cg).map(|(a, b)| (a - b).powi(2)).sum();

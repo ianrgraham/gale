@@ -12,6 +12,13 @@ project for the `gale` team, with a gale-specific gap & contribution analysis.**
 > **Snapshot date: 2026-06-01** (data pulled directly from the GitHub REST API).
 > The repo is **~6 weeks old and changing daily** — numbers below will drift. See
 > [§9 How to refresh](#9-how-to-refresh) to regenerate.
+>
+> ⚠️ **2026-06-08 update — `v0.2.0` is out.** §1–§8 below describe the v0.1.0-era
+> repo and are now partially stale. **[§10](#10-v020-released--fate-of-our-fork-patches)
+> records what 0.2.0 changed and the fate of each of our 8 fork patches.** Bottom
+> line: 0.2.0 is a rearchitecture (not a cherry-pick of our work); it obsoletes ~4
+> of our patches but **still does not support pre-Blackwell typed pointers**, so the
+> Titan V (sm_70) fork is still required. Left for later — no action taken yet.
 
 ---
 
@@ -369,3 +376,57 @@ and run `gh issue list` / `gh pr list -R NVlabs/cuda-oxide --state all`.
 > conclusions should be **confirmed empirically** by gale's Milestone-1 probe on
 > the actual Titan Vs — the repo tells us what's being worked on, not what passes
 > on our exact hardware.
+
+---
+
+## 10. v0.2.0 released — fate of our fork patches
+
+**Reviewed 2026-06-08** by diffing our fork branches against the actual `v0.2.0`
+git tree (more authoritative than release notes). Source of truth: a local
+`git fetch upstream --tags` in `/home/ian/src/cuda-oxide-101`.
+
+### 10.1 State of play
+
+- Upstream tagged **`v0.2.0`** (commit `faea395` bumps the version). Our two fork
+  branches — `fix/typed-pointer-insertvalue-bitcast` (8 patches) and
+  `pr-101-typed-nvvm` (1 patch) — both branch from merge-base `1f38440` and are
+  **60 commits / one full minor release behind** `upstream/main`.
+- **0.2.0 is a rearchitecture, not a cherry-pick of our work.** `git cherry`
+  reports all 8 of our patches as still-absent by patch-id, but upstream re-did
+  several of them independently under their own commits. The three structural moves:
+  1. **`dialect-llvm` crate → renamed `llvm-export` + migrated onto upstream
+     `pliron-llvm`** (PR #114, commits `838949c` + `a2effe1`). This is why our 4
+     `dialect-llvm` patches no longer apply — that crate is gone by that name/shape.
+  2. **New `oxide-artifacts` crate** + real cross-crate kernel support in
+     `rustc-codegen-cuda/src/collector.rs`.
+  3. **New `cuda-core::peer` module** (`can_access_peer` / `enable_peer_access` /
+     `disable_peer_access`) + `memcpy_dtod_async` cross-device copy.
+
+### 10.2 Per-patch fate
+
+| Our patch | 0.2.0 status | Action |
+|---|---|---|
+| `a315b72` typed NVVM IR for pre-Blackwell | ❌ **Still unsupported.** `llvm-export/src/export/config.rs:88-89` says verbatim: *"Currently supports NVVM 20 dialect (Blackwell+, opaque pointers). NVVM 7 dialect (pre-Blackwell, typed pointers) is not yet supported."* Titan V = sm_70 = pre-Blackwell. | **Keep** — re-author onto `llvm-export` |
+| `b787932` bitcast before `insertvalue` (typed) | ❌ Same — part of the unsupported typed-pointer path. | **Keep** |
+| `8e8d71a` default unknown targets → typed ptrs | ❌ Same. | **Keep** |
+| `eb2eab2` NaN constants as IEEE hex | ✅ **Fixed upstream** — commit `03763eb` / PR #116 / #63, identical fix. | **Drop ours** |
+| `09a2e25` libm math → libdevice (broad) | ⚠️ **Partial.** Upstream wired atan/atan2/sin/cos/tan/exp/exp2/log/log2/log10/pow/sqrt/fma/min/max via `CALLEE_*` placeholders. **Still missing** the set our patch added: `acos, asin, sinh, cosh, tanh, cbrt, hypot, expm1, log1p, {a}sinh/cosh/tanh`. | **Keep the delta**, re-expressed via the new placeholder mechanism in `dialect-mir/src/rust_intrinsics.rs` |
+| `965c436` `memcpy_peer_async` (P2P) | ✅ **Superseded by a cleaner API** — `peer::enable_peer_access` + `memcpy_dtod_async` (memory.rs:163, "may reside on different devices if peer access is enabled"). | **Drop, migrate** |
+| `02129b8` embedded artifacts cross-crate link | ✅ **Superseded** by the `oxide-artifacts` crate + collector cross-crate support. | **Drop** |
+| `0c65145` create artifact dir before `.ll` | ✅ Folded into the reworked `device_codegen` pipeline. | **Drop** |
+
+### 10.3 Recommendation (deferred)
+
+Rebase the fork onto `v0.2.0`. That collapses our delta from **8 patches → ~2
+areas**: (a) the pre-Blackwell typed-pointer trio, **re-authored against the new
+`llvm-export`/pliron-llvm internals** (non-trivial — *not* a clean `git rebase`,
+budget real time), and (b) the missing transcendental math entries (`acos`/`asin`/
+`sinh`/`cosh`/`tanh`/`cbrt`/`hypot`/…). Everything else (NaN, P2P, artifacts,
+dir-creation, the common math fns) comes for free and can be deleted.
+
+`pr-101-typed-nvvm` is the load-bearing branch — it maps to upstream **PR #101**,
+which is *still the open gap* for pre-Blackwell support. We own the only sm_70
+hardware validating it, so pushing that PR remains the highest-leverage upstream
+contribution (consistent with §8 P0).
+
+**Status: noted, no code changes made.** Pick up when we next touch the toolchain.
