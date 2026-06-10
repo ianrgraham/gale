@@ -84,7 +84,7 @@ mod kernels {
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn gradient(
-        d: &[f64], u: &[f64], rx: &[f64], ry: &[f64], sx: &[f64], sy: &[f64], n1: u32, ne: u32,
+        d: &[f64], u: &[f64], rx: f64, sy: f64, n1: u32, ne: u32,
         mut gx: DisjointSlice<f64>, mut gy: DisjointSlice<f64>,
     ) {
         let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | US(epb·nn) ]
@@ -109,7 +109,6 @@ mod kernels {
         if !active {
             return; // no further barrier in this kernel ⇒ safe to bail
         }
-        let base = e * nn;
         let i = m % n1;
         let j = m / n1;
         let mut ur = 0.0f64;
@@ -122,9 +121,10 @@ mod kernels {
             }
             k += 1;
         }
-        let gxv = rx[base + m] * ur + sx[base + m] * uss;
-        let gyv = ry[base + m] * ur + sy[base + m] * uss;
-        // block_dim = epb·nn ⇒ global 1D thread index == base + m.
+        // Affine axis-aligned metrics: gx = rx·u_r (sx=0), gy = sy·u_s (ry=0).
+        let gxv = rx * ur;
+        let gyv = sy * uss;
+        // block_dim = epb·nn ⇒ global 1D thread index == e·nn + m.
         if let Some(o) = gx.get_mut(thread::index_1d()) {
             *o = gxv;
         }
@@ -136,8 +136,8 @@ mod kernels {
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn operator(
-        d: &[f64], u: &[f64], gx: &[f64], gy: &[f64], rx: &[f64], ry: &[f64], sx: &[f64],
-        sy: &[f64], jw: &[f64], n1: u32, ne: u32, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
+        d: &[f64], u: &[f64], gx: &[f64], gy: &[f64], mass: &[f64], n1: u32, ne: u32, rx: f64,
+        sy: f64, jac: f64, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
         face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<f64>,
     ) {
         let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | PR(epb·nn) | PS(epb·nn) ]
@@ -154,16 +154,18 @@ mod kernels {
         let b = e * nn + m;
         unsafe {
             if t < nn {
-                *sm.add(t) = d[t]; // shared diff matrix, loaded once per block
+                *sm.add(t) = d[t]; // shared diff matrix (DS), loaded once per block
             }
         }
+        // affine: per-node jw = constant Jacobian × the (tiny, well-cached) GLL mass diagonal.
+        let jw_b = jac * mass[m];
         let mut rf = 0.0f64;
         if active {
             unsafe {
-                let wx = jw[b] * gx[b];
-                let wy = jw[b] * gy[b];
-                *sm.add(pr + m) = rx[b] * wx + ry[b] * wy;
-                *sm.add(ps + m) = sx[b] * wx + sy[b] * wy;
+                let wx = jw_b * gx[b];
+                let wy = jw_b * gy[b];
+                *sm.add(pr + m) = rx * wx; // ry = 0
+                *sm.add(ps + m) = sy * wy; // sx = 0
             }
             // Face contribution by **gather** (race-free, fully parallel): thread `m` owns
             // node `m`, visits the ≤2 faces it lies on (corner ⇒ 2), and accumulates the SIPG
@@ -212,8 +214,8 @@ mod kernels {
                 t4 += 1;
             }
             unsafe {
-                *sm.add(pr + m) -= rx[b] * hx + ry[b] * hy;
-                *sm.add(ps + m) -= sx[b] * hx + sy[b] * hy;
+                *sm.add(pr + m) -= rx * hx; // ry = 0
+                *sm.add(ps + m) -= sy * hy; // sx = 0
             }
         }
         thread::sync_threads(); // ALL threads (active + inactive padding) reach this barrier
@@ -234,7 +236,7 @@ mod kernels {
         if let Some(o) = out.get_mut(thread::index_1d()) {
             // SIPG stiffness `A·u` plus the Helmholtz reaction `λ·M·u` (diagonal GLL
             // mass `M = diag(jw)`). `λ = 0` ⇒ pure Poisson, bit-identical to before.
-            *o = acc + rf + lambda * jw[b] * u[b];
+            *o = acc + rf + lambda * jw_b * u[b];
         }
     }
 
@@ -554,11 +556,15 @@ struct MeshArrays {
     ndof: usize,
     n1: u32,
     diff: Vec<f64>,
-    rx: Vec<f64>,
-    ry: Vec<f64>,
-    sx: Vec<f64>,
-    sy: Vec<f64>,
-    jw: Vec<f64>,
+    /// 2D GLL mass diagonal `w_i·w_j` (length `nn`), shared by all elements — `jw = jac·mass`.
+    mass: Vec<f64>,
+    /// **Affine metrics** for a uniform axis-aligned rectangular mesh: `rx = 2/dx`, `sy = 2/dy`
+    /// are constant across the whole mesh and `ry = sx = 0`, and the Jacobian `jac` is constant.
+    /// So the 5 per-node metric arrays collapse to these 3 scalars + the shared `mass` — the
+    /// matvec stops streaming `rx/ry/sx/sy/jw` from DRAM entirely (the big memory-bound win).
+    rx: f64,
+    sy: f64,
+    jac: f64,
     fvl: Vec<u32>,
     fnx: Vec<f64>,
     fny: Vec<f64>,
@@ -582,17 +588,25 @@ fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32]) -> MeshArrays {
     let n1 = (order + 1) as u32;
     assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
 
-    let (mut rx, mut ry, mut sx, mut sy, mut jw) =
-        (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
-    for (e, el) in mesh.elements.iter().enumerate() {
+    // Affine-metric extraction: a uniform axis-aligned rectangular mesh has rx, sy, jac constant
+    // across every node of every element and ry = sx = 0. Take them from element 0 and ASSERT the
+    // whole mesh matches — so a non-axis-aligned / non-uniform mesh (which would need the per-node
+    // metrics) fails loudly here rather than silently producing the wrong operator.
+    let (rx, sy, jac) = (mesh.elements[0].geom.rx[0], mesh.elements[0].geom.sy[0], mesh.elements[0].geom.jac[0]);
+    let tol = 1e-9 * (1.0 + rx.abs() + sy.abs() + jac.abs());
+    for el in &mesh.elements {
         for k in 0..nn {
-            rx[e * nn + k] = el.geom.rx[k];
-            ry[e * nn + k] = el.geom.ry[k];
-            sx[e * nn + k] = el.geom.sx[k];
-            sy[e * nn + k] = el.geom.sy[k];
-            jw[e * nn + k] = el.geom.jw[k];
+            assert!(
+                (el.geom.rx[k] - rx).abs() < tol
+                    && (el.geom.sy[k] - sy).abs() < tol
+                    && (el.geom.jac[k] - jac).abs() < tol
+                    && el.geom.ry[k].abs() < tol
+                    && el.geom.sx[k].abs() < tol,
+                "gale-gpu matvec requires a uniform axis-aligned rectangular mesh (affine metrics)"
+            );
         }
     }
+    let mass = mesh.refq.mass.clone(); // nn, the 2D GLL mass diagonal w_i·w_j (jw = jac·mass)
 
     let p1 = (order + 1) as f64;
     let h: Vec<f64> = mesh.elements.iter().map(|el| el.geom.jw.iter().sum::<f64>().sqrt()).collect();
@@ -632,11 +646,10 @@ fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32]) -> MeshArrays {
         ndof,
         n1,
         diff: mesh.refq.line.diff.clone(),
+        mass,
         rx,
-        ry,
-        sx,
         sy,
-        jw,
+        jac,
         fvl,
         fnx,
         fny,
@@ -668,11 +681,7 @@ pub fn poisson_apply(
 
     let d_dev = up(&ma.diff)?;
     let u_dev = up(u)?;
-    let rx_dev = up(&ma.rx)?;
-    let ry_dev = up(&ma.ry)?;
-    let sx_dev = up(&ma.sx)?;
-    let sy_dev = up(&ma.sy)?;
-    let jw_dev = up(&ma.jw)?;
+    let mass_dev = up(&ma.mass)?;
     let fvl_dev = upu(&ma.fvl)?;
     let fnx_dev = up(&ma.fnx)?;
     let fny_dev = up(&ma.fny)?;
@@ -686,14 +695,10 @@ pub fn poisson_apply(
     let module = kernels::load(&ctx)?;
     let nev = ma.ne as u32;
     let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
-    module.gradient(
-        &stream, gcfg, &d_dev, &u_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev, ma.n1, nev,
-        &mut gx_dev, &mut gy_dev,
-    )?;
+    module.gradient(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, ma.n1, nev, &mut gx_dev, &mut gy_dev)?;
     module.operator(
-        &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev,
-        &jw_dev, ma.n1, nev, &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev,
-        0.0, &mut out_dev,
+        &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &mass_dev, ma.n1, nev, ma.rx, ma.sy, ma.jac,
+        &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out_dev,
     )?;
     Ok(out_dev.to_host_vec(&stream)?)
 }
@@ -770,11 +775,7 @@ fn cg_solve_impl(
     let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
 
     let d_dev = up(&ma.diff)?;
-    let rx_dev = up(&ma.rx)?;
-    let ry_dev = up(&ma.ry)?;
-    let sx_dev = up(&ma.sx)?;
-    let sy_dev = up(&ma.sy)?;
-    let jw_dev = up(&ma.jw)?;
+    let mass_dev = up(&ma.mass)?;
     let fvl_dev = upu(&ma.fvl)?;
     let fnx_dev = up(&ma.fnx)?;
     let fny_dev = up(&ma.fny)?;
@@ -819,9 +820,9 @@ fn cg_solve_impl(
     }
     macro_rules! apply {
         ($field:expr, $dst:expr) => {{
-            module.gradient(&stream, gcfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, nev, &mut gx, &mut gy)?;
+            module.gradient(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
             module.operator(
-                &stream, ocfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1, nev,
+                &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, reaction, $dst,
             )?;
         }};
@@ -882,11 +883,7 @@ pub fn pressure_cg_solve(
     let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
 
     let d_dev = up(&ma.diff)?;
-    let rx_dev = up(&ma.rx)?;
-    let ry_dev = up(&ma.ry)?;
-    let sx_dev = up(&ma.sx)?;
-    let sy_dev = up(&ma.sy)?;
-    let jw_dev = up(&ma.jw)?;
+    let mass_dev = up(&ma.mass)?;
     let fvl_dev = upu(&ma.fvl)?;
     let fnx_dev = up(&ma.fnx)?;
     let fny_dev = up(&ma.fny)?;
@@ -929,9 +926,9 @@ pub fn pressure_cg_solve(
     }
     macro_rules! apply {
         ($field:expr, $dst:expr) => {{
-            module.gradient(&stream, gcfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, nev, &mut gx, &mut gy)?;
+            module.gradient(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
             module.operator(
-                &stream, ocfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1, nev,
+                &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, $dst,
             )?;
         }};
@@ -982,11 +979,12 @@ struct MgConst {
     nev: Vec<u32>,
     ndofv: Vec<usize>,
     dl: Vec<DeviceBuffer<f64>>,
-    rxl: Vec<DeviceBuffer<f64>>,
-    ryl: Vec<DeviceBuffer<f64>>,
-    sxl: Vec<DeviceBuffer<f64>>,
-    syl: Vec<DeviceBuffer<f64>>,
-    jwl: Vec<DeviceBuffer<f64>>,
+    /// 2D GLL mass diagonal per level (affine matvec: `jw = jac·mass`).
+    massl: Vec<DeviceBuffer<f64>>,
+    /// Affine metric scalars per level (uniform axis-aligned rect mesh): `rx=2/dx`, `sy=2/dy`, Jacobian.
+    rxs: Vec<f64>,
+    sys: Vec<f64>,
+    jacs: Vec<f64>,
     invd: Vec<DeviceBuffer<f64>>,
     fvl: Vec<DeviceBuffer<u32>>,
     fnbr: Vec<DeviceBuffer<u32>>,
@@ -1027,8 +1025,8 @@ impl MgConst {
         let mut n1v = Vec::new();
         let mut nev = Vec::new();
         let mut ndofv = Vec::new();
-        let (mut dl, mut rxl, mut ryl, mut sxl, mut syl, mut jwl, mut invd) =
-            (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+        let (mut dl, mut massl, mut invd) = (vec![], vec![], vec![]);
+        let (mut rxs, mut sys, mut jacs): (Vec<f64>, Vec<f64>, Vec<f64>) = (vec![], vec![], vec![]);
         let (mut fvl, mut fnbr) = (vec![], vec![]);
         let (mut fnx, mut fny, mut fsw, mut ftau) = (vec![], vec![], vec![], vec![]);
         let mut omega = Vec::new();
@@ -1043,11 +1041,10 @@ impl MgConst {
             nev.push(ma.ne as u32);
             ndofv.push(ma.ndof);
             dl.push(up(&ma.diff)?);
-            rxl.push(up(&ma.rx)?);
-            ryl.push(up(&ma.ry)?);
-            sxl.push(up(&ma.sx)?);
-            syl.push(up(&ma.sy)?);
-            jwl.push(up(&ma.jw)?);
+            massl.push(up(&ma.mass)?);
+            rxs.push(ma.rx);
+            sys.push(ma.sy);
+            jacs.push(ma.jac);
             invd.push(up(mg.inv_diagonal(l))?);
             fvl.push(upu(&ma.fvl)?);
             fnbr.push(upu(&ma.fnbr)?);
@@ -1094,11 +1091,10 @@ impl MgConst {
             nev,
             ndofv,
             dl,
-            rxl,
-            ryl,
-            sxl,
-            syl,
-            jwl,
+            massl,
+            rxs,
+            sys,
+            jacs,
             invd,
             fvl,
             fnbr,
@@ -1177,11 +1173,10 @@ fn pcg_solve_with(
         ref nev,
         ref ndofv,
         ref dl,
-        ref rxl,
-        ref ryl,
-        ref sxl,
-        ref syl,
-        ref jwl,
+        ref massl,
+        ref rxs,
+        ref sys,
+        ref jacs,
         ref invd,
         ref fvl,
         ref fnbr,
@@ -1304,9 +1299,9 @@ fn pcg_solve_with(
     macro_rules! matvec {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
-            module.gradient(&stream, mvcfg[l].0, &dl[l], $src, &rxl[l], &ryl[l], &sxl[l], &syl[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
+            module.gradient(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
             module.operator(
-                &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &rxl[l], &ryl[l], &sxl[l], &syl[l], &jwl[l], n1v[l], nev[l],
+                &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
                 &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
             )?;
         }};
@@ -1516,11 +1511,7 @@ pub fn bench_poisson_kernels(
     let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
 
     let d_dev = up(&ma.diff)?;
-    let rx_dev = up(&ma.rx)?;
-    let ry_dev = up(&ma.ry)?;
-    let sx_dev = up(&ma.sx)?;
-    let sy_dev = up(&ma.sy)?;
-    let jw_dev = up(&ma.jw)?;
+    let mass_dev = up(&ma.mass)?;
     let fvl_dev = upu(&ma.fvl)?;
     let fnx_dev = up(&ma.fnx)?;
     let fny_dev = up(&ma.fny)?;
@@ -1566,11 +1557,11 @@ pub fn bench_poisson_kernels(
     }
 
     let grad_ms = timed!({
-        module.gradient(&stream, gcfg, &d_dev, &u_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, nev, &mut gx, &mut gy)?;
+        module.gradient(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
     });
     let op_ms = timed!({
         module.operator(
-            &stream, ocfg, &d_dev, &u_dev, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1, nev,
+            &stream, ocfg, &d_dev, &u_dev, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
             &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out,
         )?;
     });
@@ -1635,11 +1626,10 @@ pub struct GpuPoisson {
     n1: u32,
     // constant (neumann-tag-independent) device arrays, uploaded once.
     d_dev: DeviceBuffer<f64>,
-    rx_dev: DeviceBuffer<f64>,
-    ry_dev: DeviceBuffer<f64>,
-    sx_dev: DeviceBuffer<f64>,
-    sy_dev: DeviceBuffer<f64>,
-    jw_dev: DeviceBuffer<f64>,
+    mass_dev: DeviceBuffer<f64>, // 2D GLL mass diagonal (affine matvec: jw = jac·mass)
+    rx: f64,                     // affine metric scalars (uniform axis-aligned rect mesh)
+    sy: f64,
+    jac: f64,
     fvl_dev: DeviceBuffer<u32>,
     fnx_dev: DeviceBuffer<f64>,
     fny_dev: DeviceBuffer<f64>,
@@ -1682,11 +1672,10 @@ impl GpuPoisson {
             ndof: ma.ndof,
             n1: ma.n1,
             d_dev: up(&ma.diff)?,
-            rx_dev: up(&ma.rx)?,
-            ry_dev: up(&ma.ry)?,
-            sx_dev: up(&ma.sx)?,
-            sy_dev: up(&ma.sy)?,
-            jw_dev: up(&ma.jw)?,
+            mass_dev: up(&ma.mass)?,
+            rx: ma.rx,
+            sy: ma.sy,
+            jac: ma.jac,
             fvl_dev: upu(&ma.fvl)?,
             fnx_dev: up(&ma.fnx)?,
             fny_dev: up(&ma.fny)?,
@@ -1782,9 +1771,9 @@ impl GpuPoisson {
         }
         macro_rules! apply {
             ($field:expr, $dst:expr) => {{
-                module.gradient(stream, gcfg, &self.d_dev, $field, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, n1, nev, &mut gx, &mut gy)?;
+                module.gradient(stream, gcfg, &self.d_dev, $field, self.rx, self.sy, n1, nev, &mut gx, &mut gy)?;
                 module.operator(
-                    stream, ocfg, &self.d_dev, $field, &gx, &gy, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, &self.jw_dev, n1, nev,
+                    stream, ocfg, &self.d_dev, $field, &gx, &gy, &self.mass_dev, n1, nev, self.rx, self.sy, self.jac,
                     &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, &fnbr_dev, &self.ftau_dev, reaction, $dst,
                 )?;
             }};
