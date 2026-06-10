@@ -13,7 +13,9 @@
 //! gradient correction, SIPG RHS lifting) reuses the validated host `gale::dg`
 //! machinery. Bit-for-bit (to solver tolerance) equal to `gale::dg::Stokes::step`.
 
-use crate::operators::poisson::{helmholtz_cg_solve, helmholtz_cg_solve_tags, pressure_cg_solve, GpuPoisson};
+use crate::operators::poisson::{
+    helmholtz_cg_solve, helmholtz_cg_solve_tags, pressure_cg_solve, GpuPoisson, GpuPoissonMg,
+};
 use crate::operators::poisson_nc::{
     helmholtz_nc_cg_solve_tags, poisson_nc_cg_solve, pressure_nc_cg_solve, GpuPoissonNc,
 };
@@ -65,8 +67,31 @@ fn ensure_poisson_nc_handle(slot: &RefCell<Option<GpuPoissonNc>>, mesh: &Mesh2d,
 use gale::dg::{
     log_conformation, upwind_advection_lift, BoundaryConditions, ConformationInflow,
     ConstitutiveModel, ConvectionScheme, Hyperbolic, IncompressibleConvection, LogConfOldroydB,
-    Mesh2d, OldroydB, Poisson, VolumeForm,
+    Mesh2d, OldroydB, PMultigrid, Poisson, VolumeForm,
 };
+
+/// Lazily (re)build the persistent **p-multigrid-PCG pressure** handle in `slot`: built
+/// (reaction 0, the given pressure `neumann_tags`) from a conforming **rectangular** flow
+/// mesh via `PMultigrid::from_mesh`; left `None` for non-conforming or non-rectangular
+/// meshes (the step then falls back to the deflated-CG pressure path). The MG-PCG is
+/// mesh-independent where plain CG grows O(1/h) — the dominant pressure-solve win.
+fn ensure_mg_pressure_handle(
+    slot: &RefCell<Option<GpuPoissonMg>>,
+    mesh: &Mesh2d,
+    alpha: f64,
+    neumann_tags: Vec<u32>,
+) {
+    let mut cur = slot.borrow_mut();
+    if mesh_is_nonconforming(mesh) {
+        *cur = None;
+        return;
+    }
+    let ndof = mesh.n_elements() * mesh.refq.n_nodes();
+    if cur.as_ref().map_or(true, |h| h.ndof() != ndof) {
+        // None if `mesh` is not a uniform rectangular grid ⇒ stay on the CG pressure path.
+        *cur = PMultigrid::from_mesh(mesh, alpha, 0.0, neumann_tags).and_then(|mg| GpuPoissonMg::new(mg).ok());
+    }
+}
 
 type StepResult = Result<(Vec<f64>, Vec<f64>), Box<dyn std::error::Error>>;
 
@@ -89,6 +114,11 @@ pub struct GpuStokes<'m, 'p> {
     /// (then `poisson` is `None`); `None` ⇒ the one-shot mortar solvers. Set via
     /// [`with_nc_handle`](Self::with_nc_handle).
     poisson_nc: Option<&'p GpuPoissonNc>,
+    /// Optional persistent **p-multigrid-PCG** handle for the PRESSURE solve (the most
+    /// ill-conditioned: deflated CG iterations grow O(1/h), MG-PCG holds ~flat — 136× fewer
+    /// at 64²). Built by the integrator from the (conforming, rectangular) flow mesh with
+    /// the pressure neumann-tags; `None` ⇒ the CG path. Set via [`with_mg_pressure`].
+    mg_pressure: Option<&'p GpuPoissonMg>,
     /// Pressure-Poisson assembly (pure Neumann, singular).
     pressure: Poisson<'m>,
     /// Velocity Helmholtz assembly `(λM + A)`, one per component (differ only in their
@@ -121,6 +151,7 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             alpha,
             poisson: None,
             poisson_nc: None,
+            mg_pressure: None,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
             velocity_x: Poisson::with_reaction(mesh, alpha, lambda),
             velocity_y: Poisson::with_reaction(mesh, alpha, lambda),
@@ -153,6 +184,16 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         self
     }
 
+    /// Route the **pressure** projection solve through the persistent p-multigrid-PCG
+    /// `handle` (built from this mesh with the pressure neumann-tags). The MG-PCG is
+    /// mesh-independent (~flat iters) where plain CG grows O(1/h); for the singular
+    /// pure-Neumann (closed-box) pressure it auto-deflates. Conforming rectangular meshes
+    /// only; bit-equivalent to the CG it replaces (validated by pcg-pressure-check).
+    pub fn with_mg_pressure(mut self, handle: &'p GpuPoissonMg) -> Self {
+        self.mg_pressure = Some(handle);
+        self
+    }
+
     /// Solver with **per-region** boundary conditions — the GPU analogue of
     /// `gale::dg::Stokes::with_bcs`. Each boundary tag is routed via `bcs` to the right
     /// pair of operator settings (no-slip/inflow ⇒ velocity-Dirichlet + pressure-Neumann;
@@ -171,6 +212,7 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             alpha,
             poisson: None,
             poisson_nc: None,
+            mg_pressure: None,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, pres_neumann.clone()),
             velocity_x: Poisson::with_bc(mesh, alpha, lambda, velx_neumann.clone()),
             velocity_y: Poisson::with_bc(mesh, alpha, lambda, vely_neumann.clone()),
@@ -343,7 +385,10 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _| 0.0, |_, _| 0.0);
         let nc = mesh_is_nonconforming(mesh);
-        let (p, _it) = if nc {
+        let (p, _it) = if !nc && self.mg_pressure.is_some() {
+            // p-MG-PCG (mesh-independent iters; auto-deflated for the singular pure-Neumann op).
+            self.mg_pressure.unwrap().solve(&bp, self.tol, self.maxit)?
+        } else if nc {
             if let Some(h) = self.poisson_nc {
                 h.solve(&bp, 0.0, &self.pres_neumann_tags, true, self.tol, self.maxit)?
             } else {
@@ -475,7 +520,11 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         let div = self.divergence(&uhx, &uhy);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _| 0.0, |_, _| 0.0);
-        let (p, _it) = match (self.has_outflow, nc) {
+        let (p, _it) = if !nc && self.mg_pressure.is_some() {
+            // p-MG-PCG pressure (mesh-independent iters; auto-deflated for pure-Neumann,
+            // plain for the outflow-pinned non-singular case).
+            self.mg_pressure.unwrap().solve(&bp, self.tol, self.maxit)?
+        } else { match (self.has_outflow, nc) {
             // Conforming + persistent handle: reaction 0, pressure-Neumann tags, and
             // deflate ⇔ no outflow (pinned pressure is non-singular ⇒ no nullspace removal).
             (_, false) if self.poisson.is_some() => {
@@ -490,7 +539,7 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             (true, true) => helmholtz_nc_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?,
             (false, false) => pressure_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?,
             (false, true) => pressure_nc_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?,
-        };
+        }};
         for (e, el) in mesh.elements.iter().enumerate() {
             let gpx = el.geom.grad_x(refq, &p[e * nn..(e + 1) * nn]);
             let gpy = el.geom.grad_y(refq, &p[e * nn..(e + 1) * nn]);
@@ -545,6 +594,7 @@ pub struct GpuStokesIntegrator {
     /// Persistent GPU Poisson handle (P4), lazily built and reused across timesteps.
     poisson: RefCell<Option<GpuPoisson>>,
     poisson_nc: RefCell<Option<GpuPoissonNc>>,
+    mg_pressure: RefCell<Option<GpuPoissonMg>>,
 }
 
 impl GpuStokesIntegrator {
@@ -560,6 +610,7 @@ impl GpuStokesIntegrator {
             bc_v: Box::new(|_, _, _| 0.0),
             poisson: RefCell::new(None),
             poisson_nc: RefCell::new(None),
+            mg_pressure: RefCell::new(None),
         }
     }
 
@@ -584,14 +635,19 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
         let t_new = state.time.t + self.dt;
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
+        ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, state.mesh.boundary_tags());
         let handle = self.poisson.borrow();
         let nc_handle = self.poisson_nc.borrow();
+        let mg_handle = self.mg_pressure.borrow();
         let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.nu, self.dt);
         if let Some(h) = handle.as_ref() {
             stokes = stokes.with_handle(h);
         }
         if let Some(h) = nc_handle.as_ref() {
             stokes = stokes.with_nc_handle(h);
+        }
+        if let Some(h) = mg_handle.as_ref() {
+            stokes = stokes.with_mg_pressure(h);
         }
         let (ux, uy) = {
             let v = state.fields.by_id(self.velocity);
@@ -636,6 +692,7 @@ pub struct GpuDualSplitting {
     /// across timesteps. `RefCell` because `step` is `&self`; conforming meshes only.
     poisson: RefCell<Option<GpuPoisson>>,
     poisson_nc: RefCell<Option<GpuPoissonNc>>,
+    mg_pressure: RefCell<Option<GpuPoissonMg>>,
 }
 
 impl GpuDualSplitting {
@@ -657,6 +714,7 @@ impl GpuDualSplitting {
             }),
             poisson: RefCell::new(None),
             poisson_nc: RefCell::new(None),
+            mg_pressure: RefCell::new(None),
         }
     }
 
@@ -708,10 +766,18 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             (v.component(0).to_vec(), v.component(1).to_vec())
         };
         let (bx, by) = (self.body_force)(state, t_new);
+        // Pressure-Neumann tags for the MG handle: per-region set (outflow excluded) with
+        // BCs, else all boundary tags (the singular closed-box pressure).
+        let pres_tags = match &self.bcs {
+            Some(bcs) => bcs.pressure_neumann_tags(&state.mesh),
+            None => state.mesh.boundary_tags(),
+        };
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
+        ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, pres_tags);
         let handle = self.poisson.borrow();
         let nc_handle = self.poisson_nc.borrow();
+        let mg_handle = self.mg_pressure.borrow();
         let (nux, nuy) = if let Some(bcs) = &self.bcs {
             let mut stokes = GpuStokes::with_bcs(&state.mesh, self.alpha, self.nu, self.dt, bcs);
             stokes.convection_scheme = self.convection_scheme;
@@ -720,6 +786,9 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             }
             if let Some(h) = nc_handle.as_ref() {
                 stokes = stokes.with_nc_handle(h);
+            }
+            if let Some(h) = mg_handle.as_ref() {
+                stokes = stokes.with_mg_pressure(h);
             }
             stokes
                 .step_ns_forced_bc(&ux, &uy, t_new, bcs, &bx, &by)
@@ -732,6 +801,9 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             }
             if let Some(h) = nc_handle.as_ref() {
                 stokes = stokes.with_nc_handle(h);
+            }
+            if let Some(h) = mg_handle.as_ref() {
+                stokes = stokes.with_mg_pressure(h);
             }
             stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
@@ -910,6 +982,7 @@ pub struct GpuViscoelasticDualSplitting {
     /// on the first step and reused across timesteps. Conforming meshes only.
     poisson: RefCell<Option<GpuPoisson>>,
     poisson_nc: RefCell<Option<GpuPoissonNc>>,
+    mg_pressure: RefCell<Option<GpuPoissonMg>>,
 }
 
 impl GpuViscoelasticDualSplitting {
@@ -943,6 +1016,7 @@ impl GpuViscoelasticDualSplitting {
             inflow: None,
             poisson: RefCell::new(None),
             poisson_nc: RefCell::new(None),
+            mg_pressure: RefCell::new(None),
         }
     }
 
@@ -1030,14 +1104,19 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             let (bx, by) = self.body_force(&state.mesh, &c, t_new);
             ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
             ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
+            ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, state.mesh.boundary_tags());
             let handle = self.poisson.borrow();
             let nc_handle = self.poisson_nc.borrow();
+            let mg_handle = self.mg_pressure.borrow();
             let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.eta_s, self.dt);
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
             }
             if let Some(h) = nc_handle.as_ref() {
                 stokes = stokes.with_nc_handle(h);
+            }
+            if let Some(h) = mg_handle.as_ref() {
+                stokes = stokes.with_mg_pressure(h);
             }
             let (nux, nuy) = stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
