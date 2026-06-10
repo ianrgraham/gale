@@ -18,12 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== p-multigrid PCG for velocity Helmholtz (λ={lambda}, p={p}) — iters vs plain CG ===\n");
     println!("{:>7} {:>8} {:>10} {:>10} {:>9}", "grid", "ndof", "CG iters", "PCG iters", "speedup");
 
-    // Grids capped at 32²: the CPU PMultigrid setup probes the operator diagonal with `n`
-    // matvecs (O(n²)) — fine here, but impractical at 64²+ until an analytic/colored O(n)
-    // diagonal lands (see multigrid.rs). The iteration trend (flat PCG vs growing CG) is
-    // already conclusive at these sizes.
     let mut worst_rel = 0.0f64;
-    for &g in &[16usize, 32] {
+    for &g in &[16usize, 32, 64] {
         let mg = PMultigrid::with_reaction(p, g, g, [0.0, 1.0], [0.0, 1.0], alpha, lambda);
         let fine = mg.mesh(0);
         let nn = fine.refq.n_nodes();

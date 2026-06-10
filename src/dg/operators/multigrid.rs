@@ -65,6 +65,12 @@ pub struct PMultigrid {
     lam_hi: Vec<f64>,
     n_pre: usize,
     n_post: usize,
+    // Rectangular grid params, for the checkerboard element coloring used by the O(n·nn)
+    // diagonal probing.
+    nx: usize,
+    ny: usize,
+    xr: [f64; 2],
+    yr: [f64; 2],
 }
 
 impl PMultigrid {
@@ -96,6 +102,10 @@ impl PMultigrid {
             lam_hi: Vec::new(),
             n_pre: 3,
             n_post: 3,
+            nx,
+            ny,
+            xr,
+            yr,
         };
         for l in 0..s.orders.len() {
             let d = s.diagonal(l);
@@ -153,16 +163,54 @@ impl PMultigrid {
         Poisson::with_reaction(&self.meshes[l], self.alpha, self.reaction).apply(u)
     }
 
-    /// Operator diagonal via unit-vector probing (CPU prototype; the GPU port needs
-    /// an analytic diagonal kernel).
+    /// Checkerboard parity of element `e` on the rectangular `nx×ny` grid, from its
+    /// centroid (ordering-independent). SIPG couples an element only to its **face**
+    /// neighbours (which differ by ±1 in one cell index ⇒ opposite parity), so two
+    /// same-parity elements never couple — the key to the colored diagonal below.
+    fn elem_color(&self, l: usize, e: usize) -> usize {
+        let g = &self.meshes[l].elements[e].geom;
+        let nn = self.meshes[l].refq.n_nodes();
+        let (mut xc, mut yc) = (0.0, 0.0);
+        for k in 0..nn {
+            xc += g.x[k];
+            yc += g.y[k];
+        }
+        xc /= nn as f64;
+        yc /= nn as f64;
+        let cx = (((xc - self.xr[0]) / ((self.xr[1] - self.xr[0]) / self.nx as f64)) as usize).min(self.nx - 1);
+        let cy = (((yc - self.yr[0]) / ((self.yr[1] - self.yr[0]) / self.ny as f64)) as usize).min(self.ny - 1);
+        (cx + cy) % 2
+    }
+
+    /// Operator diagonal in **O(n·nn)** via 2-colored probing instead of O(n²) unit-vector
+    /// probing. For each (local node `m`, element colour `c`) set a probe with `1` at node
+    /// `m` of every colour-`c` element and apply once: since same-colour elements don't
+    /// couple (SIPG is face-local; checkerboard separates face neighbours) and only node
+    /// `m` is set per element, `(A·e)` at those nodes is exactly the diagonal. `2·nn`
+    /// matvecs total — bit-for-bit equal to the old probing (validated by poisson-pcg-check).
     fn diagonal(&self, l: usize) -> Vec<f64> {
-        let n = self.ndof(l);
+        let mesh = &self.meshes[l];
+        let nn = mesh.refq.n_nodes();
+        let ne = mesh.n_elements();
+        let n = ne * nn;
+        let colors: Vec<usize> = (0..ne).map(|e| self.elem_color(l, e)).collect();
         let mut diag = vec![0.0; n];
         let mut e = vec![0.0; n];
-        for i in 0..n {
-            e[i] = 1.0;
-            diag[i] = self.apply_level(l, &e)[i];
-            e[i] = 0.0;
+        for c in 0..2 {
+            for m in 0..nn {
+                for el in 0..ne {
+                    if colors[el] == c {
+                        e[el * nn + m] = 1.0;
+                    }
+                }
+                let ae = self.apply_level(l, &e);
+                for el in 0..ne {
+                    if colors[el] == c {
+                        diag[el * nn + m] = ae[el * nn + m];
+                        e[el * nn + m] = 0.0;
+                    }
+                }
+            }
         }
         diag
     }
