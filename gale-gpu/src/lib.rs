@@ -54,9 +54,9 @@ pub use operators::logconf3d::logconf3d_psi_rhs;
 pub use operators::oldroyd::oldroyd_conf_rhs;
 pub use operators::oldroyd3d::oldroyd3d_conf_rhs;
 pub use operators::poisson::{
-    bench_poisson_kernels, helmholtz_cg_solve, helmholtz_cg_solve_tags, pcie_crossover, poisson_apply,
-    poisson_cg_solve, poisson_pcg_solve, pressure_cg_solve, GpuPoisson, GpuPoissonMg, KernelTime,
-    PoissonBench,
+    bench_poisson_kernels, helmholtz_cg_solve, helmholtz_cg_solve_tags, multigpu_poisson_matvec_2d,
+    pcie_crossover, poisson_apply, poisson_cg_solve, poisson_pcg_solve, pressure_cg_solve, GpuPoisson,
+    GpuPoissonMg, KernelTime, PoissonBench,
 };
 pub use operators::poisson3d::{
     helmholtz3d_cg_solve, helmholtz3d_cg_solve_tags, poisson3d_apply, pressure3d_cg_solve,

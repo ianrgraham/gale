@@ -414,6 +414,18 @@ mod kernels {
         }
     }
 
+    /// Packed gather `out[i] = src[idx[i]]` — packs scattered partition-boundary trace nodes
+    /// into a contiguous send buffer so a multi-GPU halo exchange moves in ONE P2P copy per
+    /// field/direction instead of one tiny copy per node. Used by `multigpu_poisson_matvec_2d`.
+    #[kernel]
+    pub fn gather(src: &[f64], idx: &[u32], mut out: DisjointSlice<f64>) {
+        let tid = thread::index_1d();
+        let i = tid.get();
+        if let Some(o) = out.get_mut(tid) {
+            *o = src[idx[i] as usize];
+        }
+    }
+
     /// y ← y + a·x
     #[kernel]
     pub fn axpy(mut y: DisjointSlice<f64>, x: &[f64], a: f64) {
@@ -2005,6 +2017,270 @@ pub fn pcie_crossover(p: usize, reps: u32) -> Result<(), Box<dyn std::error::Err
          bandwidth-bound matvec can hide a P2P halo exchange; below it, distribution only adds latency."
     );
     Ok(())
+}
+
+/// **Distributed finest-level SIPG matvec across 2 GPUs** (the research §7 first increment).
+/// Computes `A·u` (SIPG Poisson + `reaction·M`) with the mesh block-partitioned over GPU0/GPU1,
+/// exchanging only the partition-boundary **face traces** (`u`, `gx`, `gy`) via a gathered,
+/// single-copy-per-field P2P halo. Bit-for-bit equal to the single-GPU [`poisson_apply`] /
+/// `Poisson::apply` (same kernels, same arithmetic; the gather just reorders *which* buffer a
+/// boundary node is read from). The load-bearing primitive for a distributed MG-PCG; pays only
+/// at large finest-level sizes (see `pcie_crossover` — crossover ≈128² on this NODE-topology box).
+///
+/// Performance-minded but deliberately un-tuned: phases are separated by full stream syncs (no
+/// compute/halo overlap), and the halo is one gathered P2P copy per field per direction (NOT the
+/// thousands of per-node copies the advection path uses). Requires 2 peer-capable GPUs + a uniform
+/// axis-aligned rectangular mesh (affine metrics).
+pub fn multigpu_poisson_matvec_2d(
+    mesh: &Mesh2d,
+    u: &[f64],
+    alpha: f64,
+    reaction: f64,
+    neumann_tags: &[u32],
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    use cuda_core::peer::{can_access_peer, enable_peer_access};
+    use gale::sim::{Device, DomainDecomposition, Partition};
+
+    let nn = mesh.refq.n_nodes();
+    let n1 = (mesh.order + 1) as u32;
+    let n1u = n1 as usize;
+    let ne = mesh.n_elements();
+    let ndof = ne * nn;
+    assert_eq!(u.len(), ndof, "u length must be n_elements·n_nodes");
+
+    // Global affine metrics + shared arrays (identical on both GPUs).
+    let glob = flatten_mesh(mesh, alpha, neumann_tags);
+    let (rx, sy, jac) = (glob.rx, glob.sy, glob.jac);
+    let p1f = (mesh.order + 1) as f64;
+    let h: Vec<f64> = mesh.elements.iter().map(|el| el.geom.jw.iter().sum::<f64>().sqrt()).collect();
+
+    // Element → GPU ownership (framework block decomposition).
+    let device = Device::MultiGpu { ordinals: vec![0, 1], partition: Partition::Blocks };
+    assert_eq!(device.n_devices(), 2, "this routine targets the 2× Titan V");
+    let dd = DomainDecomposition::new(ne, &device);
+    println!("partition: {} elements → {:?} per GPU", ne, dd.counts());
+    let parts = dd.parts.clone();
+    let mut local_of = vec![0usize; ne];
+    let mut global_of: [Vec<usize>; 2] = [vec![], vec![]];
+    for e in 0..ne {
+        local_of[e] = global_of[parts[e]].len();
+        global_of[parts[e]].push(e);
+    }
+
+    // Per-partition face metadata: fnbr indexes the combined [local | halo] buffer (local node,
+    // halo slot, or the BND/NEU sentinels), exactly mirroring flatten_mesh but partition-aware.
+    struct Part {
+        global: Vec<usize>,
+        fvl: Vec<u32>,
+        fnx: Vec<f64>,
+        fny: Vec<f64>,
+        fsw: Vec<f64>,
+        fnbr: Vec<u32>,
+        ftau: Vec<f64>,
+        halo_src: Vec<u32>, // per halo slot: source node index in the OTHER GPU's local buffer
+    }
+    let build = |g: usize| -> Part {
+        let locals = &global_of[g];
+        let nl = locals.len();
+        let nldof = nl * nn;
+        let mut p = Part {
+            global: locals.clone(),
+            fvl: vec![0; nl * 4 * n1u],
+            fnx: vec![0.0; nl * 4 * n1u],
+            fny: vec![0.0; nl * 4 * n1u],
+            fsw: vec![0.0; nl * 4 * n1u],
+            fnbr: vec![BND; nl * 4 * n1u],
+            ftau: vec![0.0; nl * 4],
+            halo_src: vec![],
+        };
+        for (le, &e) in locals.iter().enumerate() {
+            let el = &mesh.elements[e];
+            for (t, edge) in Edge::ALL.iter().enumerate() {
+                let face = &el.faces[*edge as usize];
+                let nb = &el.neighbors[*edge as usize];
+                p.ftau[le * 4 + t] = match nb {
+                    Neighbor::Interior { elem: re, .. } => alpha * p1f * p1f / h[e].min(h[*re]),
+                    Neighbor::Boundary { .. } => alpha * p1f * p1f / h[e],
+                    _ => unreachable!("non-conforming mesh unsupported in the distributed matvec"),
+                };
+                let neu = matches!(nb, Neighbor::Boundary { tag } if neumann_tags.contains(tag));
+                for a in 0..n1u {
+                    let idx = (le * 4 + t) * n1u + a;
+                    p.fvl[idx] = face.nodes[a] as u32;
+                    p.fnx[idx] = face.nx[a];
+                    p.fny[idx] = face.ny[a];
+                    p.fsw[idx] = face.sw[a];
+                    if let Neighbor::Interior { elem: re, edge: redge, perm } = nb {
+                        let rnode = mesh.elements[*re].faces[*redge as usize].nodes[perm[a]];
+                        if parts[*re] == g {
+                            p.fnbr[idx] = (local_of[*re] * nn + rnode) as u32; // same-GPU neighbour
+                        } else {
+                            let slot = p.halo_src.len();
+                            p.halo_src.push((local_of[*re] * nn + rnode) as u32); // node in OTHER GPU
+                            p.fnbr[idx] = (nldof + slot) as u32; // halo region
+                        }
+                    } else if neu {
+                        p.fnbr[idx] = NEU; // natural BC (else stays BND)
+                    }
+                }
+            }
+        }
+        p
+    };
+    let pd = [build(0), build(1)];
+
+    // Two contexts + bidirectional peer access.
+    let ctx0 = CudaContext::new(0)?;
+    let ctx1 = CudaContext::new(1)?;
+    if !can_access_peer(&ctx0, &ctx1)? || !can_access_peer(&ctx1, &ctx0)? {
+        return Err("the two GPUs cannot access each other via P2P".into());
+    }
+    ctx0.bind_to_thread()?;
+    enable_peer_access(&ctx0, &ctx1)?;
+    ctx1.bind_to_thread()?;
+    enable_peer_access(&ctx1, &ctx0)?;
+    let ctxs = [&ctx0, &ctx1];
+
+    // Per-GPU resources. Combined u/gx/gy = [local | halo]; `packed` is this GPU's send buffer for
+    // the OTHER GPU's halo (sized to the consumer's halo); `sendidx` gathers into it.
+    struct Gpu {
+        stream: Arc<CudaStream>,
+        module: kernels::LoadedModule,
+        nl: usize,
+        nldof: usize,
+        u: DeviceBuffer<f64>,
+        gx: DeviceBuffer<f64>,
+        gy: DeviceBuffer<f64>,
+        out: DeviceBuffer<f64>,
+        d: DeviceBuffer<f64>,
+        mass: DeviceBuffer<f64>,
+        fvl: DeviceBuffer<u32>,
+        fnx: DeviceBuffer<f64>,
+        fny: DeviceBuffer<f64>,
+        fsw: DeviceBuffer<f64>,
+        fnbr: DeviceBuffer<u32>,
+        ftau: DeviceBuffer<f64>,
+        sendidx: DeviceBuffer<u32>, // OTHER GPU's halo_src (nodes this GPU sends)
+        packed: DeviceBuffer<f64>,  // gathered send buffer, len = other GPU's halo
+        gcfg: LaunchConfig,
+        ocfg: LaunchConfig,
+    }
+    let mut gpus: Vec<Gpu> = Vec::new();
+    for g in 0..2 {
+        let ctx = ctxs[g];
+        ctx.bind_to_thread()?;
+        let stream = ctx.default_stream();
+        let p = &pd[g];
+        let nl = p.global.len();
+        let nldof = nl * nn;
+        let nhalo = p.halo_src.len();
+        let other_halo = pd[1 - g].halo_src.len();
+        let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+        let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+        let mut uvec = vec![0.0; nldof + nhalo];
+        for (le, &e) in p.global.iter().enumerate() {
+            uvec[le * nn..(le + 1) * nn].copy_from_slice(&u[e * nn..(e + 1) * nn]);
+        }
+        let (gcfg, ocfg) = matvec_cfgs(nl, n1);
+        gpus.push(Gpu {
+            u: DeviceBuffer::from_host(&stream, &uvec)?,
+            gx: DeviceBuffer::<f64>::zeroed(&stream, nldof + nhalo)?,
+            gy: DeviceBuffer::<f64>::zeroed(&stream, nldof + nhalo)?,
+            out: DeviceBuffer::<f64>::zeroed(&stream, nldof)?,
+            d: up(&glob.diff)?,
+            mass: up(&glob.mass)?,
+            fvl: upu(&p.fvl)?,
+            fnx: up(&p.fnx)?,
+            fny: up(&p.fny)?,
+            fsw: up(&p.fsw)?,
+            fnbr: upu(&p.fnbr)?,
+            ftau: up(&p.ftau)?,
+            sendidx: upu(&pd[1 - g].halo_src)?, // the other GPU's halo references THIS GPU's nodes
+            packed: DeviceBuffer::<f64>::zeroed(&stream, other_halo.max(1))?,
+            module: kernels::load(ctx)?,
+            stream,
+            nl,
+            nldof,
+            gcfg,
+            ocfg,
+        });
+    }
+
+    // Gathered halo exchange: GPU `og` gathers the nodes consumer `g` needs (in g's halo-slot
+    // order) into its packed buffer, then ONE P2P copy → g's halo region. `field` selects u/gx/gy.
+    let sz = std::mem::size_of::<f64>();
+    // Gathered halo exchange for one `field` (0=u,1=gx,2=gy): on each producer `og`, gather the
+    // boundary nodes consumer `g`(=1−og) needs (`sendidx`, in g's halo-slot order) into `packed`,
+    // then ONE P2P copy → g's contiguous halo region. Phase-synced (no overlap; un-tuned by design).
+    let exchange = |gpus: &mut [Gpu], field: u8| -> Result<(), Box<dyn std::error::Error>> {
+        for g in 0..2 {
+            let og = 1 - g;
+            let nrecv = pd[g].halo_src.len(); // == gpus[og].sendidx length
+            if nrecv == 0 {
+                continue;
+            }
+            ctxs[og].bind_to_thread()?;
+            let cfg = LaunchConfig::for_num_elems(nrecv as u32);
+            // Gather on `og` (disjoint field borrows of one Gpu): packed[i] = field[sendidx[i]].
+            {
+                let p = &mut gpus[og];
+                let src = match field {
+                    0 => &p.u,
+                    1 => &p.gx,
+                    _ => &p.gy,
+                };
+                p.module.gather(&p.stream, cfg, src, &p.sendidx, &mut p.packed)?;
+            }
+            // P2P: og.packed → g.<field>[nldof_g .. nldof_g+nrecv]. Pointers/handles are Copy, so
+            // extract them as values (no lingering borrows across the two Gpu elements).
+            let dst = (match field {
+                0 => gpus[g].u.cu_deviceptr(),
+                1 => gpus[g].gx.cu_deviceptr(),
+                _ => gpus[g].gy.cu_deviceptr(),
+            }) + (gpus[g].nldof * sz) as u64;
+            let src = gpus[og].packed.cu_deviceptr();
+            let st = gpus[og].stream.cu_stream();
+            unsafe {
+                cuda_core::memory::memcpy_peer_async(dst, ctxs[g].cu_ctx(), src, ctxs[og].cu_ctx(), nrecv * sz, st)?;
+            }
+        }
+        for g in 0..2 {
+            ctxs[g].bind_to_thread()?;
+            gpus[g].stream.synchronize()?;
+        }
+        Ok(())
+    };
+
+    // Phase 1: exchange u halos (u is input, available now).
+    exchange(&mut gpus, 0)?;
+    // Phase 2: local gradients on each GPU.
+    for g in 0..2 {
+        ctxs[g].bind_to_thread()?;
+        let gp = &mut gpus[g];
+        gp.module.gradient::<f64, f64>(&gp.stream, gp.gcfg, &gp.d, &gp.u, rx, sy, n1, gp.nl as u32, &mut gp.gx, &mut gp.gy)?;
+    }
+    for g in 0..2 {
+        ctxs[g].bind_to_thread()?;
+        gpus[g].stream.synchronize()?;
+    }
+    // Phase 3: exchange gx, gy halos (now that gradients are computed).
+    exchange(&mut gpus, 1)?;
+    exchange(&mut gpus, 2)?;
+    // Phase 4: local operator on each GPU, then gather to global order.
+    let mut got = vec![0.0; ndof];
+    for g in 0..2 {
+        ctxs[g].bind_to_thread()?;
+        let gp = &mut gpus[g];
+        gp.module.operator::<f64, f64>(
+            &gp.stream, gp.ocfg, &gp.d, &gp.u, &gp.gx, &gp.gy, &gp.mass, n1, gp.nl as u32, rx, sy, jac,
+            &gp.fvl, &gp.fnx, &gp.fny, &gp.fsw, &gp.fnbr, &gp.ftau, reaction, &mut gp.out,
+        )?;
+        let local_out = gp.out.to_host_vec(&gp.stream)?;
+        for (le, &e) in pd[g].global.iter().enumerate() {
+            got[e * nn..(e + 1) * nn].copy_from_slice(&local_out[le * nn..(le + 1) * nn]);
+        }
+    }
+    Ok(got)
 }
 
 // ===== Persistent solver handle (P4) =============================================
