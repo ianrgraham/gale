@@ -1908,6 +1908,7 @@ pub fn pcie_crossover(p: usize, reps: u32) -> Result<(), Box<dyn std::error::Err
     ctx0.bind_to_thread()?;
     let stream0 = ctx0.default_stream();
     let b0 = DeviceBuffer::<f64>::zeroed(&stream0, cap)?;
+    let b0b = DeviceBuffer::<f64>::zeroed(&stream0, cap)?; // second GPU0 buffer for the intra-device baseline
     let ev = || ctx0.new_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT));
 
     // Time `reps` peer copies issued on stream0 (ctx0 events), single final sync.
@@ -1926,9 +1927,13 @@ pub fn pcie_crossover(p: usize, reps: u32) -> Result<(), Box<dyn std::error::Err
         e.synchronize()?;
         Ok(s.elapsed_ms(&e)? as f64 * 1e3 / reps as f64) // µs per copy (or per pair)
     };
-    let (p0, p1) = (b0.cu_deviceptr(), b1.cu_deviceptr());
+    let (p0, p1, p0b) = (b0.cu_deviceptr(), b1.cu_deviceptr(), b0b.cu_deviceptr());
     let (c0, c1) = (ctx0.cu_ctx(), ctx1.cu_ctx());
     let st = stream0.cu_stream();
+    // Intra-GPU0 device-to-device 8 B copy: the copy-engine DISPATCH-overhead floor with zero
+    // P2P path. The (peer − intra) delta is the actual cross-GPU cost; if peer ≈ intra, the ~µs
+    // are dispatch overhead (topology-independent), not the PCIe path.
+    let intra_us = time_copies(&|| unsafe { cuda_core::memory::memcpy_dtod_async(p0b, p0, 8, st) })?;
     // One-way 0→1 latency at a tiny (8 B) message.
     let oneway_us = time_copies(&|| unsafe { cuda_core::memory::memcpy_peer_async(p1, c1, p0, c0, 8, st) })?;
     // Round-trip 0→1→0 (what a halo exchange + add-reduce needs: data out and the partial back).
@@ -1937,7 +1942,8 @@ pub fn pcie_crossover(p: usize, reps: u32) -> Result<(), Box<dyn std::error::Err
         cuda_core::memory::memcpy_peer_async(p0, c0, p1, c1, 8, st)
     })?;
     println!("=== PCIe P2P (GPU0↔GPU1, cuMemcpyPeerAsync) ===");
-    println!("  one-way  8 B : {oneway_us:8.2} µs");
+    println!("  intra-GPU0 8 B: {intra_us:8.2} µs   (copy-engine dispatch floor, no P2P path)");
+    println!("  one-way  8 B : {oneway_us:8.2} µs   (P2P path cost ≈ {:.2} µs above the floor)", oneway_us - intra_us);
     println!("  round-trip 8 B: {rt_us:8.2} µs   (≈ halo-exchange + add-reduce latency floor)");
     println!("  --- one-way transfer vs message size ---");
     println!("  {:>10}  {:>10}  {:>10}", "bytes", "µs", "GB/s");
