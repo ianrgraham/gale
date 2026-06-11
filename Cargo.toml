@@ -30,3 +30,16 @@ path = "src/lib.rs"
 # probing + power-iteration). Pure host crate — does not touch the GPU path.
 [dependencies]
 rayon = "1"
+# Thread-caching allocator (default-on, opt-out via `--no-default-features`). The
+# parallel p-MG build allocates heavily across all cores (per-element/-face scratch
+# Vecs); profiling showed glibc malloc's per-call mmap/munmap is ~20% of build time
+# under 32-thread contention AND caps useful scaling at ~32 cores (mmap_lock). mimalloc
+# removes both — 18-38% faster build and good scaling out to the 64 physical cores.
+# Set as the process global allocator in lib.rs behind this feature so the pyo3 module
+# (where the host may manage allocation) can disable it.
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+default = ["mimalloc"]
+# Use mimalloc as the process-wide global allocator (see [dependencies].mimalloc).
+mimalloc = ["dep:mimalloc"]
