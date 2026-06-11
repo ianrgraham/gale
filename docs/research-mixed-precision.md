@@ -6,6 +6,25 @@ Anzt, de Sturler, Warburton, Notay, Tsai. Several key results are **2025 preprin
 This is a *method-decision reference* per [[research-before-architecture]]; it complements the
 consumer-GPU precision roadmap (`gale-consumer-gpu-precision`).
 
+## EMPIRICAL ADDENDUM (measured on gale, Titan V) — it does NOT pay off here
+
+Implemented the FP32-gradient-intermediate V-cycle (opt-in `GpuPoissonMg::with_mixed_precision`,
+FP64 default bit-exact) and measured it (`mixed-precision-check`). **Correct but no speedup: 0.99×
+at 16²–64²** (flat), with the mixed solution matching FP64 to ~the solve tolerance at the same
+iteration count. Root cause confirms the report's central caveat: **gale's h-coarsened V-cycle is a
+sequence of SMALL matvecs that are latency/occupancy-bound, not bandwidth-bound** (per `ncu`) — so
+halving `gx/gy` bytes saves nothing. The cited ~2× speedups are all large stored-CSR/AMG/FD-Poisson
+SpMV, a regime gale isn't in *after* the h-coarsening that gave the big algorithmic win. So on the
+Titan V (native FP64), **don't pursue mixed precision further** — the headroom isn't there. The
+infrastructure (generic two-precision matvec, the precision-boundary rule below, the opt-out knob)
+is kept for the **RTX 5090**, where the calculus flips: FP64 is ~1:64, so mixed precision becomes
+about *avoiding crippled FP64 throughput*, not bandwidth.
+
+**Critical precision-boundary lesson (caught by the convergence guard via a NaN):** FP32 is safe
+only in the V-cycle *smoother* (a robust stationary Jacobi). The **outer PCG `A·p`** and the
+**deflated singular coarse-grid CG** must stay FP64 — both are CG, which diverges (→NaN) on an
+FP32-perturbed, non-symmetric operator. The coarse grid is tiny (h-coarsened) so FP64 there is free.
+
 ## TL;DR verdict — do it, the standard way
 
 Run the **whole V-cycle preconditioner in FP32** (damped-Jacobi smoother, restriction/prolongation,

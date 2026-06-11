@@ -47,12 +47,12 @@ fn rel(a: &[f64], b: &[f64]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (p, alpha, tol, maxit, reps, xr) = (4usize, 5.0, 1e-10, 100_000usize, 2usize, [0.0, 1.0]);
+    let (p, alpha, tol, maxit, reps, xr) = (4usize, 5.0, 1e-10, 100_000usize, 7usize, [0.0, 1.0]);
     let lambda = 100.0;
     println!("=== Mixed-precision V-cycle (FP32 gx/gy) vs FP64 — accuracy + speedup (p={p}) ===\n");
     println!("{:>9} {:>6} {:>11} {:>16} {:>9} {:>9} {:>8}", "op", "grid", "ndof", "‖mix−f64‖/‖f64‖", "f64 ms", "mix ms", "speedup");
 
-    for &g in &[16usize] {
+    for &g in &[64usize] {
         let mesh = Mesh2d::rectangular(p, g, g, xr, xr);
         let n0 = mesh.n_elements() * mesh.refq.n_nodes();
         let tags = mesh.boundary_tags();
