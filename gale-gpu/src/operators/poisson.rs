@@ -16,7 +16,7 @@
 //! the validated CPU `Poisson` / `PMultigrid`; only the iterations run on-device.
 //! Libdevice-free ⇒ the embedded path works on sm_70.
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, LaunchConfig};
+use cuda_core::{CaptureMode, CudaContext, CudaGraphExec, CudaStream, DeviceBuffer, DeviceCopy, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
 use std::sync::Arc;
 use cuda_host::cuda_module;
@@ -1182,7 +1182,7 @@ pub fn poisson_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build(&stream, mg)?;
-    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, tol, maxit)
+    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, tol, maxit, false)
 }
 
 /// The p-MG-PCG loop given an already-created stream + loaded module + uploaded
@@ -1197,7 +1197,13 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     rhs: &[f64],
     tol: f64,
     maxit: usize,
+    use_graph: bool,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    // `use_graph`: capture the V-cycle launch sequence into a CUDA graph once and replay it each
+    // outer PCG iteration, instead of re-issuing its ~500 tiny kernel launches. The solve is
+    // launch-bound (cuLaunchKernel ≈ 83% of host time), so this is the dominant lever. Requires
+    // a NON-legacy stream (the caller supplies one) and a host-branch-free V-cycle — hence the
+    // coarse CG runs a FIXED iteration count (no residual readback) under this flag.
     // `G` = the gradient-intermediate (gxb/gyb) storage precision. `G=f64` is the across-the-board
     // FP64 path (bit-exact); `G=f32` halves the gx/gy DRAM traffic (the matvec's biggest field
     // round-trip, incl. the uncoalesced neighbor reads). All other vectors + reductions stay f64.
@@ -1385,7 +1391,17 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // and the outer PCG absorbs the inexactness.
     let coarse_small = ndofv[clast] <= 1024;
     let coarse_tol = if coarse_small { 1e-9 } else { 1e-2 };
-    let coarse_cap = if coarse_small { 100 } else { 40 };
+    // Adaptive (non-graph) iteration cap. Under `use_graph` the coarse CG instead runs a small
+    // FIXED count: the h-coarsened coarsest grid is tiny (CG converges in ≤ ndof iters), so a
+    // handful suffices, and a long fixed chain would bloat the captured graph (cuGraphInstantiate
+    // cost scales with node count — a 100-iter coarse chain is ~1300 extra nodes).
+    let coarse_cap = if use_graph {
+        (ndofv[clast] + 4).min(if coarse_small { 100 } else { 40 })
+    } else if coarse_small {
+        100
+    } else {
+        40
+    };
     // Coarsest-level CG, on-device scalars; the residual is polled to the host only every
     // COARSE_CHECK iterations (no per-iter sync).
     macro_rules! coarse_cg {
@@ -1397,7 +1413,12 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             deflate_c!(&mut rb[l]); // project the coarse RHS onto the range (singular op)
             dcopy!(&tmpb[l], &rb[l], n);
             dot_to!(&rb[l], &rb[l], n, &mut d_rs);
-            let bn = d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300); // 1 sync at solve start
+            // `bn` (and the relative-residual break below) require a host readback, which is
+            // illegal mid graph-capture. Under `use_graph` the coarse CG instead runs a FIXED
+            // `coarse_cap` iterations with no readback (a tiny h-coarsened grid converges well
+            // within the cap; the extra iters are cheap and, captured into the graph, add ~zero
+            // launch cost). Otherwise it polls every COARSE_CHECK iters and breaks at `coarse_tol`.
+            let bn = if use_graph { 1.0 } else { d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300) };
             const COARSE_CHECK: usize = 10;
             for it in 0..coarse_cap {
                 matvec_c!(l, &tmpb[l], &mut apb[l]); // coarse A·p — FP64 (deflated CG needs exactness)
@@ -1407,7 +1428,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                 module.axpy_s(&stream, vcfg[l], &mut rb[l], &apb[l], &d_nalpha_c)?; // r −= α ap
                 deflate_c!(&mut rb[l]); // keep the coarse residual in the range each iter
                 dot_to!(&rb[l], &rb[l], n, &mut d_rsnew);
-                if (it + 1) % COARSE_CHECK == 0 || it + 1 == coarse_cap {
+                if !use_graph && ((it + 1) % COARSE_CHECK == 0 || it + 1 == coarse_cap) {
                     if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bn < coarse_tol {
                         break;
                     }
@@ -1453,13 +1474,37 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         }};
     }
 
+    // Launch-bound remediation: capture the V-cycle's ~500-launch sequence into a CUDA graph
+    // ONCE (recorded, not executed — `vcycle!` re-zeroes its working state each call, so the
+    // graph is a pure bb[0] → xb[0] map reusable every outer iteration), then replay it with a
+    // single `cuGraphLaunch`. Requires the host-branch-free coarse CG (above, under `use_graph`)
+    // and a non-legacy stream (the handle supplies one in graph mode). `run_vcycle!` dispatches
+    // to the replay or the direct launches.
+    let vcycle_graph: Option<CudaGraphExec> = if use_graph {
+        Some(stream.capture(CaptureMode::ThreadLocal, || {
+            vcycle!();
+            Ok(())
+        })?)
+    } else {
+        None
+    };
+    macro_rules! run_vcycle {
+        () => {{
+            if let Some(ref g) = vcycle_graph {
+                g.launch(stream)?;
+            } else {
+                vcycle!();
+            }
+        }};
+    }
+
     // Preconditioned CG on the device. α/β and the deflation mean stay on-device; only the
     // outer residual norm is polled — once per outer iter, which is cheap (PCG converges in
     // ~tens of iters), unlike the coarse solve's hundreds.
     module.scal(&stream, vcfg[0], &mut psol, 0.0)?;
     deflate0!(&mut pres); // project the initial residual (=RHS) onto the range
     dcopy!(&bb[0], &pres, n0);
-    vcycle!();
+    run_vcycle!();
     dcopy!(&pz, &xb[0], n0);
     dcopy!(&pp, &pz, n0);
     dot_to!(&rhs_dev, &rhs_dev, n0, &mut d_rr);
@@ -1483,7 +1528,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             break;
         }
         dcopy!(&bb[0], &pres, n0);
-        vcycle!();
+        run_vcycle!();
         dcopy!(&pz, &xb[0], n0);
         dot_to!(&pres, &pz, n0, &mut d_rznew);
         module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β=rznew/rz; rz←rznew
@@ -1512,6 +1557,12 @@ pub struct GpuPoissonMg {
     /// DRAM traffic. The outer CG, residual, reductions, and deflation stay FP64, so the final
     /// solution keeps full accuracy. `false` (default) ⇒ the across-the-board FP64 path (bit-exact).
     mixed: bool,
+    /// Capture the V-cycle into a CUDA graph and replay it (launch-bound remediation). Opt-in;
+    /// `false` (default) ⇒ the launch-per-iteration path. When enabled, `stream` is a non-legacy
+    /// stream (capture is illegal on the default/legacy stream) and the coarse CG runs a fixed
+    /// iteration count (the captured V-cycle must be host-branch-free). The replayed launches are
+    /// identical to the direct ones, so the result matches the non-graph path to solver tolerance.
+    graph: bool,
 }
 
 impl GpuPoissonMg {
@@ -1523,7 +1574,7 @@ impl GpuPoissonMg {
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
         let dev = MgConst::build(&stream, &mg)?;
-        Ok(Self { stream, module, dev, mixed: false })
+        Ok(Self { stream, module, dev, mixed: false, graph: false })
     }
 
     /// Enable the mixed-precision V-cycle (FP32 gradient intermediates). Opt-in; default is the
@@ -1531,6 +1582,20 @@ impl GpuPoissonMg {
     pub fn with_mixed_precision(mut self, mixed: bool) -> Self {
         self.mixed = mixed;
         self
+    }
+
+    /// Enable CUDA-graph capture/replay of the V-cycle (launch-bound remediation; the solve is
+    /// ~83% `cuLaunchKernel`). Opt-in; default is the launch-per-iteration path. Capture is illegal
+    /// on the default/legacy stream, so enabling this swaps in a freshly created stream. The coarse
+    /// CG then runs a fixed iteration count (host-branch-free), so the result matches the non-graph
+    /// path to solver tolerance rather than bit-for-bit. Fallible because it may create a stream.
+    pub fn with_cuda_graph(mut self, graph: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        self.graph = graph;
+        if graph && self.stream.cu_stream().is_null() {
+            // Stream capture cannot be initiated on CU_STREAM_LEGACY (the null default stream).
+            self.stream = self.stream.context().new_stream()?;
+        }
+        Ok(self)
     }
 
     /// Degrees of freedom on the finest level (`n_elements · n_nodes`).
@@ -1548,9 +1613,9 @@ impl GpuPoissonMg {
     /// systems are auto-deflated. `rhs` is the finest-level RHS.
     pub fn solve(&self, rhs: &[f64], tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
         if self.mixed {
-            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, tol, maxit)
+            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, tol, maxit, self.graph)
         } else {
-            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, tol, maxit)
+            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, tol, maxit, self.graph)
         }
     }
 }

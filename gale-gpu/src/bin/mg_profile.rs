@@ -42,14 +42,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mesh = Mesh2d::rectangular(p, g, g, xr, xr);
     let n0 = mesh.n_elements() * mesh.refq.n_nodes();
     let src = broadband(n0);
+    // MG_GRAPH=1 captures the V-cycle into a CUDA graph and replays it (launch-bound remediation).
+    let use_graph = std::env::var("MG_GRAPH").ok().as_deref() == Some("1");
     let (mg, rhs) = if op == "velocity" {
         let rhs = Poisson::with_reaction(&mesh, alpha, lambda).rhs(&src, |_, _| 0.0);
-        (GpuPoissonMg::new(PMultigrid::with_reaction(p, g, g, xr, xr, alpha, lambda))?, rhs)
+        (GpuPoissonMg::new(PMultigrid::with_reaction(p, g, g, xr, xr, alpha, lambda))?.with_cuda_graph(use_graph)?, rhs)
     } else {
         let tags = mesh.boundary_tags();
         let rhs = Poisson::with_bc(&mesh, alpha, 0.0, tags.clone()).rhs_mixed(&src, |_, _| 0.0, |_, _| 0.0);
-        (GpuPoissonMg::new(PMultigrid::with_bc(p, g, g, xr, xr, alpha, 0.0, tags))?, rhs)
+        (GpuPoissonMg::new(PMultigrid::with_bc(p, g, g, xr, xr, alpha, 0.0, tags))?.with_cuda_graph(use_graph)?, rhs)
     };
+    eprintln!("MG_GRAPH={}", use_graph);
 
     let _warmup = mg.solve(&rhs, tol, maxit)?; // JIT/caches — first solve, skip in analysis
     // MG_REPS repeated solves: 1 for a clean single-solve trace; many to sustain a GPU-busy
