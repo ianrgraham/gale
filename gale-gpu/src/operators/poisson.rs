@@ -16,7 +16,7 @@
 //! the validated CPU `Poisson` / `PMultigrid`; only the iterations run on-device.
 //! Libdevice-free ⇒ the embedded path works on sm_70.
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
 use std::sync::Arc;
 use cuda_host::cuda_module;
@@ -114,12 +114,13 @@ mod kernels {
 
     #[kernel]
     #[allow(clippy::too_many_arguments)]
-    pub fn gradient<T: Scalar>(
-        d: &[f64], u: &[T], rx: f64, sy: f64, n1: u32, ne: u32,
-        mut gx: DisjointSlice<T>, mut gy: DisjointSlice<T>,
+    pub fn gradient<U: Scalar, G: Scalar>(
+        d: &[f64], u: &[U], rx: f64, sy: f64, n1: u32, ne: u32,
+        mut gx: DisjointSlice<G>, mut gy: DisjointSlice<G>,
     ) {
-        // Storage `T`, accumulate f64: the diff matrix + shared tile are f64; only the global
-        // field reads/writes carry `T`. `T = f64` ⇒ to_f64/from_f64 are identity (bit-exact).
+        // Two storage scalars, f64 accumulate: `U` = input field, `G` = gradient intermediate
+        // written here (read back by `operator`). `U=G=f64` ⇒ identity casts ⇒ bit-exact original;
+        // mixed mode uses `G=f32` to halve the gx/gy DRAM round-trip.
         let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | US(epb·nn) ]
         let n1 = n1 as usize;
         let nn = n1 * n1;
@@ -159,23 +160,23 @@ mod kernels {
         let gyv = sy * uss;
         // block_dim = epb·nn ⇒ global 1D thread index == e·nn + m.
         if let Some(o) = gx.get_mut(thread::index_1d()) {
-            *o = T::from_f64(gxv);
+            *o = G::from_f64(gxv);
         }
         if let Some(o) = gy.get_mut(thread::index_1d()) {
-            *o = T::from_f64(gyv);
+            *o = G::from_f64(gyv);
         }
     }
 
     #[kernel]
     #[allow(clippy::too_many_arguments)]
-    pub fn operator<T: Scalar>(
-        d: &[f64], u: &[T], gx: &[T], gy: &[T], mass: &[f64], n1: u32, ne: u32, rx: f64,
+    pub fn operator<U: Scalar, G: Scalar>(
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], n1: u32, ne: u32, rx: f64,
         sy: f64, jac: f64, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
-        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<T>,
+        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<U>,
     ) {
-        // Storage `T`, accumulate f64 (shared PR/PS, metrics, mass all f64). The global field
-        // reads (gx/gy/u, own + neighbor) widen via to_f64; the result narrows via from_f64.
-        // `T = f64` ⇒ identity casts ⇒ bit-for-bit the original FP64 operator.
+        // Two storage scalars, f64 accumulate: `U` = field/output, `G` = gradient intermediate
+        // (read here, written by `gradient`). Shared PR/PS, metrics, mass stay f64; global field
+        // reads widen via to_f64, the result narrows via from_f64. `U=G=f64` ⇒ bit-for-bit FP64.
         let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | PR(epb·nn) | PS(epb·nn) ]
         let n1 = n1 as usize;
         let nn = n1 * n1;
@@ -272,7 +273,7 @@ mod kernels {
         if let Some(o) = out.get_mut(thread::index_1d()) {
             // SIPG stiffness `A·u` plus the Helmholtz reaction `λ·M·u` (diagonal GLL
             // mass `M = diag(jw)`). `λ = 0` ⇒ pure Poisson, bit-identical to before.
-            *o = T::from_f64(acc + rf + lambda * jw_b * u[b].to_f64());
+            *o = U::from_f64(acc + rf + lambda * jw_b * u[b].to_f64());
         }
     }
 
@@ -731,8 +732,8 @@ pub fn poisson_apply(
     let module = kernels::load(&ctx)?;
     let nev = ma.ne as u32;
     let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
-    module.gradient::<f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, ma.n1, nev, &mut gx_dev, &mut gy_dev)?;
-    module.operator::<f64>(
+    module.gradient::<f64, f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, ma.n1, nev, &mut gx_dev, &mut gy_dev)?;
+    module.operator::<f64, f64>(
         &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &mass_dev, ma.n1, nev, ma.rx, ma.sy, ma.jac,
         &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out_dev,
     )?;
@@ -856,8 +857,8 @@ fn cg_solve_impl(
     }
     macro_rules! apply {
         ($field:expr, $dst:expr) => {{
-            module.gradient::<f64>(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
-            module.operator::<f64>(
+            module.gradient::<f64, f64>(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
+            module.operator::<f64, f64>(
                 &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, reaction, $dst,
             )?;
@@ -962,8 +963,8 @@ pub fn pressure_cg_solve(
     }
     macro_rules! apply {
         ($field:expr, $dst:expr) => {{
-            module.gradient::<f64>(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
-            module.operator::<f64>(
+            module.gradient::<f64, f64>(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
+            module.operator::<f64, f64>(
                 &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, $dst,
             )?;
@@ -1181,7 +1182,7 @@ pub fn poisson_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build(&stream, mg)?;
-    pcg_solve_with(&stream, &module, &dev, rhs, tol, maxit)
+    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, tol, maxit)
 }
 
 /// The p-MG-PCG loop given an already-created stream + loaded module + uploaded
@@ -1189,7 +1190,7 @@ pub fn poisson_pcg_solve(
 /// persistent [`GpuPoissonMg`] handle. The constant per-level device arrays live in
 /// `dev`; only the per-solve scratch (V-cycle work vectors + PCG vectors) is allocated
 /// here, and only `rhs` is uploaded.
-fn pcg_solve_with(
+fn pcg_solve_with<G: Scalar + DeviceCopy>(
     stream: &CudaStream,
     module: &kernels::LoadedModule,
     dev: &MgConst,
@@ -1197,6 +1198,9 @@ fn pcg_solve_with(
     tol: f64,
     maxit: usize,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    // `G` = the gradient-intermediate (gxb/gyb) storage precision. `G=f64` is the across-the-board
+    // FP64 path (bit-exact); `G=f32` halves the gx/gy DRAM traffic (the matvec's biggest field
+    // round-trip, incl. the uncoalesced neighbor reads). All other vectors + reductions stay f64.
     // Bind the constant per-level state to bare locals (disjoint immutable borrows of
     // `dev`) so the matvec/V-cycle/deflation macros below read exactly as the original
     // single-function loop did.
@@ -1251,8 +1255,8 @@ fn pcg_solve_with(
         bb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
         rb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
         apb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
-        gxb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
-        gyb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        gxb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
+        gyb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
         tmpb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
     }
 
@@ -1335,9 +1339,40 @@ fn pcg_solve_with(
     macro_rules! matvec {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
-            module.gradient::<f64>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
-            module.operator::<f64>(
+            module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
+            module.operator::<f64, G>(
                 &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
+                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
+            )?;
+        }};
+    }
+    // Two operator applications MUST stay FP64 even in mixed mode, with their own f64 gx/gy
+    // intermediates (NOT the V-cycle's `G`-typed gxb/gyb):
+    //  • the OUTER PCG's `A·p` (`matvec0!`, finest level) — CG breaks with an inexact/varying
+    //    operator; the matvec/residual precision sets the attainable accuracy.
+    //  • the COARSE-grid CG (`matvec_c!`, coarsest level) — the deflated *singular* coarse solve is
+    //    a CG too and likewise breaks (→ NaN) on an FP32-perturbed, non-symmetric operator. The
+    //    coarse grid is tiny (h-coarsened), so FP64 there is free.
+    // Only the V-cycle *smoother* matvecs (a robust stationary Jacobi) carry the FP32 intermediates.
+    let mut gx0 = DeviceBuffer::<f64>::zeroed(stream, n0)?;
+    let mut gy0 = DeviceBuffer::<f64>::zeroed(stream, n0)?;
+    let mut gxc = DeviceBuffer::<f64>::zeroed(stream, ndofv[clast])?;
+    let mut gyc = DeviceBuffer::<f64>::zeroed(stream, ndofv[clast])?;
+    macro_rules! matvec0 {
+        ($src:expr, $dst:expr) => {{
+            module.gradient::<f64, f64>(&stream, mvcfg[0].0, &dl[0], $src, rxs[0], sys[0], n1v[0], nev[0], &mut gx0, &mut gy0)?;
+            module.operator::<f64, f64>(
+                &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], n1v[0], nev[0], rxs[0], sys[0], jacs[0],
+                &fvl[0], &fnx[0], &fny[0], &fsw[0], &fnbr[0], &ftau[0], reaction, $dst,
+            )?;
+        }};
+    }
+    macro_rules! matvec_c {
+        ($l:expr, $src:expr, $dst:expr) => {{
+            let l = $l;
+            module.gradient::<f64, f64>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxc, &mut gyc)?;
+            module.operator::<f64, f64>(
+                &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
                 &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
             )?;
         }};
@@ -1365,7 +1400,7 @@ fn pcg_solve_with(
             let bn = d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300); // 1 sync at solve start
             const COARSE_CHECK: usize = 10;
             for it in 0..coarse_cap {
-                matvec!(l, &tmpb[l], &mut apb[l]);
+                matvec_c!(l, &tmpb[l], &mut apb[l]); // coarse A·p — FP64 (deflated CG needs exactness)
                 dot_to!(&tmpb[l], &apb[l], n, &mut d_pap_c);
                 module.cg_alpha(&stream, one, &d_rs, &d_pap_c, &mut d_alpha_c, &mut d_nalpha_c)?;
                 module.axpy_s(&stream, vcfg[l], &mut xb[l], &tmpb[l], &d_alpha_c)?; // x += α p
@@ -1434,7 +1469,7 @@ fn pcg_solve_with(
     let mut converged = false;
     let mut rel = 1.0;
     for it in 0..maxit {
-        matvec!(0, &pp, &mut pap);
+        matvec0!(&pp, &mut pap); // outer A·p — FP64 (CG needs an exact operator)
         dot_to!(&pp, &pap, n0, &mut d_pap_o);
         module.cg_alpha(&stream, one, &d_rz, &d_pap_o, &mut d_alpha_o, &mut d_nalpha_o)?;
         module.axpy_s(&stream, vcfg[0], &mut psol, &pp, &d_alpha_o)?; // x += α p
@@ -1473,6 +1508,10 @@ pub struct GpuPoissonMg {
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
     dev: MgConst,
+    /// Mixed-precision V-cycle: store the gradient intermediates (gx/gy) in FP32 to halve their
+    /// DRAM traffic. The outer CG, residual, reductions, and deflation stay FP64, so the final
+    /// solution keeps full accuracy. `false` (default) ⇒ the across-the-board FP64 path (bit-exact).
+    mixed: bool,
 }
 
 impl GpuPoissonMg {
@@ -1484,7 +1523,14 @@ impl GpuPoissonMg {
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
         let dev = MgConst::build(&stream, &mg)?;
-        Ok(Self { stream, module, dev })
+        Ok(Self { stream, module, dev, mixed: false })
+    }
+
+    /// Enable the mixed-precision V-cycle (FP32 gradient intermediates). Opt-in; default is the
+    /// bit-exact FP64 path. The final solution stays FP64-accurate (outer CG + reductions are FP64).
+    pub fn with_mixed_precision(mut self, mixed: bool) -> Self {
+        self.mixed = mixed;
+        self
     }
 
     /// Degrees of freedom on the finest level (`n_elements · n_nodes`).
@@ -1501,7 +1547,11 @@ impl GpuPoissonMg {
     /// Solve `A·x = rhs` (the hierarchy's operator) by p-MG-PCG; singular pure-Neumann
     /// systems are auto-deflated. `rhs` is the finest-level RHS.
     pub fn solve(&self, rhs: &[f64], tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-        pcg_solve_with(&self.stream, &self.module, &self.dev, rhs, tol, maxit)
+        if self.mixed {
+            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, tol, maxit)
+        } else {
+            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, tol, maxit)
+        }
     }
 }
 
@@ -1593,10 +1643,10 @@ pub fn bench_poisson_kernels(
     }
 
     let grad_ms = timed!({
-        module.gradient::<f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
+        module.gradient::<f64, f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
     });
     let op_ms = timed!({
-        module.operator::<f64>(
+        module.operator::<f64, f64>(
             &stream, ocfg, &d_dev, &u_dev, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
             &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out,
         )?;
@@ -1807,8 +1857,8 @@ impl GpuPoisson {
         }
         macro_rules! apply {
             ($field:expr, $dst:expr) => {{
-                module.gradient::<f64>(stream, gcfg, &self.d_dev, $field, self.rx, self.sy, n1, nev, &mut gx, &mut gy)?;
-                module.operator::<f64>(
+                module.gradient::<f64, f64>(stream, gcfg, &self.d_dev, $field, self.rx, self.sy, n1, nev, &mut gx, &mut gy)?;
+                module.operator::<f64, f64>(
                     stream, ocfg, &self.d_dev, $field, &gx, &gy, &self.mass_dev, n1, nev, self.rx, self.sy, self.jac,
                     &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, &fnbr_dev, &self.ftau_dev, reaction, $dst,
                 )?;

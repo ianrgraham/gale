@@ -210,6 +210,11 @@ path = "src/bin/mg_profile.rs"
 name = "solve-tol-sweep"
 path = "src/bin/solve_tol_sweep.rs"
 
+# Mixed-precision V-cycle (FP32 gx/gy) vs FP64: accuracy + realized speedup.
+[[bin]]
+name = "mixed-precision-check"
+path = "src/bin/mixed_precision_check.rs"
+
 # Validates the persistent GpuPoisson solver handle (P4) vs the one-shot solvers.
 [[bin]]
 name = "poisson-handle-check"
