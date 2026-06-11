@@ -277,6 +277,114 @@ mod kernels {
         }
     }
 
+    /// **Fused matvec + damped-Jacobi smoother step.** Computes `Ap = A·u` exactly as
+    /// [`operator`], then writes the smoother update `out ← u + ω·invd·(rhs − Ap)` instead of
+    /// `Ap` — so the per-node `Ap` never round-trips through DRAM and the separate `jacobi`
+    /// launch is eliminated. `out` MUST be a distinct buffer from `u` (the operator reads
+    /// neighbour `u`/gradients, so an in-place write would race across blocks); the V-cycle
+    /// ping-pongs `xb ↔ sm`. Bit-identical to `operator` then `jacobi` (same arithmetic, same
+    /// order). The body is a deliberate copy of [`operator`] up to the final write (cuda-oxide
+    /// codegens each `#[kernel]` independently; a shared device helper with shared-mem + a
+    /// barrier is unproven, so the duplication buys guaranteed codegen + the bit-exact validator).
+    #[kernel]
+    pub fn operator_jacobi<U: Scalar, G: Scalar>(
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], n1: u32, ne: u32, rx: f64,
+        sy: f64, jac: f64, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
+        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, rhs: &[f64],
+        invd: &[f64], omega: f64, mut out: DisjointSlice<U>,
+    ) {
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | PR(epb·nn) | PS(epb·nn) ]
+        let n1 = n1 as usize;
+        let nn = n1 * n1;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let active = e < ne as usize;
+        let pr = nn + el * nn;
+        let ps = nn + epb * nn + el * nn;
+        let b = e * nn + m;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = d[t];
+            }
+        }
+        let jw_b = jac * mass[m];
+        let mut rf = 0.0f64;
+        if active {
+            unsafe {
+                let wx = jw_b * gx[b].to_f64();
+                let wy = jw_b * gy[b].to_f64();
+                *sm.add(pr + m) = rx * wx;
+                *sm.add(ps + m) = sy * wy;
+            }
+            let ii = m % n1;
+            let jj = m / n1;
+            let mut hx = 0.0f64;
+            let mut hy = 0.0f64;
+            let mut t4 = 0usize;
+            while t4 < 4 {
+                let (on, a) = if t4 == 0 {
+                    (jj == 0, ii)
+                } else if t4 == 1 {
+                    (ii == n1 - 1, jj)
+                } else if t4 == 2 {
+                    (jj == n1 - 1, ii)
+                } else {
+                    (ii == 0, jj)
+                };
+                if on {
+                    let idx = (e * 4 + t4) * n1 + a;
+                    let nbr = face_nbr[idx];
+                    if nbr != NEU {
+                        let tau = face_tau[e * 4 + t4];
+                        let nx = face_nx[idx];
+                        let ny = face_ny[idx];
+                        let sw = face_sw[idx];
+                        let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
+                        let ug = u[b].to_f64();
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0)
+                        } else {
+                            let ng = nbr as usize;
+                            (0.5 * (dun_e + nx * gx[ng].to_f64() + ny * gy[ng].to_f64()), ug - u[ng].to_f64(), 0.5)
+                        };
+                        let g = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * nx;
+                        hy += g * ny;
+                    }
+                }
+                t4 += 1;
+            }
+            unsafe {
+                *sm.add(pr + m) -= rx * hx;
+                *sm.add(ps + m) -= sy * hy;
+            }
+        }
+        thread::sync_threads();
+        if !active {
+            return;
+        }
+        let i = m % n1;
+        let j = m / n1;
+        let mut acc = 0.0f64;
+        let mut k = 0usize;
+        while k < n1 {
+            unsafe {
+                acc += *sm.add(k * n1 + i) * *sm.add(pr + k + j * n1)
+                    + *sm.add(k * n1 + j) * *sm.add(ps + i + k * n1);
+            }
+            k += 1;
+        }
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            // Ap = A·u (SIPG + λM), then the damped-Jacobi update folded in: out ← u + ω·invd·(rhs − Ap).
+            let ap = acc + rf + lambda * jw_b * u[b].to_f64();
+            *o = U::from_f64(u[b].to_f64() + omega * invd[b] * (rhs[b] - ap));
+        }
+    }
+
     /// y ← y + ω·invd·(b − ap)  (damped-Jacobi update)
     #[kernel]
     pub fn jacobi(mut y: DisjointSlice<f64>, b: &[f64], ap: &[f64], invd: &[f64], omega: f64) {
@@ -1253,8 +1361,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
 
     // Per-solve scratch: V-cycle work vectors (struct-of-arrays per level) — allocated
     // fresh each solve (cheap device zeroed-malloc; the expensive uploads live in `dev`).
-    let (mut xb, mut bb, mut rb, mut apb, mut gxb, mut gyb, mut tmpb) =
-        (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+    let (mut xb, mut bb, mut rb, mut apb, mut gxb, mut gyb, mut tmpb, mut sm) =
+        (vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
     for l in 0..nlev {
         let nd = ndofv[l];
         xb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
@@ -1264,6 +1372,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         gxb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
         gyb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
         tmpb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        sm.push(DeviceBuffer::<f64>::zeroed(stream, nd)?); // damped-Jacobi smoother pong buffer
     }
 
     // PCG vectors (finest level, separate from V-cycle scratch).
@@ -1350,6 +1459,22 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                 &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
                 &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
             )?;
+        }};
+    }
+    // One fused damped-Jacobi smoother sweep: gradient + `operator_jacobi` (the matvec with the
+    // Jacobi update `x + ω·invd·(b − Ap)` folded into the operator's output write — no `Ap` DRAM
+    // round-trip, no separate `jacobi` launch), writing to the pong buffer `sm[l]` then swapping
+    // it into `xb[l]` (the operator reads neighbour `u`, so the update cannot be in place). After
+    // the swap `xb[l]` holds the freshest iterate. Bit-identical to `matvec! + jacobi`.
+    macro_rules! smooth_sweep {
+        ($l:expr) => {{
+            let l = $l;
+            module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], &xb[l], rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
+            module.operator_jacobi::<f64, G>(
+                &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
+                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, &bb[l], &invd[l], omega[l], &mut sm[l],
+            )?;
+            std::mem::swap(&mut xb[l], &mut sm[l]);
         }};
     }
     // Two operator applications MUST stay FP64 even in mixed mode, with their own f64 gx/gy
@@ -1445,8 +1570,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             for l in 0..last {
                 module.scal(&stream, vcfg[l], &mut xb[l], 0.0)?;
                 for _ in 0..n_pre {
-                    matvec!(l, &xb[l], &mut apb[l]);
-                    module.jacobi(&stream, vcfg[l], &mut xb[l], &bb[l], &apb[l], &invd[l], omega[l])?;
+                    smooth_sweep!(l);
                 }
                 matvec!(l, &xb[l], &mut apb[l]);
                 module.sub(&stream, vcfg[l], &mut rb[l], &bb[l], &apb[l])?;
@@ -1467,8 +1591,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                 }
                 module.axpy(&stream, vcfg[l], &mut xb[l], &tmpb[l], 1.0)?;
                 for _ in 0..n_post {
-                    matvec!(l, &xb[l], &mut apb[l]);
-                    module.jacobi(&stream, vcfg[l], &mut xb[l], &bb[l], &apb[l], &invd[l], omega[l])?;
+                    smooth_sweep!(l);
                 }
             }
         }};
