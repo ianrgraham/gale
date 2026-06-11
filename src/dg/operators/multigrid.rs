@@ -11,6 +11,7 @@
 
 use super::mesh::Mesh2d;
 use super::poisson::Poisson;
+use rayon::prelude::*;
 
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
@@ -194,14 +195,18 @@ impl PMultigrid {
             xr,
             yr,
         };
-        for l in 0..s.orders.len() {
-            let d = s.diagonal(l);
-            s.inv_diag.push(d.iter().map(|&v| 1.0 / v).collect());
-        }
-        for l in 0..s.orders.len() {
-            let lam = s.power_lambda(l);
-            s.lam_hi.push(1.1 * lam);
-        }
+        // Build the per-level smoother data in parallel across levels (the levels are
+        // independent). Each `diagonal` itself fans its `2·nn` probes out over rayon, so
+        // the finest level — which dominates — is load-balanced across all cores even
+        // though it is one item of this outer loop. Results are collected in level order,
+        // so the build stays bit-for-bit identical to the serial version.
+        s.inv_diag = (0..s.orders.len())
+            .into_par_iter()
+            .map(|l| s.diagonal(l).iter().map(|&v| 1.0 / v).collect())
+            .collect();
+        // `power_lambda` reads `inv_diag[l]` (now fully built) and is inherently serial
+        // within a level (power iteration), so parallelism here is across levels only.
+        s.lam_hi = (0..s.orders.len()).into_par_iter().map(|l| 1.1 * s.power_lambda(l)).collect();
         s
     }
 
@@ -355,21 +360,33 @@ impl PMultigrid {
         let n = ne * nn;
         let colors: Vec<usize> = (0..ne).map(|e| self.elem_color(l, e)).collect();
         let mut diag = vec![0.0; n];
-        let mut e = vec![0.0; n];
-        for c in 0..2 {
-            for m in 0..nn {
+        // The `2·nn` probes (one per local node `m` × colour `c`) are independent: each
+        // sets node `m` of every colour-`c` element, applies once, and reads back the
+        // diagonal at exactly those (disjoint) indices. Fan them out over rayon — each
+        // task owns its probe buffer and returns its `(index, value)` contributions, which
+        // are scattered back below. Disjoint indices ⇒ bit-for-bit identical to the serial
+        // probing (validated by poisson-pcg-check).
+        let probes: Vec<(usize, usize)> =
+            (0..2).flat_map(|c| (0..nn).map(move |m| (c, m))).collect();
+        let parts: Vec<Vec<(usize, f64)>> = probes
+            .par_iter()
+            .map(|&(c, m)| {
+                let mut e = vec![0.0; n];
                 for el in 0..ne {
                     if colors[el] == c {
                         e[el * nn + m] = 1.0;
                     }
                 }
                 let ae = self.apply_level(l, &e);
-                for el in 0..ne {
-                    if colors[el] == c {
-                        diag[el * nn + m] = ae[el * nn + m];
-                        e[el * nn + m] = 0.0;
-                    }
-                }
+                (0..ne)
+                    .filter(|&el| colors[el] == c)
+                    .map(|el| (el * nn + m, ae[el * nn + m]))
+                    .collect()
+            })
+            .collect();
+        for part in parts {
+            for (i, v) in part {
+                diag[i] = v;
             }
         }
         diag

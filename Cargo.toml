@@ -25,3 +25,8 @@ cuda-core = { path = "/home/ian/src/cuda-oxide-101/crates/cuda-core" }
 [lib]
 name = "gale"
 path = "src/lib.rs"
+
+# Host-side CPU parallelism (data-parallel build/setup, e.g. the p-MG diagonal
+# probing + power-iteration). Pure host crate — does not touch the GPU path.
+[dependencies]
+rayon = "1"
