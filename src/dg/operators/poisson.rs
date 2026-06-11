@@ -82,23 +82,16 @@ impl<'m> Poisson<'m> {
         let m = self.mesh;
         let refq = &m.refq;
         let nn = refq.n_nodes();
-        // Per-element physical gradients (reused by the face terms). Element-local ⇒
-        // computed in parallel; bit-for-bit identical to the serial precompute.
-        let grads: Vec<(Vec<f64>, Vec<f64>)> = m
-            .elements
-            .par_iter()
-            .enumerate()
-            .map(|(e, el)| {
-                let ue = &u[e * nn..(e + 1) * nn];
-                (el.geom.grad_x(refq, ue), el.geom.grad_y(refq, ue))
-            })
-            .collect();
+        // Per-element physical gradients, computed once and shared by BOTH the volume term
+        // and the face terms (previously the volume term recomputed them — a full redundant
+        // gradient pass per apply).
+        let grads = self.elem_grads(u);
         let gx: Vec<&Vec<f64>> = grads.iter().map(|g| &g.0).collect();
         let gy: Vec<&Vec<f64>> = grads.iter().map(|g| &g.1).collect();
 
         // Volume stiffness (fused form — the same operator the GPU kernel computes),
         // so that `apply − apply_volume` is exactly the face contribution.
-        let mut r = self.apply_volume(u);
+        let mut r = self.volume_with_grads(&grads);
 
         // Mortar projections (only used at non-conforming faces).
         let mortar = RefineQuad::new(m.order);
@@ -283,16 +276,38 @@ impl<'m> Poisson<'m> {
     /// element-local. Written in the fused `pr/ps` form the GPU kernel uses, so it
     /// is the bit-for-bit reference for the GPU volume-operator port.
     pub fn apply_volume(&self, u: &[f64]) -> Vec<f64> {
+        self.volume_with_grads(&self.elem_grads(u))
+    }
+
+    /// Per-element physical gradients `(∂u/∂x, ∂u/∂y)`, computed in parallel (element-local
+    /// ⇒ bit-for-bit identical to a serial precompute). Shared by [`apply`](Self::apply) and
+    /// [`apply_volume`](Self::apply_volume) so the gradient contraction is done **once** per
+    /// `apply`, not twice (the face term and the volume term both consume it).
+    fn elem_grads(&self, u: &[f64]) -> Vec<(Vec<f64>, Vec<f64>)> {
+        let refq = &self.mesh.refq;
+        let nn = refq.n_nodes();
+        self.mesh
+            .elements
+            .par_iter()
+            .enumerate()
+            .map(|(e, el)| {
+                let ue = &u[e * nn..(e + 1) * nn];
+                (el.geom.grad_x(refq, ue), el.geom.grad_y(refq, ue))
+            })
+            .collect()
+    }
+
+    /// Volume-stiffness action from already-computed per-element gradients (the shared core
+    /// of [`apply_volume`](Self::apply_volume)). Element-local ⇒ parallel over elements is
+    /// bit-for-bit identical to the serial loop (each output chunk is written by exactly one
+    /// element's arithmetic).
+    fn volume_with_grads(&self, grads: &[(Vec<f64>, Vec<f64>)]) -> Vec<f64> {
         let m = self.mesh;
         let refq = &m.refq;
         let nn = refq.n_nodes();
         let mut r = vec![0.0; self.ndof()];
-        // Element-local stencil ⇒ parallel over elements is bit-for-bit identical to the
-        // serial loop (each output chunk is written by exactly one element's arithmetic).
         r.par_chunks_mut(nn).zip(m.elements.par_iter()).enumerate().for_each(|(e, (out, el))| {
-            let ue = &u[e * nn..(e + 1) * nn];
-            let gx = el.geom.grad_x(refq, ue);
-            let gy = el.geom.grad_y(refq, ue);
+            let (gx, gy) = (&grads[e].0, &grads[e].1);
             let mut pr = vec![0.0; nn];
             let mut ps = vec![0.0; nn];
             for k in 0..nn {
