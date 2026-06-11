@@ -16,7 +16,7 @@
 //! the validated CPU `Poisson` / `PMultigrid`; only the iterations run on-device.
 //! Libdevice-free ⇒ the embedded path works on sm_70.
 
-use cuda_core::{CaptureMode, CudaContext, CudaGraphExec, CudaStream, DeviceBuffer, DeviceCopy, LaunchConfig};
+use cuda_core::{CaptureMode, CudaContext, CudaGraphExec, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig};
 use cuda_device::{kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
 use std::sync::Arc;
 use cuda_host::cuda_module;
@@ -1876,6 +1876,129 @@ pub fn bench_poisson_kernels(
             KernelTime { name: "dot_partial", ms: dot_ms },
         ],
     })
+}
+
+/// **Multi-GPU gating measurement** (research §7, docs/research-multi-gpu-elliptic.md): the
+/// decisive number before building a distributed elliptic solver on 2× PCIe Titan V. Measures
+/// (a) the PCIe **P2P round-trip latency** between GPU0↔GPU1 via `cuMemcpyPeerAsync` at small /
+/// halo-trace message sizes (the per-iteration cost a distributed matvec+reduce must hide), and
+/// (b) the single-GPU finest-level **matvec** (`gradient`+`operator`) time vs DoF. The
+/// **crossover** is the finest-level DoF where matvec time ≥ the P2P round-trip — below it
+/// distribution only *adds* latency; at/above it the bandwidth-bound matvec can overlap the halo.
+/// Prints a table; reused by the `pcie-crossover` bin. Requires 2 peer-capable GPUs.
+pub fn pcie_crossover(p: usize, reps: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use cuda_core::peer::{can_access_peer, enable_peer_access};
+
+    // ---- (a) PCIe P2P latency/bandwidth between the two GPUs ----
+    let ctx0 = CudaContext::new(0)?;
+    let ctx1 = CudaContext::new(1)?;
+    if !can_access_peer(&ctx0, &ctx1)? || !can_access_peer(&ctx1, &ctx0)? {
+        return Err("the two GPUs cannot access each other via P2P".into());
+    }
+    ctx0.bind_to_thread()?;
+    enable_peer_access(&ctx0, &ctx1)?;
+    ctx1.bind_to_thread()?;
+    enable_peer_access(&ctx1, &ctx0)?;
+    // 1 MiB scratch on EACH GPU — b0 in ctx0, b1 in ctx1 (allocate with the owning context
+    // bound, else the buffer lives on the wrong device and the peer copy is an invalid arg).
+    let cap = 131_072usize; // f64 elements = 1 MiB
+    ctx1.bind_to_thread()?;
+    let stream1 = ctx1.default_stream();
+    let b1 = DeviceBuffer::<f64>::zeroed(&stream1, cap)?;
+    ctx0.bind_to_thread()?;
+    let stream0 = ctx0.default_stream();
+    let b0 = DeviceBuffer::<f64>::zeroed(&stream0, cap)?;
+    let ev = || ctx0.new_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT));
+
+    // Time `reps` peer copies issued on stream0 (ctx0 events), single final sync.
+    let time_copies = |build: &dyn Fn() -> Result<(), DriverError>| -> Result<f64, Box<dyn std::error::Error>> {
+        for _ in 0..8 {
+            build()?;
+        }
+        stream0.synchronize()?;
+        let s = ev()?;
+        let e = ev()?;
+        s.record(&stream0)?;
+        for _ in 0..reps {
+            build()?;
+        }
+        e.record(&stream0)?;
+        e.synchronize()?;
+        Ok(s.elapsed_ms(&e)? as f64 * 1e3 / reps as f64) // µs per copy (or per pair)
+    };
+    let (p0, p1) = (b0.cu_deviceptr(), b1.cu_deviceptr());
+    let (c0, c1) = (ctx0.cu_ctx(), ctx1.cu_ctx());
+    let st = stream0.cu_stream();
+    // One-way 0→1 latency at a tiny (8 B) message.
+    let oneway_us = time_copies(&|| unsafe { cuda_core::memory::memcpy_peer_async(p1, c1, p0, c0, 8, st) })?;
+    // Round-trip 0→1→0 (what a halo exchange + add-reduce needs: data out and the partial back).
+    let rt_us = time_copies(&|| unsafe {
+        cuda_core::memory::memcpy_peer_async(p1, c1, p0, c0, 8, st)?;
+        cuda_core::memory::memcpy_peer_async(p0, c0, p1, c1, 8, st)
+    })?;
+    println!("=== PCIe P2P (GPU0↔GPU1, cuMemcpyPeerAsync) ===");
+    println!("  one-way  8 B : {oneway_us:8.2} µs");
+    println!("  round-trip 8 B: {rt_us:8.2} µs   (≈ halo-exchange + add-reduce latency floor)");
+    println!("  --- one-way transfer vs message size ---");
+    println!("  {:>10}  {:>10}  {:>10}", "bytes", "µs", "GB/s");
+    for &nbytes in &[256usize, 1 << 10, 1 << 12, 1 << 14, 1 << 16, 1 << 18, 1 << 20] {
+        let us = time_copies(&|| unsafe { cuda_core::memory::memcpy_peer_async(p1, c1, p0, c0, nbytes, st) })?;
+        let gbps = nbytes as f64 / (us * 1e3);
+        println!("  {nbytes:>10}  {us:>10.2}  {gbps:>10.1}");
+    }
+
+    // ---- (b) single-GPU finest-level matvec time vs DoF, and the crossover ----
+    let module = kernels::load(&ctx0)?;
+    println!("\n=== single-GPU matvec (gradient+operator) vs DoF (p={p}) ===");
+    println!("  {:>6}  {:>10}  {:>12}  {:>14}", "grid", "ndof", "matvec µs", "vs round-trip");
+    for &g in &[16usize, 32, 64, 128, 256, 512] {
+        let mesh = Mesh2d::rectangular(p, g, g, [0.0, 1.0], [0.0, 1.0]);
+        let ma = flatten_mesh(&mesh, 5.0, &[]);
+        let ndof = ma.ndof;
+        let up = |v: &[f64]| DeviceBuffer::from_host(&stream0, v);
+        let upu = |v: &[u32]| DeviceBuffer::from_host(&stream0, v);
+        let d = up(&ma.diff)?;
+        let mass = up(&ma.mass)?;
+        let fvl = upu(&ma.fvl)?;
+        let fnx = up(&ma.fnx)?;
+        let fny = up(&ma.fny)?;
+        let fsw = up(&ma.fsw)?;
+        let fnbr = upu(&ma.fnbr)?;
+        let ftau = up(&ma.ftau)?;
+        let u = up(&vec![1.0; ndof])?;
+        let mut gx = DeviceBuffer::<f64>::zeroed(&stream0, ndof)?;
+        let mut gy = DeviceBuffer::<f64>::zeroed(&stream0, ndof)?;
+        let mut out = DeviceBuffer::<f64>::zeroed(&stream0, ndof)?;
+        let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
+        let (n1, nev) = (ma.n1, ma.ne as u32);
+        let mut matvec = || -> Result<(), DriverError> {
+            module.gradient::<f64, f64>(&stream0, gcfg, &d, &u, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
+            module.operator::<f64, f64>(
+                &stream0, ocfg, &d, &u, &gx, &gy, &mass, n1, nev, ma.rx, ma.sy, ma.jac,
+                &fvl, &fnx, &fny, &fsw, &fnbr, &ftau, 0.0, &mut out,
+            )
+        };
+        for _ in 0..3 {
+            matvec()?;
+        }
+        stream0.synchronize()?;
+        let s = ev()?;
+        let e = ev()?;
+        s.record(&stream0)?;
+        for _ in 0..reps {
+            matvec()?;
+        }
+        e.record(&stream0)?;
+        e.synchronize()?;
+        let mv_us = s.elapsed_ms(&e)? as f64 * 1e3 / reps as f64;
+        let verdict = if mv_us >= rt_us { "matvec ≥ RT ✓" } else { "RT-dominated" };
+        println!("  {g:>4}²  {ndof:>10}  {mv_us:>12.2}  {verdict:>14}");
+    }
+    println!(
+        "\nCrossover = smallest grid above where matvec µs ≥ round-trip {rt_us:.2} µs: at/above it the\n\
+         bandwidth-bound matvec can hide a P2P halo exchange; below it, distribution only adds latency."
+    );
+    Ok(())
 }
 
 // ===== Persistent solver handle (P4) =============================================
