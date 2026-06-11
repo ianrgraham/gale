@@ -15,6 +15,7 @@
 use super::amr::RefineQuad;
 use super::face::Edge;
 use super::mesh::{Mesh2d, Neighbor};
+use rayon::prelude::*;
 
 /// The SIPG Poisson operator over a mesh, with a penalty coefficient.
 pub struct Poisson<'m> {
@@ -81,15 +82,19 @@ impl<'m> Poisson<'m> {
         let m = self.mesh;
         let refq = &m.refq;
         let nn = refq.n_nodes();
-        let ne = m.n_elements();
-        // Per-element physical gradients (reused by the face terms).
-        let mut gx = Vec::with_capacity(ne);
-        let mut gy = Vec::with_capacity(ne);
-        for (e, el) in m.elements.iter().enumerate() {
-            let ue = &u[e * nn..(e + 1) * nn];
-            gx.push(el.geom.grad_x(refq, ue));
-            gy.push(el.geom.grad_y(refq, ue));
-        }
+        // Per-element physical gradients (reused by the face terms). Element-local ⇒
+        // computed in parallel; bit-for-bit identical to the serial precompute.
+        let grads: Vec<(Vec<f64>, Vec<f64>)> = m
+            .elements
+            .par_iter()
+            .enumerate()
+            .map(|(e, el)| {
+                let ue = &u[e * nn..(e + 1) * nn];
+                (el.geom.grad_x(refq, ue), el.geom.grad_y(refq, ue))
+            })
+            .collect();
+        let gx: Vec<&Vec<f64>> = grads.iter().map(|g| &g.0).collect();
+        let gy: Vec<&Vec<f64>> = grads.iter().map(|g| &g.1).collect();
 
         // Volume stiffness (fused form — the same operator the GPU kernel computes),
         // so that `apply − apply_volume` is exactly the face contribution.
@@ -110,149 +115,166 @@ impl<'m> Poisson<'m> {
             idx
         };
 
-        // Face terms.
-        for (e, el) in m.elements.iter().enumerate() {
-            for edge in Edge::ALL {
-                let f = &el.faces[edge as usize];
-                match &el.neighbors[edge as usize] {
-                    Neighbor::Interior { elem: re, edge: redge, perm } => {
-                        if e >= *re {
-                            continue; // process each interior face once (from low side)
-                        }
-                        let rel = &m.elements[*re];
-                        let rf = &rel.faces[*redge as usize];
-                        let tau = self.penalty(e, Some(*re));
-                        let mut hxl = vec![0.0; nn];
-                        let mut hyl = vec![0.0; nn];
-                        let mut hxr = vec![0.0; nn];
-                        let mut hyr = vec![0.0; nn];
-                        for a in 0..f.nodes.len() {
-                            let b = perm[a];
-                            let (vl, vr) = (f.nodes[a], rf.nodes[b]);
-                            let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
-                            let dun_l = nx * gx[e][vl] + ny * gy[e][vl];
-                            let dun_r = nx * gx[*re][vr] + ny * gy[*re][vr];
-                            let avg = 0.5 * (dun_l + dun_r);
-                            let jump = u[e * nn + vl] - u[*re * nn + vr];
-                            // consistency  −∮{∇u·n}[v]
-                            r[e * nn + vl] += -sw * avg;
-                            r[*re * nn + vr] += sw * avg;
-                            // penalty  +∮ τ[u][v]
-                            r[e * nn + vl] += tau * sw * jump;
-                            r[*re * nn + vr] += -tau * sw * jump;
-                            // symmetry  −∮{∇v·n}[u]  (lift, average factor ½, same normal n_L)
-                            let g = 0.5 * sw * jump;
-                            hxl[vl] += g * nx;
-                            hyl[vl] += g * ny;
-                            hxr[vr] += g * nx;
-                            hyr[vr] += g * ny;
-                        }
-                        let ll = add(el.geom.gradx_t(refq, &hxl), el.geom.grady_t(refq, &hyl));
-                        let lr = add(rel.geom.gradx_t(refq, &hxr), rel.geom.grady_t(refq, &hyr));
-                        for k in 0..nn {
-                            r[e * nn + k] -= ll[k];
-                            r[*re * nn + k] -= lr[k];
-                        }
-                    }
-                    Neighbor::Boundary { tag } => {
-                        if self.is_neumann(*tag) {
-                            // Natural (Neumann) BC: no operator contribution; the
-                            // prescribed flux enters the RHS instead.
-                            continue;
-                        }
-                        let tau = self.penalty(e, None);
-                        let mut hx = vec![0.0; nn];
-                        let mut hy = vec![0.0; nn];
-                        for a in 0..f.nodes.len() {
-                            let v = f.nodes[a];
-                            let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
-                            let dun = nx * gx[e][v] + ny * gy[e][v];
-                            let uval = u[e * nn + v];
-                            r[e * nn + v] += -sw * dun; // consistency  −∮(∇u·n)v
-                            r[e * nn + v] += tau * sw * uval; // penalty  +∮ τ u v
-                            hx[v] += sw * uval * nx; // symmetry  −∮(∇v·n)u
-                            hy[v] += sw * uval * ny;
-                        }
-                        let l = add(el.geom.gradx_t(refq, &hx), el.geom.grady_t(refq, &hy));
-                        for k in 0..nn {
-                            r[e * nn + k] -= l[k];
-                        }
-                    }
-                    Neighbor::FineToCoarse { .. } => { /* handled from the coarse side */ }
-                    Neighbor::CoarseToFine { fine } => {
-                        // SIPG across a 2:1 interface, integrated on the fine mortar.
-                        // Coarse traces (sorted) and their coarse-normal gradient.
-                        let ce = sorted(e, edge);
-                        let (ncx, ncy) = (f.nx[ce[0]], f.ny[ce[0]]);
-                        let uc: Vec<f64> = ce.iter().map(|&i| u[e * nn + f.nodes[i]]).collect();
-                        let dnc: Vec<f64> = ce
-                            .iter()
-                            .map(|&i| {
-                                let v = f.nodes[i];
-                                ncx * gx[e][v] + ncy * gy[e][v]
-                            })
-                            .collect();
-                        let mut hxe = vec![0.0; nn];
-                        let mut hye = vec![0.0; nn];
-                        for h in 0..2 {
-                            let (re, redge) = fine[h];
-                            let tau = self.penalty(e, Some(re));
-                            let rel = &m.elements[re];
-                            let frw = &rel.faces[redge as usize];
-                            let rw = sorted(re, redge);
-                            let uc_m = mortar.mortar_to_fine(&uc, h);
-                            let dnc_m = mortar.mortar_to_fine(&dnc, h);
+        // Face terms. Each owning element's contribution is computed in parallel into a
+        // record of `(global_index, delta)` pairs — this is where the expensive O(p³) gradᵀ
+        // symmetry lifts live — then replayed **serially in element/edge/node order** below.
+        // The replay order is identical to the original serial scatter, so accumulation into
+        // each node is bit-for-bit unchanged (the symmetry / MMS / non-conforming tests guard
+        // this). Writes `r[i] += v` become `push((i, v))`; `r[i] -= v` become `push((i, -v))`.
+        let records: Vec<Vec<(usize, f64)>> = m
+            .elements
+            .par_iter()
+            .enumerate()
+            .map(|(e, el)| {
+                let mut rec: Vec<(usize, f64)> = Vec::new();
+                for edge in Edge::ALL {
+                    let f = &el.faces[edge as usize];
+                    match &el.neighbors[edge as usize] {
+                        Neighbor::Interior { elem: re, edge: redge, perm } => {
+                            if e >= *re {
+                                continue; // process each interior face once (from low side)
+                            }
+                            let rel = &m.elements[*re];
+                            let rf = &rel.faces[*redge as usize];
+                            let tau = self.penalty(e, Some(*re));
+                            let mut hxl = vec![0.0; nn];
+                            let mut hyl = vec![0.0; nn];
                             let mut hxr = vec![0.0; nn];
                             let mut hyr = vec![0.0; nn];
-                            let mut gc = vec![0.0; rw.len()]; // coarse-test consistency+penalty
-                            let mut gl = vec![0.0; rw.len()]; // coarse-test symmetry-lift source
-                            for (mi, &i) in rw.iter().enumerate() {
-                                let vf = frw.nodes[i];
-                                let sw = frw.sw[i];
-                                let dnf = ncx * gx[re][vf] + ncy * gy[re][vf];
-                                let jump = uc_m[mi] - u[re * nn + vf];
-                                let avg = 0.5 * (dnc_m[mi] + dnf);
-                                // Fine test (direct): consistency +∮{∇u·n}v_f, penalty −∮τ[u]v_f.
-                                r[re * nn + vf] += sw * avg - tau * sw * jump;
-                                // Coarse test (Pᵀ-scattered): −∮{∇u·n}v_c, +∮τ[u]v_c.
-                                gc[mi] = sw * (-avg + tau * jump);
-                                // Symmetry lift g = ½ sw [u] (same coarse normal both sides).
+                            for a in 0..f.nodes.len() {
+                                let b = perm[a];
+                                let (vl, vr) = (f.nodes[a], rf.nodes[b]);
+                                let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
+                                let dun_l = nx * gx[e][vl] + ny * gy[e][vl];
+                                let dun_r = nx * gx[*re][vr] + ny * gy[*re][vr];
+                                let avg = 0.5 * (dun_l + dun_r);
+                                let jump = u[e * nn + vl] - u[*re * nn + vr];
+                                // consistency  −∮{∇u·n}[v]
+                                rec.push((e * nn + vl, -sw * avg));
+                                rec.push((*re * nn + vr, sw * avg));
+                                // penalty  +∮ τ[u][v]
+                                rec.push((e * nn + vl, tau * sw * jump));
+                                rec.push((*re * nn + vr, -tau * sw * jump));
+                                // symmetry  −∮{∇v·n}[u]  (lift, average factor ½, same normal n_L)
                                 let g = 0.5 * sw * jump;
-                                hxr[vf] += g * ncx;
-                                hyr[vf] += g * ncy;
-                                gl[mi] = g;
+                                hxl[vl] += g * nx;
+                                hyl[vl] += g * ny;
+                                hxr[vr] += g * nx;
+                                hyr[vr] += g * ny;
                             }
-                            // Scatter coarse-test contributions back via Pᵀ.
-                            let cc = mortar.mortar_gather(&gc, h);
-                            let cl = mortar.mortar_gather(&gl, h);
-                            for (mc, &cv) in ce.iter().enumerate() {
-                                let node = f.nodes[cv];
-                                r[e * nn + node] += cc[mc];
-                                hxe[node] += cl[mc] * ncx;
-                                hye[node] += cl[mc] * ncy;
-                            }
-                            // Fine symmetry-lift → r[re].
+                            let ll = add(el.geom.gradx_t(refq, &hxl), el.geom.grady_t(refq, &hyl));
                             let lr = add(rel.geom.gradx_t(refq, &hxr), rel.geom.grady_t(refq, &hyr));
                             for k in 0..nn {
-                                r[re * nn + k] -= lr[k];
+                                rec.push((e * nn + k, -ll[k]));
+                                rec.push((*re * nn + k, -lr[k]));
                             }
                         }
-                        // Coarse symmetry-lift → r[e].
-                        let le = add(el.geom.gradx_t(refq, &hxe), el.geom.grady_t(refq, &hye));
-                        for k in 0..nn {
-                            r[e * nn + k] -= le[k];
+                        Neighbor::Boundary { tag } => {
+                            if self.is_neumann(*tag) {
+                                // Natural (Neumann) BC: no operator contribution; the
+                                // prescribed flux enters the RHS instead.
+                                continue;
+                            }
+                            let tau = self.penalty(e, None);
+                            let mut hx = vec![0.0; nn];
+                            let mut hy = vec![0.0; nn];
+                            for a in 0..f.nodes.len() {
+                                let v = f.nodes[a];
+                                let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
+                                let dun = nx * gx[e][v] + ny * gy[e][v];
+                                let uval = u[e * nn + v];
+                                rec.push((e * nn + v, -sw * dun)); // consistency  −∮(∇u·n)v
+                                rec.push((e * nn + v, tau * sw * uval)); // penalty  +∮ τ u v
+                                hx[v] += sw * uval * nx; // symmetry  −∮(∇v·n)u
+                                hy[v] += sw * uval * ny;
+                            }
+                            let l = add(el.geom.gradx_t(refq, &hx), el.geom.grady_t(refq, &hy));
+                            for k in 0..nn {
+                                rec.push((e * nn + k, -l[k]));
+                            }
+                        }
+                        Neighbor::FineToCoarse { .. } => { /* handled from the coarse side */ }
+                        Neighbor::CoarseToFine { fine } => {
+                            // SIPG across a 2:1 interface, integrated on the fine mortar.
+                            // Coarse traces (sorted) and their coarse-normal gradient.
+                            let ce = sorted(e, edge);
+                            let (ncx, ncy) = (f.nx[ce[0]], f.ny[ce[0]]);
+                            let uc: Vec<f64> = ce.iter().map(|&i| u[e * nn + f.nodes[i]]).collect();
+                            let dnc: Vec<f64> = ce
+                                .iter()
+                                .map(|&i| {
+                                    let v = f.nodes[i];
+                                    ncx * gx[e][v] + ncy * gy[e][v]
+                                })
+                                .collect();
+                            let mut hxe = vec![0.0; nn];
+                            let mut hye = vec![0.0; nn];
+                            for h in 0..2 {
+                                let (re, redge) = fine[h];
+                                let tau = self.penalty(e, Some(re));
+                                let rel = &m.elements[re];
+                                let frw = &rel.faces[redge as usize];
+                                let rw = sorted(re, redge);
+                                let uc_m = mortar.mortar_to_fine(&uc, h);
+                                let dnc_m = mortar.mortar_to_fine(&dnc, h);
+                                let mut hxr = vec![0.0; nn];
+                                let mut hyr = vec![0.0; nn];
+                                let mut gc = vec![0.0; rw.len()]; // coarse-test consistency+penalty
+                                let mut gl = vec![0.0; rw.len()]; // coarse-test symmetry-lift source
+                                for (mi, &i) in rw.iter().enumerate() {
+                                    let vf = frw.nodes[i];
+                                    let sw = frw.sw[i];
+                                    let dnf = ncx * gx[re][vf] + ncy * gy[re][vf];
+                                    let jump = uc_m[mi] - u[re * nn + vf];
+                                    let avg = 0.5 * (dnc_m[mi] + dnf);
+                                    // Fine test (direct): consistency +∮{∇u·n}v_f, penalty −∮τ[u]v_f.
+                                    rec.push((re * nn + vf, sw * avg - tau * sw * jump));
+                                    // Coarse test (Pᵀ-scattered): −∮{∇u·n}v_c, +∮τ[u]v_c.
+                                    gc[mi] = sw * (-avg + tau * jump);
+                                    // Symmetry lift g = ½ sw [u] (same coarse normal both sides).
+                                    let g = 0.5 * sw * jump;
+                                    hxr[vf] += g * ncx;
+                                    hyr[vf] += g * ncy;
+                                    gl[mi] = g;
+                                }
+                                // Scatter coarse-test contributions back via Pᵀ.
+                                let cc = mortar.mortar_gather(&gc, h);
+                                let cl = mortar.mortar_gather(&gl, h);
+                                for (mc, &cv) in ce.iter().enumerate() {
+                                    let node = f.nodes[cv];
+                                    rec.push((e * nn + node, cc[mc]));
+                                    hxe[node] += cl[mc] * ncx;
+                                    hye[node] += cl[mc] * ncy;
+                                }
+                                // Fine symmetry-lift → r[re].
+                                let lr = add(rel.geom.gradx_t(refq, &hxr), rel.geom.grady_t(refq, &hyr));
+                                for k in 0..nn {
+                                    rec.push((re * nn + k, -lr[k]));
+                                }
+                            }
+                            // Coarse symmetry-lift → r[e].
+                            let le = add(el.geom.gradx_t(refq, &hxe), el.geom.grady_t(refq, &hye));
+                            for k in 0..nn {
+                                rec.push((e * nn + k, -le[k]));
+                            }
                         }
                     }
                 }
+                rec
+            })
+            .collect();
+        for rec in &records {
+            for &(i, d) in rec {
+                r[i] += d;
             }
         }
-        // Helmholtz reaction term: + λ M u (diagonal mass).
+        // Helmholtz reaction term: + λ M u (diagonal mass). Element-local ⇒ parallel.
         if self.reaction != 0.0 {
-            for (e, el) in m.elements.iter().enumerate() {
+            r.par_chunks_mut(nn).zip(m.elements.par_iter()).enumerate().for_each(|(e, (out, el))| {
                 for k in 0..nn {
-                    r[e * nn + k] += self.reaction * el.geom.jw[k] * u[e * nn + k];
+                    out[k] += self.reaction * el.geom.jw[k] * u[e * nn + k];
                 }
-            }
+            });
         }
         r
     }
@@ -265,7 +287,9 @@ impl<'m> Poisson<'m> {
         let refq = &m.refq;
         let nn = refq.n_nodes();
         let mut r = vec![0.0; self.ndof()];
-        for (e, el) in m.elements.iter().enumerate() {
+        // Element-local stencil ⇒ parallel over elements is bit-for-bit identical to the
+        // serial loop (each output chunk is written by exactly one element's arithmetic).
+        r.par_chunks_mut(nn).zip(m.elements.par_iter()).enumerate().for_each(|(e, (out, el))| {
             let ue = &u[e * nn..(e + 1) * nn];
             let gx = el.geom.grad_x(refq, ue);
             let gy = el.geom.grad_y(refq, ue);
@@ -280,9 +304,9 @@ impl<'m> Poisson<'m> {
             let a = refq.diff_r_t(&pr);
             let b = refq.diff_s_t(&ps);
             for k in 0..nn {
-                r[e * nn + k] = a[k] + b[k];
+                out[k] = a[k] + b[k];
             }
-        }
+        });
         r
     }
 
