@@ -170,9 +170,9 @@ mod kernels {
     #[kernel]
     #[allow(clippy::too_many_arguments)]
     pub fn operator<U: Scalar, G: Scalar>(
-        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], n1: u32, ne: u32, rx: f64,
-        sy: f64, jac: f64, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
-        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, mut out: DisjointSlice<U>,
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
+        mut out: DisjointSlice<U>,
     ) {
         // Two storage scalars, f64 accumulate: `U` = field/output, `G` = gradient intermediate
         // (read here, written by `gradient`). Shared PR/PS, metrics, mass stay f64; global field
@@ -206,34 +206,35 @@ mod kernels {
             }
             // Face contribution by **gather** (race-free, fully parallel): thread `m` owns
             // node `m`, visits the ≤2 faces it lies on (corner ⇒ 2), and accumulates the SIPG
-            // consistency/penalty `rf` and the symmetry-lift `hx,hy` into registers — so no
-            // shared `RF/HX/HY` and no inter-thread races (each node written by one thread).
-            // Node m = (ii, jj)'s face position `a` follows the tensor face-node convention (see
-            // `quad_faces`): South/North run along i (a=ii), East/West along j (a=jj). The
-            // bit-for-bit operator validator confirms the convention.
+            // consistency/penalty `rf` and the symmetry-lift `hx,hy` into registers.
+            // For the uniform axis-aligned mesh the per-face metadata is NOT streamed from DRAM:
+            // the outward normals are the closed-form per-edge constants (S=(0,−1) E=(1,0) N=(0,1)
+            // W=(−1,0)), the surface weights collapse to the two tiny per-direction 1D arrays
+            // `fswx` (South/North, along i) and `fswy` (East/West, along j), and the SIPG penalty
+            // is the scalar `tau`. Only the connectivity `face_nbr` remains a per-face array. This
+            // is the affine-collapse already applied to the volume metrics, extended to the face
+            // terms — eliminating the fnx/fny/fsw/ftau (and unused fvl) global loads that were the
+            // bulk of the operator's L1TEX traffic. Bit-for-bit (the values equal the mesh's).
             let ii = m % n1;
             let jj = m / n1;
             let mut hx = 0.0f64;
             let mut hy = 0.0f64;
             let mut t4 = 0usize;
             while t4 < 4 {
-                let (on, a) = if t4 == 0 {
-                    (jj == 0, ii) // South
+                let (on, a, nx, ny, xface) = if t4 == 0 {
+                    (jj == 0, ii, 0.0f64, -1.0f64, true) // South
                 } else if t4 == 1 {
-                    (ii == n1 - 1, jj) // East
+                    (ii == n1 - 1, jj, 1.0f64, 0.0f64, false) // East
                 } else if t4 == 2 {
-                    (jj == n1 - 1, ii) // North
+                    (jj == n1 - 1, ii, 0.0f64, 1.0f64, true) // North
                 } else {
-                    (ii == 0, jj) // West
+                    (ii == 0, jj, -1.0f64, 0.0f64, false) // West
                 };
                 if on {
                     let idx = (e * 4 + t4) * n1 + a;
                     let nbr = face_nbr[idx];
                     if nbr != NEU {
-                        let tau = face_tau[e * 4 + t4];
-                        let nx = face_nx[idx];
-                        let ny = face_ny[idx];
-                        let sw = face_sw[idx];
+                        let sw = if xface { fswx[a] } else { fswy[a] };
                         let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
                         let ug = u[b].to_f64();
                         let (avg, jump, gfac) = if nbr == BND {
@@ -288,11 +289,12 @@ mod kernels {
     /// barrier is unproven, so the duplication buys guaranteed codegen + the bit-exact validator).
     #[kernel]
     pub fn operator_jacobi<U: Scalar, G: Scalar>(
-        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], n1: u32, ne: u32, rx: f64,
-        sy: f64, jac: f64, _face_vl: &[u32], face_nx: &[f64], face_ny: &[f64],
-        face_sw: &[f64], face_nbr: &[u32], face_tau: &[f64], lambda: f64, rhs: &[f64],
-        invd: &[f64], omega: f64, mut out: DisjointSlice<U>,
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
+        rhs: &[f64], invd: &[f64], omega: f64, mut out: DisjointSlice<U>,
     ) {
+        // Same affine face-metadata collapse as [`operator`] (closed-form normals, per-direction
+        // surface weights `fswx`/`fswy`, scalar penalty `tau`); only `face_nbr` is streamed.
         let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | PR(epb·nn) | PS(epb·nn) ]
         let n1 = n1 as usize;
         let nn = n1 * n1;
@@ -325,23 +327,20 @@ mod kernels {
             let mut hy = 0.0f64;
             let mut t4 = 0usize;
             while t4 < 4 {
-                let (on, a) = if t4 == 0 {
-                    (jj == 0, ii)
+                let (on, a, nx, ny, xface) = if t4 == 0 {
+                    (jj == 0, ii, 0.0f64, -1.0f64, true) // South
                 } else if t4 == 1 {
-                    (ii == n1 - 1, jj)
+                    (ii == n1 - 1, jj, 1.0f64, 0.0f64, false) // East
                 } else if t4 == 2 {
-                    (jj == n1 - 1, ii)
+                    (jj == n1 - 1, ii, 0.0f64, 1.0f64, true) // North
                 } else {
-                    (ii == 0, jj)
+                    (ii == 0, jj, -1.0f64, 0.0f64, false) // West
                 };
                 if on {
                     let idx = (e * 4 + t4) * n1 + a;
                     let nbr = face_nbr[idx];
                     if nbr != NEU {
-                        let tau = face_tau[e * 4 + t4];
-                        let nx = face_nx[idx];
-                        let ny = face_ny[idx];
-                        let sw = face_sw[idx];
+                        let sw = if xface { fswx[a] } else { fswy[a] };
                         let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
                         let ug = u[b].to_f64();
                         let (avg, jump, gfac) = if nbr == BND {
@@ -722,12 +721,15 @@ struct MeshArrays {
     rx: f64,
     sy: f64,
     jac: f64,
-    fvl: Vec<u32>,
-    fnx: Vec<f64>,
-    fny: Vec<f64>,
-    fsw: Vec<f64>,
+    /// **Affine face metadata** (uniform axis-aligned mesh): the outward normals are per-edge
+    /// constants (closed-form in the kernel), the SIPG penalty `tau = α(p+1)²/h` is constant, and
+    /// the surface quadrature weights collapse to two `n1`-length 1D arrays — `fswx` for the
+    /// South/North (along-i) faces, `fswy` for East/West (along-j). So `fnx/fny/fsw/ftau` (and the
+    /// unused `fvl`) stop being per-face DRAM arrays; only the connectivity `fnbr` remains.
+    fswx: Vec<f64>,
+    fswy: Vec<f64>,
+    tau: f64,
     fnbr: Vec<u32>,
-    ftau: Vec<f64>,
 }
 
 /// Flatten a mesh's metrics and SIPG face metadata (penalty `tau` from `alpha`),
@@ -769,24 +771,22 @@ fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32]) -> MeshArrays {
     let h: Vec<f64> = mesh.elements.iter().map(|el| el.geom.jw.iter().sum::<f64>().sqrt()).collect();
     let n1u = n1 as usize;
     let nfc = ne * 4 * n1u;
-    let (mut fvl, mut fnx, mut fny, mut fsw, mut fnbr, mut ftau) =
-        (vec![0u32; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![0.0; nfc], vec![BND; nfc], vec![0.0; ne * 4]);
+    // Affine face metadata (uniform axis-aligned mesh): the surface weights are identical for every
+    // face of a given direction — South/North run along i (`fswx`), East/West along j (`fswy`) — and
+    // the SIPG penalty `tau = α(p+1)²/h` is constant (every element shares the same `h`, so the
+    // interior `h[e].min(h[re])` equals it too). Taken straight from the mesh ⇒ bit-for-bit. Only
+    // the connectivity `fnbr` stays per-face; the kernel derives normals closed-form per edge.
+    let e0 = &mesh.elements[0];
+    let fswx: Vec<f64> = (0..n1u).map(|a| e0.faces[Edge::ALL[0] as usize].sw[a]).collect();
+    let fswy: Vec<f64> = (0..n1u).map(|a| e0.faces[Edge::ALL[1] as usize].sw[a]).collect();
+    let tau = alpha * p1 * p1 / h[0];
+    let mut fnbr = vec![BND; nfc];
     for (e, el) in mesh.elements.iter().enumerate() {
         for (t, edge) in Edge::ALL.iter().enumerate() {
-            let face = &el.faces[*edge as usize];
             let nb = &el.neighbors[*edge as usize];
-            ftau[e * 4 + t] = match nb {
-                Neighbor::Interior { elem: re, .. } => alpha * p1 * p1 / h[e].min(h[*re]),
-                Neighbor::Boundary { .. } => alpha * p1 * p1 / h[e],
-                Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. } => unreachable!(),
-            };
             let neumann_boundary = matches!(nb, Neighbor::Boundary { tag } if neumann_tags.contains(tag));
             for a in 0..n1u {
                 let idx = (e * 4 + t) * n1u + a;
-                fvl[idx] = face.nodes[a] as u32;
-                fnx[idx] = face.nx[a];
-                fny[idx] = face.ny[a];
-                fsw[idx] = face.sw[a];
                 if let Neighbor::Interior { elem: re, edge: redge, perm } = nb {
                     let rf = &mesh.elements[*re].faces[*redge as usize];
                     fnbr[idx] = (*re * nn + rf.nodes[perm[a]]) as u32;
@@ -807,12 +807,10 @@ fn flatten_mesh(mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32]) -> MeshArrays {
         rx,
         sy,
         jac,
-        fvl,
-        fnx,
-        fny,
-        fsw,
+        fswx,
+        fswy,
+        tau,
         fnbr,
-        ftau,
     }
 }
 
@@ -839,12 +837,9 @@ pub fn poisson_apply(
     let d_dev = up(&ma.diff)?;
     let u_dev = up(u)?;
     let mass_dev = up(&ma.mass)?;
-    let fvl_dev = upu(&ma.fvl)?;
-    let fnx_dev = up(&ma.fnx)?;
-    let fny_dev = up(&ma.fny)?;
-    let fsw_dev = up(&ma.fsw)?;
+    let fswx_dev = up(&ma.fswx)?;
+    let fswy_dev = up(&ma.fswy)?;
     let fnbr_dev = upu(&ma.fnbr)?;
-    let ftau_dev = up(&ma.ftau)?;
     let mut gx_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
     let mut gy_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
     let mut out_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
@@ -854,8 +849,8 @@ pub fn poisson_apply(
     let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
     module.gradient::<f64, f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, ma.n1, nev, &mut gx_dev, &mut gy_dev)?;
     module.operator::<f64, f64>(
-        &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &mass_dev, ma.n1, nev, ma.rx, ma.sy, ma.jac,
-        &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out_dev,
+        &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &mass_dev, &fswx_dev, &fswy_dev, ma.n1, nev,
+        ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, 0.0, &mut out_dev,
     )?;
     Ok(out_dev.to_host_vec(&stream)?)
 }
@@ -933,12 +928,9 @@ fn cg_solve_impl(
 
     let d_dev = up(&ma.diff)?;
     let mass_dev = up(&ma.mass)?;
-    let fvl_dev = upu(&ma.fvl)?;
-    let fnx_dev = up(&ma.fnx)?;
-    let fny_dev = up(&ma.fny)?;
-    let fsw_dev = up(&ma.fsw)?;
+    let fswx_dev = up(&ma.fswx)?;
+    let fswy_dev = up(&ma.fswy)?;
     let fnbr_dev = upu(&ma.fnbr)?;
-    let ftau_dev = up(&ma.ftau)?;
 
     // CG vectors (resident on device). r = b − A·0 = b, p = r.
     let mut x = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
@@ -979,8 +971,8 @@ fn cg_solve_impl(
         ($field:expr, $dst:expr) => {{
             module.gradient::<f64, f64>(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
             module.operator::<f64, f64>(
-                &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
-                &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, reaction, $dst,
+                &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, &fswx_dev, &fswy_dev, n1, nev,
+                ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, reaction, $dst,
             )?;
         }};
     }
@@ -1041,12 +1033,9 @@ pub fn pressure_cg_solve(
 
     let d_dev = up(&ma.diff)?;
     let mass_dev = up(&ma.mass)?;
-    let fvl_dev = upu(&ma.fvl)?;
-    let fnx_dev = up(&ma.fnx)?;
-    let fny_dev = up(&ma.fny)?;
-    let fsw_dev = up(&ma.fsw)?;
+    let fswx_dev = up(&ma.fswx)?;
+    let fswy_dev = up(&ma.fswy)?;
     let fnbr_dev = upu(&ma.fnbr)?;
-    let ftau_dev = up(&ma.ftau)?;
 
     let mut x = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
     let mut r = up(b)?;
@@ -1085,8 +1074,8 @@ pub fn pressure_cg_solve(
         ($field:expr, $dst:expr) => {{
             module.gradient::<f64, f64>(&stream, gcfg, &d_dev, $field, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
             module.operator::<f64, f64>(
-                &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
-                &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, $dst,
+                &stream, ocfg, &d_dev, $field, &gx, &gy, &mass_dev, &fswx_dev, &fswy_dev, n1, nev,
+                ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, 0.0, $dst,
             )?;
         }};
     }
@@ -1143,12 +1132,13 @@ struct MgConst {
     sys: Vec<f64>,
     jacs: Vec<f64>,
     invd: Vec<DeviceBuffer<f64>>,
-    fvl: Vec<DeviceBuffer<u32>>,
     fnbr: Vec<DeviceBuffer<u32>>,
-    fnx: Vec<DeviceBuffer<f64>>,
-    fny: Vec<DeviceBuffer<f64>>,
-    fsw: Vec<DeviceBuffer<f64>>,
-    ftau: Vec<DeviceBuffer<f64>>,
+    /// Affine face metadata per level (see [`MeshArrays`]): per-direction 1D surface weights
+    /// (`fswx` = S/N, `fswy` = E/W) + the scalar SIPG penalty `tau`. The normals are closed-form
+    /// in the kernel; `fnx/fny/fsw/ftau` (and `fvl`) are no longer streamed.
+    fswx: Vec<DeviceBuffer<f64>>,
+    fswy: Vec<DeviceBuffer<f64>>,
+    taus: Vec<f64>,
     omega: Vec<f64>,
     interp: Vec<DeviceBuffer<f64>>,
     /// Per-transition (`len = nlev−1`): true ⇒ h-coarsening (2:1 geometric, the `h_prolong`/
@@ -1184,8 +1174,9 @@ impl MgConst {
         let mut ndofv = Vec::new();
         let (mut dl, mut massl, mut invd) = (vec![], vec![], vec![]);
         let (mut rxs, mut sys, mut jacs): (Vec<f64>, Vec<f64>, Vec<f64>) = (vec![], vec![], vec![]);
-        let (mut fvl, mut fnbr) = (vec![], vec![]);
-        let (mut fnx, mut fny, mut fsw, mut ftau) = (vec![], vec![], vec![], vec![]);
+        let mut fnbr = vec![];
+        let (mut fswx, mut fswy, mut taus): (Vec<DeviceBuffer<f64>>, Vec<DeviceBuffer<f64>>, Vec<f64>) =
+            (vec![], vec![], vec![]);
         let mut omega = Vec::new();
 
         // Per-region Neumann tags (rediscretized at every level) — all-tags + reaction 0 is
@@ -1203,12 +1194,10 @@ impl MgConst {
             sys.push(ma.sy);
             jacs.push(ma.jac);
             invd.push(up(mg.inv_diagonal(l))?);
-            fvl.push(upu(&ma.fvl)?);
             fnbr.push(upu(&ma.fnbr)?);
-            fnx.push(up(&ma.fnx)?);
-            fny.push(up(&ma.fny)?);
-            fsw.push(up(&ma.fsw)?);
-            ftau.push(up(&ma.ftau)?);
+            fswx.push(up(&ma.fswx)?);
+            fswy.push(up(&ma.fswy)?);
+            taus.push(ma.tau);
             omega.push(mg.jacobi_omega(l));
         }
         // transfer operators (coarse l+1 → fine l): p-transfers carry a tensor interp matrix;
@@ -1253,12 +1242,10 @@ impl MgConst {
             sys,
             jacs,
             invd,
-            fvl,
             fnbr,
-            fnx,
-            fny,
-            fsw,
-            ftau,
+            fswx,
+            fswy,
+            taus,
             omega,
             interp,
             is_h,
@@ -1344,12 +1331,10 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ref sys,
         ref jacs,
         ref invd,
-        ref fvl,
         ref fnbr,
-        ref fnx,
-        ref fny,
-        ref fsw,
-        ref ftau,
+        ref fswx,
+        ref fswy,
+        ref taus,
         ref omega,
         ref interp,
         ref is_h,
@@ -1468,8 +1453,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             let l = $l;
             module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
             module.operator::<f64, G>(
-                &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
-                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
+                &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, $dst,
             )?;
         }};
     }
@@ -1483,8 +1468,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             let l = $l;
             module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], &xb[l], rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
             module.operator_jacobi::<f64, G>(
-                &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
-                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, &bb[l], &invd[l], omega[l], &mut sm[l],
+                &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l], omega[l], &mut sm[l],
             )?;
             std::mem::swap(&mut xb[l], &mut sm[l]);
         }};
@@ -1505,8 +1490,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ($src:expr, $dst:expr) => {{
             module.gradient::<f64, f64>(&stream, mvcfg[0].0, &dl[0], $src, rxs[0], sys[0], n1v[0], nev[0], &mut gx0, &mut gy0)?;
             module.operator::<f64, f64>(
-                &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], n1v[0], nev[0], rxs[0], sys[0], jacs[0],
-                &fvl[0], &fnx[0], &fny[0], &fsw[0], &fnbr[0], &ftau[0], reaction, $dst,
+                &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], &fswx[0], &fswy[0], n1v[0], nev[0],
+                rxs[0], sys[0], jacs[0], &fnbr[0], taus[0], reaction, $dst,
             )?;
         }};
     }
@@ -1515,8 +1500,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             let l = $l;
             module.gradient::<f64, f64>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxc, &mut gyc)?;
             module.operator::<f64, f64>(
-                &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l],
-                &fvl[l], &fnx[l], &fny[l], &fsw[l], &fnbr[l], &ftau[l], reaction, $dst,
+                &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, $dst,
             )?;
         }};
     }
@@ -1798,12 +1783,9 @@ pub fn bench_poisson_kernels(
 
     let d_dev = up(&ma.diff)?;
     let mass_dev = up(&ma.mass)?;
-    let fvl_dev = upu(&ma.fvl)?;
-    let fnx_dev = up(&ma.fnx)?;
-    let fny_dev = up(&ma.fny)?;
-    let fsw_dev = up(&ma.fsw)?;
+    let fswx_dev = up(&ma.fswx)?;
+    let fswy_dev = up(&ma.fswy)?;
     let fnbr_dev = upu(&ma.fnbr)?;
-    let ftau_dev = up(&ma.ftau)?;
 
     let u_dev = up(&vec![1.0f64; ndof])?;
     let x_dev0 = up(&vec![0.5f64; ndof])?;
@@ -1847,8 +1829,8 @@ pub fn bench_poisson_kernels(
     });
     let op_ms = timed!({
         module.operator::<f64, f64>(
-            &stream, ocfg, &d_dev, &u_dev, &gx, &gy, &mass_dev, n1, nev, ma.rx, ma.sy, ma.jac,
-            &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ftau_dev, 0.0, &mut out,
+            &stream, ocfg, &d_dev, &u_dev, &gx, &gy, &mass_dev, &fswx_dev, &fswy_dev, n1, nev,
+            ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, 0.0, &mut out,
         )?;
     });
     let axpy_ms = timed!({
@@ -1977,12 +1959,9 @@ pub fn pcie_crossover(p: usize, reps: u32) -> Result<(), Box<dyn std::error::Err
         let upu = |v: &[u32]| DeviceBuffer::from_host(&stream0, v);
         let d = up(&ma.diff)?;
         let mass = up(&ma.mass)?;
-        let fvl = upu(&ma.fvl)?;
-        let fnx = up(&ma.fnx)?;
-        let fny = up(&ma.fny)?;
-        let fsw = up(&ma.fsw)?;
+        let fswx = up(&ma.fswx)?;
+        let fswy = up(&ma.fswy)?;
         let fnbr = upu(&ma.fnbr)?;
-        let ftau = up(&ma.ftau)?;
         let u = up(&vec![1.0; ndof])?;
         let mut gx = DeviceBuffer::<f64>::zeroed(&stream0, ndof)?;
         let mut gy = DeviceBuffer::<f64>::zeroed(&stream0, ndof)?;
@@ -1992,8 +1971,8 @@ pub fn pcie_crossover(p: usize, reps: u32) -> Result<(), Box<dyn std::error::Err
         let mut matvec = || -> Result<(), DriverError> {
             module.gradient::<f64, f64>(&stream0, gcfg, &d, &u, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
             module.operator::<f64, f64>(
-                &stream0, ocfg, &d, &u, &gx, &gy, &mass, n1, nev, ma.rx, ma.sy, ma.jac,
-                &fvl, &fnx, &fny, &fsw, &fnbr, &ftau, 0.0, &mut out,
+                &stream0, ocfg, &d, &u, &gx, &gy, &mass, &fswx, &fswy, n1, nev, ma.rx, ma.sy, ma.jac,
+                &fnbr, ma.tau, 0.0, &mut out,
             )
         };
         for _ in 0..3 {
@@ -2051,8 +2030,6 @@ pub fn multigpu_poisson_matvec_2d(
     // Global affine metrics + shared arrays (identical on both GPUs).
     let glob = flatten_mesh(mesh, alpha, neumann_tags);
     let (rx, sy, jac) = (glob.rx, glob.sy, glob.jac);
-    let p1f = (mesh.order + 1) as f64;
-    let h: Vec<f64> = mesh.elements.iter().map(|el| el.geom.jw.iter().sum::<f64>().sqrt()).collect();
 
     // Element → GPU ownership (framework block decomposition).
     let device = Device::MultiGpu { ordinals: vec![0, 1], partition: Partition::Blocks };
@@ -2071,45 +2048,28 @@ pub fn multigpu_poisson_matvec_2d(
     // halo slot, or the BND/NEU sentinels), exactly mirroring flatten_mesh but partition-aware.
     struct Part {
         global: Vec<usize>,
-        fvl: Vec<u32>,
-        fnx: Vec<f64>,
-        fny: Vec<f64>,
-        fsw: Vec<f64>,
         fnbr: Vec<u32>,
-        ftau: Vec<f64>,
         halo_src: Vec<u32>, // per halo slot: source node index in the OTHER GPU's local buffer
     }
+    // Affine face metadata is global (same for both partitions): the per-direction 1D surface
+    // weights + scalar penalty come from the global flatten (`glob`); only `fnbr` (now halo-aware)
+    // is per-partition. The kernel derives the normals closed-form. (`p1f`/`h` no longer needed.)
     let build = |g: usize| -> Part {
         let locals = &global_of[g];
         let nl = locals.len();
         let nldof = nl * nn;
-        let mut p = Part {
-            global: locals.clone(),
-            fvl: vec![0; nl * 4 * n1u],
-            fnx: vec![0.0; nl * 4 * n1u],
-            fny: vec![0.0; nl * 4 * n1u],
-            fsw: vec![0.0; nl * 4 * n1u],
-            fnbr: vec![BND; nl * 4 * n1u],
-            ftau: vec![0.0; nl * 4],
-            halo_src: vec![],
-        };
+        let mut p = Part { global: locals.clone(), fnbr: vec![BND; nl * 4 * n1u], halo_src: vec![] };
         for (le, &e) in locals.iter().enumerate() {
             let el = &mesh.elements[e];
             for (t, edge) in Edge::ALL.iter().enumerate() {
-                let face = &el.faces[*edge as usize];
                 let nb = &el.neighbors[*edge as usize];
-                p.ftau[le * 4 + t] = match nb {
-                    Neighbor::Interior { elem: re, .. } => alpha * p1f * p1f / h[e].min(h[*re]),
-                    Neighbor::Boundary { .. } => alpha * p1f * p1f / h[e],
-                    _ => unreachable!("non-conforming mesh unsupported in the distributed matvec"),
-                };
+                assert!(
+                    !matches!(nb, Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. }),
+                    "non-conforming mesh unsupported in the distributed matvec"
+                );
                 let neu = matches!(nb, Neighbor::Boundary { tag } if neumann_tags.contains(tag));
                 for a in 0..n1u {
                     let idx = (le * 4 + t) * n1u + a;
-                    p.fvl[idx] = face.nodes[a] as u32;
-                    p.fnx[idx] = face.nx[a];
-                    p.fny[idx] = face.ny[a];
-                    p.fsw[idx] = face.sw[a];
                     if let Neighbor::Interior { elem: re, edge: redge, perm } = nb {
                         let rnode = mesh.elements[*re].faces[*redge as usize].nodes[perm[a]];
                         if parts[*re] == g {
@@ -2154,12 +2114,10 @@ pub fn multigpu_poisson_matvec_2d(
         out: DeviceBuffer<f64>,
         d: DeviceBuffer<f64>,
         mass: DeviceBuffer<f64>,
-        fvl: DeviceBuffer<u32>,
-        fnx: DeviceBuffer<f64>,
-        fny: DeviceBuffer<f64>,
-        fsw: DeviceBuffer<f64>,
+        fswx: DeviceBuffer<f64>,
+        fswy: DeviceBuffer<f64>,
         fnbr: DeviceBuffer<u32>,
-        ftau: DeviceBuffer<f64>,
+        tau: f64,
         sendidx: DeviceBuffer<u32>, // OTHER GPU's halo_src (nodes this GPU sends)
         packed: DeviceBuffer<f64>,  // gathered send buffer, len = other GPU's halo
         gcfg: LaunchConfig,
@@ -2189,12 +2147,10 @@ pub fn multigpu_poisson_matvec_2d(
             out: DeviceBuffer::<f64>::zeroed(&stream, nldof)?,
             d: up(&glob.diff)?,
             mass: up(&glob.mass)?,
-            fvl: upu(&p.fvl)?,
-            fnx: up(&p.fnx)?,
-            fny: up(&p.fny)?,
-            fsw: up(&p.fsw)?,
+            fswx: up(&glob.fswx)?,
+            fswy: up(&glob.fswy)?,
             fnbr: upu(&p.fnbr)?,
-            ftau: up(&p.ftau)?,
+            tau: glob.tau,
             sendidx: upu(&pd[1 - g].halo_src)?, // the other GPU's halo references THIS GPU's nodes
             packed: DeviceBuffer::<f64>::zeroed(&stream, other_halo.max(1))?,
             module: kernels::load(ctx)?,
@@ -2272,8 +2228,8 @@ pub fn multigpu_poisson_matvec_2d(
         ctxs[g].bind_to_thread()?;
         let gp = &mut gpus[g];
         gp.module.operator::<f64, f64>(
-            &gp.stream, gp.ocfg, &gp.d, &gp.u, &gp.gx, &gp.gy, &gp.mass, n1, gp.nl as u32, rx, sy, jac,
-            &gp.fvl, &gp.fnx, &gp.fny, &gp.fsw, &gp.fnbr, &gp.ftau, reaction, &mut gp.out,
+            &gp.stream, gp.ocfg, &gp.d, &gp.u, &gp.gx, &gp.gy, &gp.mass, &gp.fswx, &gp.fswy, n1, gp.nl as u32,
+            rx, sy, jac, &gp.fnbr, gp.tau, reaction, &mut gp.out,
         )?;
         let local_out = gp.out.to_host_vec(&gp.stream)?;
         for (le, &e) in pd[g].global.iter().enumerate() {
@@ -2309,11 +2265,9 @@ pub struct GpuPoisson {
     rx: f64,                     // affine metric scalars (uniform axis-aligned rect mesh)
     sy: f64,
     jac: f64,
-    fvl_dev: DeviceBuffer<u32>,
-    fnx_dev: DeviceBuffer<f64>,
-    fny_dev: DeviceBuffer<f64>,
-    fsw_dev: DeviceBuffer<f64>,
-    ftau_dev: DeviceBuffer<f64>,
+    fswx_dev: DeviceBuffer<f64>,
+    fswy_dev: DeviceBuffer<f64>,
+    tau: f64,
     // host state to rebuild the per-region `fnbr` cheaply (base = all-Dirichlet; flip the
     // listed boundary-face nodes to NEU when their tag is in `neumann_tags`).
     fnbr_base: Vec<u32>,
@@ -2329,7 +2283,6 @@ impl GpuPoisson {
         let ctx = CudaContext::new(0)?;
         let stream = ctx.default_stream();
         let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
-        let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
 
         // Boundary-face nodes and their tags, in the same flat order flatten_mesh uses, so
         // a per-region solve only flips these few entries to NEU (no mesh walk per solve).
@@ -2355,11 +2308,9 @@ impl GpuPoisson {
             rx: ma.rx,
             sy: ma.sy,
             jac: ma.jac,
-            fvl_dev: upu(&ma.fvl)?,
-            fnx_dev: up(&ma.fnx)?,
-            fny_dev: up(&ma.fny)?,
-            fsw_dev: up(&ma.fsw)?,
-            ftau_dev: up(&ma.ftau)?,
+            fswx_dev: up(&ma.fswx)?,
+            fswy_dev: up(&ma.fswy)?,
+            tau: ma.tau,
             fnbr_base: ma.fnbr,
             bnodes,
             stream,
@@ -2452,8 +2403,8 @@ impl GpuPoisson {
             ($field:expr, $dst:expr) => {{
                 module.gradient::<f64, f64>(stream, gcfg, &self.d_dev, $field, self.rx, self.sy, n1, nev, &mut gx, &mut gy)?;
                 module.operator::<f64, f64>(
-                    stream, ocfg, &self.d_dev, $field, &gx, &gy, &self.mass_dev, n1, nev, self.rx, self.sy, self.jac,
-                    &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, &fnbr_dev, &self.ftau_dev, reaction, $dst,
+                    stream, ocfg, &self.d_dev, $field, &gx, &gy, &self.mass_dev, &self.fswx_dev, &self.fswy_dev, n1, nev,
+                    self.rx, self.sy, self.jac, &fnbr_dev, self.tau, reaction, $dst,
                 )?;
             }};
         }
