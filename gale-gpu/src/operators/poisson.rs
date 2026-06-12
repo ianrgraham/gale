@@ -512,7 +512,15 @@ mod kernels {
     #[kernel]
     pub fn cg_alpha(rs: &[f64], pap: &[f64], mut alpha: DisjointSlice<f64>, mut nalpha: DisjointSlice<f64>) {
         if thread::threadIdx_x() == 0 {
+            // CG breakdown guard: a singular operator (e.g. the deflated pure-Neumann pressure on
+            // a tiny coarsest level whose only mode IS the deflated-out constant) can drive
+            // p·Ap → 0 once the in-range residual is exhausted, so rs/pAp becomes 0/0 = NaN (or
+            // x/0 = Inf). That poisons z through the V-cycle and the whole solve diverges. A
+            // non-finite ratio means the iteration has effectively converged in this subspace, so
+            // take α = 0 (no update) instead. Harmless for non-singular Helmholtz: p·Ap > 0 until
+            // true convergence, where rs → 0 too, and α = 0 is correct.
             let a = rs[0] / pap[0];
+            let a = if a.is_finite() { a } else { 0.0 };
             unsafe {
                 *alpha.get_unchecked_mut(0) = a;
                 *nalpha.get_unchecked_mut(0) = -a;
@@ -528,7 +536,11 @@ mod kernels {
             let rn = rs_new[0];
             unsafe {
                 let ro = *rs.get_unchecked_mut(0);
-                *beta.get_unchecked_mut(0) = rn / ro;
+                // Breakdown guard (see cg_alpha): if the prior residual scalar ro → 0 the solve
+                // has converged in this subspace; β = rn/ro = NaN/Inf would poison the search
+                // direction, so take β = 0 (restart p = z) instead.
+                let b = rn / ro;
+                *beta.get_unchecked_mut(0) = if b.is_finite() { b } else { 0.0 };
                 *rs.get_unchecked_mut(0) = rn;
             }
         }
@@ -1643,6 +1655,12 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         iters = it + 1;
         dot_to!(&pres, &pres, n0, &mut d_rr);
         rel = d_rr.to_host_vec(&stream)?[0].sqrt() / bn;
+        // Defensive: a non-finite residual (should not occur now the cg_alpha/cg_beta breakdown
+        // guards are in place) would make `rel < tol` false forever and grind the full maxit, so
+        // bail immediately and let warn_unconverged report it rather than burn 20000 iterations.
+        if !rel.is_finite() {
+            break;
+        }
         if rel < tol {
             converged = true;
             break;

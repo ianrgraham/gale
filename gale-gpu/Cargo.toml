@@ -200,6 +200,11 @@ path = "src/bin/roofline_poisson.rs"
 name = "mg-wallclock-bench"
 path = "src/bin/mg_wallclock_bench.rs"
 
+# CUDA-graph A/B — V-cycle graph capture/replay vs launch-per-iter (launch-bound remediation).
+[[bin]]
+name = "mg-graph-bench"
+path = "src/bin/mg_graph_bench.rs"
+
 # Minimal single MG-PCG solve — clean target for Nsight (nsys timeline / ncu per-kernel).
 [[bin]]
 name = "mg-profile"
