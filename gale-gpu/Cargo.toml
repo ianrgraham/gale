@@ -2,6 +2,7 @@
 name = "gale-gpu"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 # GPU device-code + host launch wrappers for gale's DG operators. Built ONLY via
 # `cargo oxide` (it contains `#[cuda_module]` device code the cuda-oxide codegen

@@ -107,7 +107,7 @@ cd book && mdbook serve --open
 
 ## License
 
-See repository for license details.
+Licensed under the [MIT License](LICENSE).
 
 ---
 
