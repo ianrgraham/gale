@@ -94,6 +94,15 @@ impl RigidBody {
     pub fn ellipse(cx: f64, cy: f64, a: f64, b: f64, phi: f64) -> Self {
         Self { shape: Shape::Ellipse { a, b }, cx, cy, phi, u: 0.0, v: 0.0, omega: 0.0, smooth: 0.0 }
     }
+
+    /// Bounding radius (for short-range contact/repulsion between bodies and with walls):
+    /// the disk radius, or the ellipse semi-major axis.
+    pub fn radius(&self) -> f64 {
+        match self.shape {
+            Shape::Disk { r } => r,
+            Shape::Ellipse { a, b } => a.max(b),
+        }
+    }
 }
 
 impl ImmersedSolid for RigidBody {
@@ -385,6 +394,155 @@ impl FreeBody {
     }
 }
 
+/// A **suspension** of freely-moving rigid bodies (M4 — many-body particle-laden flow).
+/// Holds the bodies plus the short-range interaction model (Glowinski roughness
+/// repulsion + optional subgrid lubrication) that keeps them from interpenetrating where
+/// the mesh can't resolve the gap. The fluid sees one **combined** penalization mask (the
+/// union of all bodies); each body's hydrodynamic force/torque is recovered over its OWN
+/// region, then composed with the inter-body forces. See
+/// `docs/research-moving-particle-coupling.md`.
+#[derive(Clone, Debug)]
+pub struct Suspension {
+    /// The freely-moving bodies.
+    pub bodies: Vec<FreeBody>,
+    /// Penalization parameter for the combined mask (shared across bodies).
+    pub eta_b: f64,
+    /// Repulsion stiffness `k` (Glowinski roughness model). Larger ⇒ stiffer contact.
+    pub rep_k: f64,
+    /// Repulsion activation range `ρ` (a safety band, ~one element width): the force
+    /// switches on when the surface gap drops below `ρ` and grows as `((ρ−gap)/ρ)²`.
+    pub rep_range: f64,
+    /// Subgrid lubrication coefficient `c_lub` (resists approach as `−c_lub·ḋ/gap` for
+    /// small gaps). `0` ⇒ disabled (the repulsion alone prevents overlap).
+    pub lub_c: f64,
+    /// Domain box `([x0,x1],[y0,y1])` for wall repulsion; `None` ⇒ no wall forces.
+    pub domain: Option<([f64; 2], [f64; 2])>,
+    /// Smallest surface–surface gap seen over the trajectory so far (driver updates it each
+    /// step; lets a caller read the closest approach after one `run(nsteps)`). `+∞` until set.
+    pub min_gap_seen: f64,
+}
+
+impl Suspension {
+    /// Build a suspension from `bodies` with penalization `eta_b`, repulsion `(k, range)`,
+    /// no lubrication and no wall forces (add via the builders).
+    pub fn new(bodies: Vec<FreeBody>, eta_b: f64, rep_k: f64, rep_range: f64) -> Self {
+        Self { bodies, eta_b, rep_k, rep_range, lub_c: 0.0, domain: None, min_gap_seen: f64::INFINITY }
+    }
+
+    /// Record the current closest-approach gap into [`min_gap_seen`](Self::min_gap_seen) —
+    /// the driver hook calls this each step so the trajectory minimum is available after a
+    /// single `Simulation::run(nsteps)` (no per-step host round-trip needed).
+    pub fn track_min_gap(&mut self) {
+        self.min_gap_seen = self.min_gap_seen.min(self.min_pair_gap());
+    }
+
+    /// Enable wall repulsion against the box `([x0,x1],[y0,y1])`. Builder.
+    pub fn with_walls(mut self, x: [f64; 2], y: [f64; 2]) -> Self {
+        self.domain = Some((x, y));
+        self
+    }
+
+    /// Enable subgrid lubrication with coefficient `c_lub`. Builder.
+    pub fn with_lubrication(mut self, c_lub: f64) -> Self {
+        self.lub_c = c_lub;
+        self
+    }
+
+    /// The **combined** volume-penalization mask: at each node, the union indicator
+    /// `max_b χ_b` and the rigid velocity of the body that owns it (the one with the
+    /// largest indicator there). One mask drives the fluid no-slip for all bodies at once.
+    pub fn combined_penalization(&self, mesh: &Mesh2d) -> VolumePenalization {
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let mut mask = vec![0.0; ndof];
+        let mut us_x = vec![0.0; ndof];
+        let mut us_y = vec![0.0; ndof];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let (x, y) = (el.geom.x[k], el.geom.y[k]);
+                let i = e * nn + k;
+                let (mut best, mut vel) = (0.0, (0.0, 0.0));
+                for fb in &self.bodies {
+                    let chi = fb.body.indicator(x, y);
+                    if chi > best {
+                        best = chi;
+                        vel = fb.body.velocity(x, y);
+                    }
+                }
+                mask[i] = best;
+                us_x[i] = vel.0;
+                us_y[i] = vel.1;
+            }
+        }
+        VolumePenalization { mask, us_x, us_y, eta_b: self.eta_b }
+    }
+
+    /// Short-range inter-body + wall **repulsion** force per body (Glowinski roughness
+    /// model): for a center–center distance `d` below the activation distance
+    /// `R_i+R_j+ρ`, a force `k·((s−d)/ρ)²` along the line of centers pushes the pair
+    /// apart (Newton's third law: `+F` on `i`, `−F` on `j`); walls repel likewise. With
+    /// `lub_c>0`, a lubrication damping `−c_lub·(approach speed)/max(gap,ρ/10)` is added
+    /// along the line of centers for near-contact pairs. Disks/ellipses use the bounding
+    /// radius. Returns `(Fx, Fy)` per body — fold into the body's external force.
+    pub fn repulsion(&self) -> Vec<(f64, f64)> {
+        let n = self.bodies.len();
+        let mut f = vec![(0.0, 0.0); n];
+        let (k, rho) = (self.rep_k, self.rep_range);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let bi = &self.bodies[i].body;
+                let bj = &self.bodies[j].body;
+                let (dx, dy) = (bi.cx - bj.cx, bi.cy - bj.cy);
+                let d = (dx * dx + dy * dy).sqrt().max(1e-12);
+                let s = bi.radius() + bj.radius() + rho;
+                if d < s {
+                    let (nx, ny) = (dx / d, dy / d); // unit line-of-centers, i ← j
+                    let mut mag = k * ((s - d) / rho).powi(2);
+                    if self.lub_c > 0.0 {
+                        // Approach speed (closing ⇒ positive) ⇒ damping resists it.
+                        let (rvx, rvy) = (bi.u - bj.u, bi.v - bj.v);
+                        let approach = -(rvx * nx + rvy * ny);
+                        let gap = (d - bi.radius() - bj.radius()).max(rho / 10.0);
+                        mag += self.lub_c * approach / gap;
+                    }
+                    f[i].0 += mag * nx;
+                    f[i].1 += mag * ny;
+                    f[j].0 -= mag * nx;
+                    f[j].1 -= mag * ny;
+                }
+            }
+        }
+        if let Some(([x0, x1], [y0, y1])) = self.domain {
+            for i in 0..n {
+                let b = &self.bodies[i].body;
+                let r = b.radius();
+                let wall = |gap: f64| if gap < rho { k * ((rho - gap) / rho).powi(2) } else { 0.0 };
+                f[i].0 += wall((b.cx - r) - x0); // left
+                f[i].0 -= wall(x1 - (b.cx + r)); // right
+                f[i].1 += wall((b.cy - r) - y0); // bottom
+                f[i].1 -= wall(y1 - (b.cy + r)); // top
+            }
+        }
+        f
+    }
+
+    /// Minimum surface–surface gap between any two bodies (`> 0` ⇒ no interpenetration;
+    /// `∞` for fewer than two bodies). Diagnostic for the no-overlap guarantee.
+    pub fn min_pair_gap(&self) -> f64 {
+        let n = self.bodies.len();
+        let mut g = f64::INFINITY;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let bi = &self.bodies[i].body;
+                let bj = &self.bodies[j].body;
+                let d = (bi.cx - bj.cx).hypot(bi.cy - bj.cy);
+                g = g.min(d - bi.radius() - bj.radius());
+            }
+        }
+        g
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +804,39 @@ mod tests {
         assert!((fb.body.cx - (0.5 + dt * want_u)).abs() < 1e-15);
         assert!((fb.body.cy - (0.5 + dt * want_v)).abs() < 1e-15);
         assert!((fb.body.phi - dt * want_w).abs() < 1e-15);
+    }
+
+    #[test]
+    fn suspension_repulsion_separates_close_bodies_and_respects_range() {
+        // Glowinski roughness repulsion: far-apart disks feel nothing; disks within the
+        // activation band feel an equal-and-opposite force along the line of centers
+        // pushing them apart; a disk near a wall is pushed inward.
+        let far = Suspension::new(
+            vec![FreeBody::disk(0.2, 0.5, 0.1, 1.0, 1e-3), FreeBody::disk(0.8, 0.5, 0.1, 1.0, 1e-3)],
+            1e-3, 50.0, 0.05,
+        );
+        let f = far.repulsion();
+        assert_eq!(f, vec![(0.0, 0.0), (0.0, 0.0)], "far bodies must not repel");
+        assert!(far.min_pair_gap() > 0.0, "far gap should be positive");
+
+        // Centers 0.45 & 0.55 (dist 0.10), radii 0.1 ⇒ surface gap −0.1 (overlapping) ⇒
+        // strong repulsion: body 0 pushed −x, body 1 pushed +x, equal and opposite.
+        let near = Suspension::new(
+            vec![FreeBody::disk(0.45, 0.5, 0.1, 1.0, 1e-3), FreeBody::disk(0.55, 0.5, 0.1, 1.0, 1e-3)],
+            1e-3, 50.0, 0.05,
+        );
+        let f = near.repulsion();
+        assert!(f[0].0 < 0.0 && f[1].0 > 0.0, "repulsion must push apart: {f:?}");
+        assert!((f[0].0 + f[1].0).abs() < 1e-12, "must be equal and opposite");
+        assert!(f[0].1.abs() < 1e-12 && f[1].1.abs() < 1e-12, "on-axis ⇒ no y force");
+        assert!(near.min_pair_gap() < 0.0, "overlapping ⇒ negative gap");
+
+        // Disk hugging the left wall x=0 (center 0.12, r=0.1 ⇒ wall gap 0.02 < range) is
+        // pushed in +x.
+        let wall = Suspension::new(vec![FreeBody::disk(0.12, 0.5, 0.1, 1.0, 1e-3)], 1e-3, 50.0, 0.05)
+            .with_walls([0.0, 1.0], [0.0, 1.0]);
+        let f = wall.repulsion();
+        assert!(f[0].0 > 0.0 && f[0].1.abs() < 1e-12, "wall should push inward (+x): {:?}", f[0]);
     }
 
     #[test]

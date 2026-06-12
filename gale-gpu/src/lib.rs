@@ -39,8 +39,8 @@ pub use flow::{
 };
 pub use flow3d::{GpuDualSplitting3d, GpuStokes3d, GpuViscoelasticDualSplitting3d};
 pub use immersed::{
-    penalize3d_apply, penalize_apply, GpuMovingPenalizationHook, GpuPenalization3dHook,
-    GpuPenalizationHook,
+    penalize3d_apply, penalize_apply, GpuMovingPenalizationHook, GpuMultiMovingPenalizationHook,
+    GpuPenalization3dHook, GpuPenalizationHook,
 };
 pub use operators::advection::{advection_rhs, GpuAdvection};
 pub use operators::advection3d::advection3d_rhs;

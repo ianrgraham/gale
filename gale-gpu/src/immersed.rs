@@ -201,6 +201,116 @@ impl gale::sim::StateStageHook for GpuMovingPenalizationHook {
     }
 }
 
+/// **Many-body** moving volume-penalization stage hook for the GPU flow integrators
+/// (M4 — particle-laden suspension). GPU twin of `gale::sim::MultiMovingPenalizationHook`:
+/// drives a whole `gale::dg::Suspension`, imprinting all bodies through one combined mask
+/// on the GPU each step, recovering per-body force/torque, applying short-range
+/// repulsion/lubrication, and advancing every body (explicit or strong). Only the
+/// combined-mask penalize runs on the GPU; force recovery, repulsion, the per-body
+/// Newton-Euler / implicit solve, and pose updates are the shared `gale` host code ⇒ the
+/// trajectory matches the CPU oracle bit-for-bit.
+pub struct GpuMultiMovingPenalizationHook {
+    velocity: gale::sim::FieldId,
+    dt: f64,
+    susp: gale::sim::SuspensionHandle,
+    penal: std::cell::RefCell<VolumePenalization>,
+    base_fext: Vec<(f64, f64)>,
+    strong: bool,
+}
+
+impl GpuMultiMovingPenalizationHook {
+    /// Build the hook for a `suspension` penalizing `velocity` over step `dt`. Returns the
+    /// hook plus a `SuspensionHandle` for reading bodies / contact gap after the run.
+    /// Defaults to EXPLICIT coupling; call [`strong`](Self::strong) for strong (implicit).
+    pub fn new(
+        velocity: gale::sim::FieldId,
+        suspension: gale::dg::Suspension,
+        mesh: &Mesh2d,
+        dt: f64,
+    ) -> (Self, gale::sim::SuspensionHandle) {
+        let penal = suspension.combined_penalization(mesh);
+        let base_fext = suspension.bodies.iter().map(|b| b.fext).collect();
+        let handle: gale::sim::SuspensionHandle = std::rc::Rc::new(std::cell::RefCell::new(suspension));
+        (Self { velocity, dt, susp: handle.clone(), penal: std::cell::RefCell::new(penal), base_fext, strong: false }, handle)
+    }
+
+    /// Enable strong (implicit) per-body coupling (light/neutrally-buoyant particles).
+    pub fn strong(mut self, strong: bool) -> Self {
+        self.strong = strong;
+        self
+    }
+}
+
+impl gale::sim::StateStageHook for GpuMultiMovingPenalizationHook {
+    fn after_stage(&self, state: &mut gale::sim::State, stage: usize) {
+        if stage != 0 {
+            return;
+        }
+        let mesh = state.mesh.clone();
+        let mut susp = self.susp.borrow_mut();
+        let mut penal = self.penal.borrow_mut();
+        let nb = susp.bodies.len();
+        let rep = susp.repulsion();
+        for b in 0..nb {
+            susp.bodies[b].fext = (self.base_fext[b].0 + rep[b].0, self.base_fext[b].1 + rep[b].1);
+        }
+        if self.strong {
+            let newvel: Vec<(f64, f64, f64)> = {
+                let v = state.fields.by_id(self.velocity);
+                let (ux, uy) = (v.component(0), v.component(1));
+                (0..nb)
+                    .map(|b| {
+                        let pb = susp.bodies[b].penalization(&mesh);
+                        susp.bodies[b].strong_solve(ux, uy, &mesh, &pb, self.dt)
+                    })
+                    .collect()
+            };
+            for b in 0..nb {
+                susp.bodies[b].body.u = newvel[b].0;
+                susp.bodies[b].body.v = newvel[b].1;
+                susp.bodies[b].body.omega = newvel[b].2;
+            }
+            *penal = susp.combined_penalization(&mesh);
+            {
+                let comps = state.fields.by_id_mut(self.velocity).components_mut();
+                let (ux, uy) = comps.split_at_mut(1);
+                penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
+                    .expect("gale-gpu: GpuMultiMovingPenalizationHook penalize_apply (strong) failed");
+            }
+            for b in 0..nb {
+                let (u, vv, om) = newvel[b];
+                susp.bodies[b].body.cx += self.dt * u;
+                susp.bodies[b].body.cy += self.dt * vv;
+                susp.bodies[b].body.phi += self.dt * om;
+            }
+        } else {
+            {
+                let comps = state.fields.by_id_mut(self.velocity).components_mut();
+                let (ux, uy) = comps.split_at_mut(1);
+                penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
+                    .expect("gale-gpu: GpuMultiMovingPenalizationHook penalize_apply failed");
+            }
+            let ft: Vec<(f64, f64, f64)> = {
+                let v = state.fields.by_id(self.velocity);
+                let (ux, uy) = (v.component(0), v.component(1));
+                (0..nb)
+                    .map(|b| {
+                        let pb = susp.bodies[b].penalization(&mesh);
+                        let (cx, cy) = (susp.bodies[b].body.cx, susp.bodies[b].body.cy);
+                        pb.force_torque(ux, uy, &mesh, cx, cy)
+                    })
+                    .collect()
+            };
+            for b in 0..nb {
+                let (fx, fy, tq) = ft[b];
+                susp.bodies[b].advance(fx, fy, tq, self.dt);
+            }
+        }
+        susp.track_min_gap(); // record closest approach (poses final for this step)
+        *penal = susp.combined_penalization(&mesh);
+    }
+}
+
 // ===== 3D volume penalization ====================================================
 
 #[cuda_module]

@@ -31,8 +31,8 @@ pub use dynamics::{
 };
 pub use field::{Field, FieldId, FieldSet};
 pub use ibm::{
-    BodyHandle, MovingPenalizationHook, Penalization3dDrag, Penalization3dHook, PenalizationDrag,
-    PenalizationHook,
+    BodyHandle, MovingPenalizationHook, MultiMovingPenalizationHook, Penalization3dDrag,
+    Penalization3dHook, PenalizationDrag, PenalizationHook, SuspensionHandle,
 };
 pub use integrate::{ClosureSemi, Integrator, NoHook, Semi, SspRk3, StageHook};
 pub use simulation::{

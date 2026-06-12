@@ -14,7 +14,7 @@ use super::dynamics::StateStageHook;
 use super::field::FieldId;
 use super::simulation::Compute;
 use super::state::State;
-use crate::dg::immersed::{FreeBody, VolumePenalization};
+use crate::dg::immersed::{FreeBody, Suspension, VolumePenalization};
 use crate::dg::immersed3d::VolumePenalization3d;
 use crate::dg::mesh3d::Mesh3d;
 use std::cell::RefCell;
@@ -161,6 +161,124 @@ impl StateStageHook for MovingPenalizationHook {
             body.advance(fx, fy, tq, self.dt);
         }
         *penal = body.penalization(&mesh); // rebuild mask for the new pose (next step)
+    }
+}
+
+/// Shared, mutable handle to a [`Suspension`] — the many-body trajectory + contact state.
+/// The [`MultiMovingPenalizationHook`] (and GPU twin) own a clone and advance it each
+/// step; the caller keeps a clone to read body poses / `min_pair_gap` after the run.
+pub type SuspensionHandle = Rc<RefCell<Suspension>>;
+
+/// **Many-body** moving volume-penalization stage hook (M4 — particle-laden suspension).
+/// Drives a whole [`Suspension`]: each step it imprints all bodies through ONE combined
+/// mask, recovers each body's hydrodynamic force/torque over its own region, adds the
+/// short-range repulsion / lubrication (which prevents interpenetration where the mesh
+/// can't resolve the gap), and advances every body — explicit (M1) or strong (M3) per
+/// body. CPU oracle for `gale_gpu::GpuMultiMovingPenalizationHook`.
+pub struct MultiMovingPenalizationHook {
+    velocity: FieldId,
+    dt: f64,
+    susp: SuspensionHandle,
+    /// Combined penalization for all bodies' current poses; rebuilt each step.
+    penal: RefCell<VolumePenalization>,
+    /// Per-body base external force (e.g. gravity), captured at build; repulsion is added
+    /// on top each step so it never overwrites the base.
+    base_fext: Vec<(f64, f64)>,
+    strong: bool,
+}
+
+impl MultiMovingPenalizationHook {
+    /// Build the hook for a `suspension` penalizing the 2-component `velocity` field over
+    /// step `dt`. Returns the hook plus a [`SuspensionHandle`] for reading the bodies /
+    /// contact gap after the run. Defaults to EXPLICIT coupling; call
+    /// [`strong`](Self::strong) for strong (implicit) per-body coupling (light particles).
+    pub fn new(
+        velocity: FieldId,
+        suspension: Suspension,
+        mesh: &crate::dg::Mesh2d,
+        dt: f64,
+    ) -> (Self, SuspensionHandle) {
+        let penal = suspension.combined_penalization(mesh);
+        let base_fext = suspension.bodies.iter().map(|b| b.fext).collect();
+        let handle: SuspensionHandle = Rc::new(RefCell::new(suspension));
+        (Self { velocity, dt, susp: handle.clone(), penal: RefCell::new(penal), base_fext, strong: false }, handle)
+    }
+
+    /// Enable strong (implicit) per-body coupling (light/neutrally-buoyant particles).
+    pub fn strong(mut self, strong: bool) -> Self {
+        self.strong = strong;
+        self
+    }
+}
+
+impl StateStageHook for MultiMovingPenalizationHook {
+    fn after_stage(&self, state: &mut State, stage: usize) {
+        if stage != 0 {
+            return;
+        }
+        let mesh = state.mesh.clone();
+        let mut susp = self.susp.borrow_mut();
+        let mut penal = self.penal.borrow_mut();
+        let nb = susp.bodies.len();
+        // Inter-body + wall repulsion (current poses) folded onto the base external force.
+        let rep = susp.repulsion();
+        for b in 0..nb {
+            susp.bodies[b].fext = (self.base_fext[b].0 + rep[b].0, self.base_fext[b].1 + rep[b].1);
+        }
+        if self.strong {
+            // Per-body implicit solve on the predictor u* (block-Jacobi over bodies).
+            let newvel: Vec<(f64, f64, f64)> = {
+                let v = state.fields.by_id(self.velocity);
+                let (ux, uy) = (v.component(0), v.component(1));
+                (0..nb)
+                    .map(|b| {
+                        let pb = susp.bodies[b].penalization(&mesh);
+                        susp.bodies[b].strong_solve(ux, uy, &mesh, &pb, self.dt)
+                    })
+                    .collect()
+            };
+            for b in 0..nb {
+                susp.bodies[b].body.u = newvel[b].0;
+                susp.bodies[b].body.v = newvel[b].1;
+                susp.bodies[b].body.omega = newvel[b].2;
+            }
+            *penal = susp.combined_penalization(&mesh); // new velocities, current poses
+            {
+                let comps = state.fields.by_id_mut(self.velocity).components_mut();
+                let (ux, uy) = comps.split_at_mut(1);
+                penal.apply(&mut ux[0], &mut uy[0], self.dt);
+            }
+            for b in 0..nb {
+                let (u, vv, om) = newvel[b];
+                susp.bodies[b].body.cx += self.dt * u;
+                susp.bodies[b].body.cy += self.dt * vv;
+                susp.bodies[b].body.phi += self.dt * om;
+            }
+        } else {
+            // Explicit: imprint combined mask, recover per-body force/torque, advance.
+            {
+                let comps = state.fields.by_id_mut(self.velocity).components_mut();
+                let (ux, uy) = comps.split_at_mut(1);
+                penal.apply(&mut ux[0], &mut uy[0], self.dt);
+            }
+            let ft: Vec<(f64, f64, f64)> = {
+                let v = state.fields.by_id(self.velocity);
+                let (ux, uy) = (v.component(0), v.component(1));
+                (0..nb)
+                    .map(|b| {
+                        let pb = susp.bodies[b].penalization(&mesh);
+                        let (cx, cy) = (susp.bodies[b].body.cx, susp.bodies[b].body.cy);
+                        pb.force_torque(ux, uy, &mesh, cx, cy)
+                    })
+                    .collect()
+            };
+            for b in 0..nb {
+                let (fx, fy, tq) = ft[b];
+                susp.bodies[b].advance(fx, fy, tq, self.dt);
+            }
+        }
+        susp.track_min_gap(); // record closest approach (poses are final for this step)
+        *penal = susp.combined_penalization(&mesh); // rebuild for next step
     }
 }
 

@@ -186,6 +186,11 @@ path = "src/bin/ve_ibm_move_check.rs"
 name = "ibm-strong-check"
 path = "src/bin/ibm_strong_check.rs"
 
+# M4: many-body suspension — repulsion/lubrication prevents interpenetration, vs CPU oracle.
+[[bin]]
+name = "ibm-suspension-check"
+path = "src/bin/ibm_suspension_check.rs"
+
 # Validates GPU per-region BCs (GpuStokes::with_bcs: inflow/outflow/walls) vs CPU.
 [[bin]]
 name = "flow-bc-check"
