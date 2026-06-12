@@ -176,6 +176,11 @@ path = "src/bin/flow_ibm_move_check.rs"
 name = "ve-ibm-check"
 path = "src/bin/ve_ibm_check.rs"
 
+# M2: freely-MOVING rigid disk in GPU viscoelastic flow (migration signal, SPD at moving body).
+[[bin]]
+name = "ve-ibm-move-check"
+path = "src/bin/ve_ibm_move_check.rs"
+
 # Validates GPU per-region BCs (GpuStokes::with_bcs: inflow/outflow/walls) vs CPU.
 [[bin]]
 name = "flow-bc-check"
