@@ -89,7 +89,11 @@ fn ensure_mg_pressure_handle(
     let ndof = mesh.n_elements() * mesh.refq.n_nodes();
     if cur.as_ref().map_or(true, |h| h.ndof() != ndof) {
         // None if `mesh` is not a uniform rectangular grid ⇒ stay on the CG pressure path.
-        *cur = PMultigrid::from_mesh(mesh, alpha, 0.0, neumann_tags).and_then(|mg| GpuPoissonMg::new(mg).ok());
+        // CUDA-graph the V-cycle: the MG solve is launch-bound, so capturing its ~500-launch
+        // sequence and replaying it with one cuGraphLaunch is a bit-exact 1.0–1.5× wall-clock win
+        // (largest at the small/medium grids the flow runs). Validated end-to-end through ns-check.
+        *cur = PMultigrid::from_mesh(mesh, alpha, 0.0, neumann_tags)
+            .and_then(|mg| GpuPoissonMg::new(mg).and_then(|h| h.with_cuda_graph(true)).ok());
     }
 }
 
@@ -113,7 +117,9 @@ fn ensure_mg_velocity_handle(
     }
     let ndof = mesh.n_elements() * mesh.refq.n_nodes();
     if cur.as_ref().map_or(true, |h| h.ndof() != ndof || h.reaction() != lambda) {
-        *cur = PMultigrid::from_mesh(mesh, alpha, lambda, neumann_tags).and_then(|mg| GpuPoissonMg::new(mg).ok());
+        // CUDA-graph the V-cycle (launch-bound remediation; bit-exact, see ensure_mg_pressure_handle).
+        *cur = PMultigrid::from_mesh(mesh, alpha, lambda, neumann_tags)
+            .and_then(|mg| GpuPoissonMg::new(mg).and_then(|h| h.with_cuda_graph(true)).ok());
     }
 }
 
