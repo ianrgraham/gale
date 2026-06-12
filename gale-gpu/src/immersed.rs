@@ -130,12 +130,16 @@ pub struct GpuMovingPenalizationHook {
     dt: f64,
     body: gale::sim::BodyHandle,
     penal: std::cell::RefCell<VolumePenalization>,
+    /// `true` ⇒ strong (implicit) coupling (M3, light/zero-mass stable); `false` ⇒
+    /// explicit Newton–Euler (M1, heavy only).
+    strong: bool,
 }
 
 impl GpuMovingPenalizationHook {
     /// Build the hook for a freely-moving `body` penalizing the 2-component `velocity`
     /// field over step `dt`. Returns the hook plus a `BodyHandle` clone for reading the
-    /// trajectory after `Simulation::run`. `mesh` builds the initial mask.
+    /// trajectory after `Simulation::run`. `mesh` builds the initial mask. Defaults to
+    /// EXPLICIT coupling; call [`strong`](Self::strong) for implicit (M3) coupling.
     pub fn new(
         velocity: gale::sim::FieldId,
         body: gale::dg::FreeBody,
@@ -144,7 +148,14 @@ impl GpuMovingPenalizationHook {
     ) -> (Self, gale::sim::BodyHandle) {
         let penal = body.penalization(mesh);
         let handle: gale::sim::BodyHandle = std::rc::Rc::new(std::cell::RefCell::new(body));
-        (Self { velocity, dt, body: handle.clone(), penal: std::cell::RefCell::new(penal) }, handle)
+        (Self { velocity, dt, body: handle.clone(), penal: std::cell::RefCell::new(penal), strong: false }, handle)
+    }
+
+    /// Enable strong (implicit) fluid–body coupling — required for light /
+    /// neutrally-buoyant particles (removes the added-mass density-ratio limit). Builder.
+    pub fn strong(mut self, strong: bool) -> Self {
+        self.strong = strong;
+        self
     }
 }
 
@@ -155,18 +166,38 @@ impl gale::sim::StateStageHook for GpuMovingPenalizationHook {
         }
         let mesh = state.mesh.clone();
         let mut penal = self.penal.borrow_mut();
-        {
+        let mut body = self.body.borrow_mut();
+        if self.strong {
+            // STRONG: implicit body-velocity solve against the penalization (host), using
+            // the predictor field u*; then penalize on the GPU and advance the pose.
+            let v = state.fields.by_id(self.velocity);
+            let (u, vv, om) =
+                body.strong_solve(v.component(0), v.component(1), &mesh, &penal, self.dt);
+            body.body.u = u;
+            body.body.v = vv;
+            body.body.omega = om;
+            *penal = body.penalization(&mesh); // current pose, NEW rigid velocity
             let comps = state.fields.by_id_mut(self.velocity).components_mut();
             let (ux, uy) = comps.split_at_mut(1);
             penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
-                .expect("gale-gpu: GpuMovingPenalizationHook penalize_apply failed");
+                .expect("gale-gpu: GpuMovingPenalizationHook penalize_apply (strong) failed");
+            body.body.cx += self.dt * u;
+            body.body.cy += self.dt * vv;
+            body.body.phi += self.dt * om;
+        } else {
+            // EXPLICIT (M1): imprint at current pose, recover force/torque, advance.
+            {
+                let comps = state.fields.by_id_mut(self.velocity).components_mut();
+                let (ux, uy) = comps.split_at_mut(1);
+                penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
+                    .expect("gale-gpu: GpuMovingPenalizationHook penalize_apply failed");
+            }
+            let v = state.fields.by_id(self.velocity);
+            let (fx, fy, tq) =
+                penal.force_torque(v.component(0), v.component(1), &mesh, body.body.cx, body.body.cy);
+            body.advance(fx, fy, tq, self.dt); // Newton–Euler (shared host code)
         }
-        let mut body = self.body.borrow_mut();
-        let v = state.fields.by_id(self.velocity);
-        let (fx, fy, tq) =
-            penal.force_torque(v.component(0), v.component(1), &mesh, body.body.cx, body.body.cy);
-        body.advance(fx, fy, tq, self.dt); // Newton–Euler (shared host code)
-        *penal = body.penalization(&mesh); // rebuild mask for the new pose
+        *penal = body.penalization(&mesh); // rebuild mask for the new pose (next step)
     }
 }
 

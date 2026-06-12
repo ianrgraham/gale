@@ -98,12 +98,16 @@ pub struct MovingPenalizationHook {
     body: BodyHandle,
     /// Penalization for the body's current pose; rebuilt after each advance.
     penal: RefCell<VolumePenalization>,
+    /// `true` ⇒ strong (implicit) coupling ([`FreeBody::strong_solve`], M3 — stable for
+    /// light/zero-mass particles); `false` ⇒ explicit Newton–Euler (M1, heavy only).
+    strong: bool,
 }
 
 impl MovingPenalizationHook {
     /// Build the hook for a freely-moving `body` penalizing the 2-component `velocity`
     /// field over step `dt`. Returns the hook plus a [`BodyHandle`] clone for reading the
-    /// trajectory after the run. `mesh` is used to build the initial mask.
+    /// trajectory after the run. `mesh` is used to build the initial mask. Defaults to
+    /// EXPLICIT coupling; call [`strong`](Self::strong) for the implicit (M3) coupling.
     pub fn new(
         velocity: FieldId,
         body: FreeBody,
@@ -112,7 +116,14 @@ impl MovingPenalizationHook {
     ) -> (Self, BodyHandle) {
         let penal = body.penalization(mesh);
         let handle: BodyHandle = Rc::new(RefCell::new(body));
-        (Self { velocity, dt, body: handle.clone(), penal: RefCell::new(penal) }, handle)
+        (Self { velocity, dt, body: handle.clone(), penal: RefCell::new(penal), strong: false }, handle)
+    }
+
+    /// Enable strong (implicit) fluid–body coupling — required for light /
+    /// neutrally-buoyant particles (removes the added-mass density-ratio limit). Builder.
+    pub fn strong(mut self, strong: bool) -> Self {
+        self.strong = strong;
+        self
     }
 }
 
@@ -123,16 +134,33 @@ impl StateStageHook for MovingPenalizationHook {
         }
         let mesh = state.mesh.clone();
         let mut penal = self.penal.borrow_mut();
-        {
+        let mut body = self.body.borrow_mut();
+        if self.strong {
+            // STRONG: solve the new body velocity implicitly against the penalization,
+            // using the predictor field u* (pre-penalization), then imprint + advance pose.
+            let v = state.fields.by_id(self.velocity);
+            let (u, vv, om) = body.strong_solve(v.component(0), v.component(1), &mesh, &penal, self.dt);
+            body.body.u = u;
+            body.body.v = vv;
+            body.body.omega = om;
+            *penal = body.penalization(&mesh); // current pose, NEW rigid velocity
             let comps = state.fields.by_id_mut(self.velocity).components_mut();
             let (ux, uy) = comps.split_at_mut(1);
-            penal.apply(&mut ux[0], &mut uy[0], self.dt); // imprint body at current pose
+            penal.apply(&mut ux[0], &mut uy[0], self.dt);
+            body.body.cx += self.dt * u;
+            body.body.cy += self.dt * vv;
+            body.body.phi += self.dt * om;
+        } else {
+            // EXPLICIT (M1): imprint at current pose, recover force/torque, advance.
+            let comps = state.fields.by_id_mut(self.velocity).components_mut();
+            let (ux, uy) = comps.split_at_mut(1);
+            penal.apply(&mut ux[0], &mut uy[0], self.dt);
+            let v = state.fields.by_id(self.velocity);
+            let (fx, fy, tq) =
+                penal.force_torque(v.component(0), v.component(1), &mesh, body.body.cx, body.body.cy);
+            body.advance(fx, fy, tq, self.dt);
         }
-        let mut body = self.body.borrow_mut();
-        let v = state.fields.by_id(self.velocity);
-        let (fx, fy, tq) = penal.force_torque(v.component(0), v.component(1), &mesh, body.body.cx, body.body.cy);
-        body.advance(fx, fy, tq, self.dt); // Newton–Euler
-        *penal = body.penalization(&mesh); // rebuild mask for the new pose
+        *penal = body.penalization(&mesh); // rebuild mask for the new pose (next step)
     }
 }
 

@@ -306,6 +306,10 @@ impl FreeBody {
     /// (symplectic) Euler: update the rigid velocity first, then advect the pose with
     /// the new velocity — better momentum behavior than fully-explicit Euler. The
     /// external force is added to the hydrodynamic one.
+    ///
+    /// EXPLICIT (weak) coupling: the force is computed before the body responds, so it is
+    /// unstable below a critical solid/fluid density ratio (added-mass effect). For light
+    /// / neutrally-buoyant particles use [`strong_solve`](Self::strong_solve) (M3).
     pub fn advance(&mut self, fx: f64, fy: f64, torque: f64, dt: f64) {
         self.body.u += dt * (fx + self.fext.0) / self.mass;
         self.body.v += dt * (fy + self.fext.1) / self.mass;
@@ -313,6 +317,71 @@ impl FreeBody {
         self.body.cx += dt * self.body.u;
         self.body.cy += dt * self.body.v;
         self.body.phi += dt * self.body.omega;
+    }
+
+    /// **Strong (implicit) coupling** — solve the new rigid velocity `(U, V, ω)`
+    /// *simultaneously* with the implicit penalization constraint, removing the
+    /// added-mass density-ratio limit so light / neutrally-buoyant / zero-mass particles
+    /// are stable (M3; the discrete form of Lee/Lee's simultaneous Newton–Euler + IB-force
+    /// solve, localized to gale's volume penalization).
+    ///
+    /// The implicit penalization sets `u = (u* + β·u_s)/(1+β)`, `β = χ·dt/η_b`, so the
+    /// hydrodynamic force `F = ∫(χ/η_b)(u − u_s) = ∫ w·(u* − u_s)`, `w = (χ/η_b)·jw/(1+β)`,
+    /// is LINEAR in `u_s(x) = (U − ω(y−c_y), V + ω(x−c_x))`. Inserting `F`/`T` into the
+    /// backward-Euler Newton–Euler relations `m(U−U₀)/dt = F_x+F_x^{ext}` etc. gives the
+    /// symmetric 3×3 system (in moments `S₀=Σw`, `S_x=Σw r_x`, `S_y=Σw r_y`,
+    /// `S_{r²}=Σw|r|²`, and predictor loads `A_u=Σw u*_x`, `A_v=Σw u*_y`,
+    /// `A_t=Σw(r_x u*_y − r_y u*_x)`):
+    /// ```text
+    ///   [ a   0  −S_y ] [U]   [ (m/dt)U₀ + A_u + F_x^ext ]
+    ///   [ 0   a   S_x ] [V] = [ (m/dt)V₀ + A_v + F_y^ext ]
+    ///   [−S_y S_x  b  ] [ω]   [ (I/dt)ω₀ + A_t          ]
+    /// ```
+    /// with `a = m/dt + S₀`, `b = I/dt + S_{r²}`. The determinant `a(ab − S_x² − S_y²)`
+    /// is positive for any body of finite extent (Cauchy–Schwarz: `S_x²+S_y² ≤ S₀ S_{r²}
+    /// ≤ ab`) — well-posed even at `m = I = 0`. `(ux, uy)` is the predictor field `u*`
+    /// (post-fluid-solve, pre-penalization); `pen` supplies `χ`/`η_b` at the body's
+    /// current pose. Returns the implicit `(U, V, ω)`; does not mutate the body.
+    pub fn strong_solve(&self, ux: &[f64], uy: &[f64], mesh: &Mesh2d, pen: &VolumePenalization, dt: f64) -> (f64, f64, f64) {
+        let nn = mesh.refq.n_nodes();
+        let inv = 1.0 / pen.eta_b;
+        let r = dt * inv; // dt/η_b, so β = r·χ
+        let (cx, cy) = (self.body.cx, self.body.cy);
+        let (mut s0, mut sx, mut sy, mut sr2) = (0.0, 0.0, 0.0, 0.0);
+        let (mut au, mut av, mut at) = (0.0, 0.0, 0.0);
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let i = e * nn + k;
+                let chi = pen.mask[i];
+                if chi == 0.0 {
+                    continue;
+                }
+                let w = chi * inv * el.geom.jw[k] / (1.0 + r * chi);
+                let rx = el.geom.x[k] - cx;
+                let ry = el.geom.y[k] - cy;
+                s0 += w;
+                sx += w * rx;
+                sy += w * ry;
+                sr2 += w * (rx * rx + ry * ry);
+                au += w * ux[i];
+                av += w * uy[i];
+                at += w * (rx * uy[i] - ry * ux[i]);
+            }
+        }
+        let a = self.mass / dt + s0;
+        let b = self.inertia / dt + sr2;
+        let r0 = self.mass / dt * self.body.u + au + self.fext.0;
+        let r1 = self.mass / dt * self.body.v + av + self.fext.1;
+        let r2 = self.inertia / dt * self.body.omega + at;
+        // Block elimination: U = (r0 + S_y ω)/a, V = (r1 − S_x ω)/a, then solve for ω.
+        let denom = b - (sx * sx + sy * sy) / a;
+        if a.abs() < 1e-300 || denom.abs() < 1e-300 {
+            return (self.body.u, self.body.v, self.body.omega); // degenerate (no resolved body)
+        }
+        let omega = (r2 + (sy * r0 - sx * r1) / a) / denom;
+        let u = (r0 + sy * omega) / a;
+        let v = (r1 - sx * omega) / a;
+        (u, v, omega)
     }
 }
 
@@ -577,6 +646,33 @@ mod tests {
         assert!((fb.body.cx - (0.5 + dt * want_u)).abs() < 1e-15);
         assert!((fb.body.cy - (0.5 + dt * want_v)).abs() < 1e-15);
         assert!((fb.body.phi - dt * want_w).abs() < 1e-15);
+    }
+
+    #[test]
+    fn strong_solve_massless_disk_tracks_uniform_flow_and_is_wellposed_at_zero_mass() {
+        // Strong (implicit) coupling on a MASSLESS disk in a uniform predictor field
+        // u* = (1, 0): the implicit body-velocity solve must return U=1, V=0, ω=0 — a
+        // massless body simply tracks the ambient flow — and must be well-posed at m=I=0
+        // (the determinant a(ab−Sx²−Sy²) stays positive by Cauchy–Schwarz). This is the
+        // property that makes strong coupling stable where explicit blows up.
+        let mesh = Mesh2d::rectangular(4, 4, 4, [0.0, 1.0], [0.0, 1.0]);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        let ux = vec![1.0; ndof];
+        let uy = vec![0.0; ndof];
+        // Zero mass and inertia ⇒ the added-mass-dominated limit.
+        let fb = FreeBody::new(RigidBody::disk(0.5, 0.5, 0.2), 0.0, 0.0, 1e-3);
+        let pen = fb.penalization(&mesh);
+        let (u, v, om) = fb.strong_solve(&ux, &uy, &mesh, &pen, 0.01);
+        assert!((u - 1.0).abs() < 1e-9, "massless disk should track flow: U={u}");
+        assert!(v.abs() < 1e-9, "V={v}");
+        assert!(om.abs() < 1e-9, "ω={om}");
+
+        // Heavier body in the same uniform flow lags it (0 < U < 1) but stays finite/bounded.
+        let heavy = FreeBody::disk(0.5, 0.5, 0.2, 50.0, 1e-3);
+        let (uh, vh, omh) = heavy.strong_solve(&ux, &uy, &mesh, &pen, 0.01);
+        assert!(uh > 0.0 && uh < 1.0 && uh.is_finite(), "heavy U={uh}");
+        assert!(vh.abs() < 1e-9 && omh.abs() < 1e-9, "symmetry broken: V={vh} ω={omh}");
     }
 
     #[test]

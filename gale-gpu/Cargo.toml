@@ -181,6 +181,11 @@ path = "src/bin/ve_ibm_check.rs"
 name = "ve-ibm-move-check"
 path = "src/bin/ve_ibm_move_check.rs"
 
+# M3: strong (implicit) coupling for LIGHT particles — added-mass stability vs explicit.
+[[bin]]
+name = "ibm-strong-check"
+path = "src/bin/ibm_strong_check.rs"
+
 # Validates GPU per-region BCs (GpuStokes::with_bcs: inflow/outflow/walls) vs CPU.
 [[bin]]
 name = "flow-bc-check"
