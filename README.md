@@ -108,7 +108,3 @@ cd book && mdbook serve --open
 ## License
 
 Licensed under the [MIT License](LICENSE).
-
----
-
-*gale is a research code, built in collaboration with Claude (Anthropic).*
