@@ -115,6 +115,61 @@ impl gale::sim::StateStageHook for GpuPenalizationHook {
     }
 }
 
+/// **Moving** volume-penalization stage hook for the GPU flow integrators — a freely-
+/// moving rigid body (M1, explicit Newton–Euler two-way coupling). The GPU twin of
+/// `gale::sim::MovingPenalizationHook`: each step it penalizes the velocity on the GPU
+/// ([`penalize_apply`]) to imprint the body at its current pose, recovers the
+/// hydrodynamic force/torque, advances the body (`FreeBody::advance`), and rebuilds the
+/// mask for the new pose. Only the penalize step runs on the GPU; the force/torque
+/// recovery, Newton–Euler update and mask rebuild are the shared `gale` host code, so the
+/// trajectory matches the CPU oracle bit-for-bit. Wire with `Simulation::set_stage_hook`.
+///
+/// For the single-stage dual-splitting integrators (`after_stage` once per step).
+pub struct GpuMovingPenalizationHook {
+    velocity: gale::sim::FieldId,
+    dt: f64,
+    body: gale::sim::BodyHandle,
+    penal: std::cell::RefCell<VolumePenalization>,
+}
+
+impl GpuMovingPenalizationHook {
+    /// Build the hook for a freely-moving `body` penalizing the 2-component `velocity`
+    /// field over step `dt`. Returns the hook plus a `BodyHandle` clone for reading the
+    /// trajectory after `Simulation::run`. `mesh` builds the initial mask.
+    pub fn new(
+        velocity: gale::sim::FieldId,
+        body: gale::dg::FreeBody,
+        mesh: &Mesh2d,
+        dt: f64,
+    ) -> (Self, gale::sim::BodyHandle) {
+        let penal = body.penalization(mesh);
+        let handle: gale::sim::BodyHandle = std::rc::Rc::new(std::cell::RefCell::new(body));
+        (Self { velocity, dt, body: handle.clone(), penal: std::cell::RefCell::new(penal) }, handle)
+    }
+}
+
+impl gale::sim::StateStageHook for GpuMovingPenalizationHook {
+    fn after_stage(&self, state: &mut gale::sim::State, stage: usize) {
+        if stage != 0 {
+            return; // advance once per step (single-stage dual-splitting)
+        }
+        let mesh = state.mesh.clone();
+        let mut penal = self.penal.borrow_mut();
+        {
+            let comps = state.fields.by_id_mut(self.velocity).components_mut();
+            let (ux, uy) = comps.split_at_mut(1);
+            penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
+                .expect("gale-gpu: GpuMovingPenalizationHook penalize_apply failed");
+        }
+        let mut body = self.body.borrow_mut();
+        let v = state.fields.by_id(self.velocity);
+        let (fx, fy, tq) =
+            penal.force_torque(v.component(0), v.component(1), &mesh, body.body.cx, body.body.cy);
+        body.advance(fx, fy, tq, self.dt); // Newton–Euler (shared host code)
+        *penal = body.penalization(&mesh); // rebuild mask for the new pose
+    }
+}
+
 // ===== 3D volume penalization ====================================================
 
 #[cuda_module]

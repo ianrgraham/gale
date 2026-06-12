@@ -166,6 +166,11 @@ path = "src/bin/ve_check.rs"
 name = "flow-ibm-check"
 path = "src/bin/flow_ibm_check.rs"
 
+# M1: freely-MOVING rigid disk in GPU flow (Newton-Euler two-way coupling) vs CPU oracle.
+[[bin]]
+name = "flow-ibm-move-check"
+path = "src/bin/flow_ibm_move_check.rs"
+
 # Capstone: immersed particle in GPU viscoelastic flow (VE integrator + IBM hook).
 [[bin]]
 name = "ve-ibm-check"

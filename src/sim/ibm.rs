@@ -14,9 +14,11 @@ use super::dynamics::StateStageHook;
 use super::field::FieldId;
 use super::simulation::Compute;
 use super::state::State;
-use crate::dg::immersed::VolumePenalization;
+use crate::dg::immersed::{FreeBody, VolumePenalization};
 use crate::dg::immersed3d::VolumePenalization3d;
 use crate::dg::mesh3d::Mesh3d;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Applies implicit volume penalization to the velocity field after a stage,
 /// driving the fluid toward the solid velocity inside the immersed body. This is
@@ -72,6 +74,65 @@ impl Compute for PenalizationDrag {
         } else {
             fy
         }
+    }
+}
+
+/// Shared, mutable handle to a [`FreeBody`] — the moving-particle trajectory. The
+/// [`MovingPenalizationHook`] (and its GPU twin) own a clone and advance it each step;
+/// the caller keeps a clone to read the pose/velocity after `Simulation::run`.
+pub type BodyHandle = Rc<RefCell<FreeBody>>;
+
+/// **Moving** volume-penalization stage hook: a freely-moving rigid body (M1, explicit
+/// Newton–Euler two-way coupling). Unlike [`PenalizationHook`] (a fixed body / static
+/// mask), each step this (1) applies the penalization to imprint the body at its current
+/// pose, (2) recovers the hydrodynamic force/torque, (3) advances the body
+/// ([`FreeBody::advance`]), and (4) rebuilds the mask for the new pose. CPU oracle for
+/// `gale_gpu::GpuMovingPenalizationHook`.
+///
+/// Designed for the single-stage dual-splitting integrators (`after_stage` once per
+/// step, `stage == 0`); the body is advanced only on stage 0 so multi-stage integrators
+/// don't over-step it.
+pub struct MovingPenalizationHook {
+    velocity: FieldId,
+    dt: f64,
+    body: BodyHandle,
+    /// Penalization for the body's current pose; rebuilt after each advance.
+    penal: RefCell<VolumePenalization>,
+}
+
+impl MovingPenalizationHook {
+    /// Build the hook for a freely-moving `body` penalizing the 2-component `velocity`
+    /// field over step `dt`. Returns the hook plus a [`BodyHandle`] clone for reading the
+    /// trajectory after the run. `mesh` is used to build the initial mask.
+    pub fn new(
+        velocity: FieldId,
+        body: FreeBody,
+        mesh: &crate::dg::Mesh2d,
+        dt: f64,
+    ) -> (Self, BodyHandle) {
+        let penal = body.penalization(mesh);
+        let handle: BodyHandle = Rc::new(RefCell::new(body));
+        (Self { velocity, dt, body: handle.clone(), penal: RefCell::new(penal) }, handle)
+    }
+}
+
+impl StateStageHook for MovingPenalizationHook {
+    fn after_stage(&self, state: &mut State, stage: usize) {
+        if stage != 0 {
+            return; // advance once per step (single-stage dual-splitting)
+        }
+        let mesh = state.mesh.clone();
+        let mut penal = self.penal.borrow_mut();
+        {
+            let comps = state.fields.by_id_mut(self.velocity).components_mut();
+            let (ux, uy) = comps.split_at_mut(1);
+            penal.apply(&mut ux[0], &mut uy[0], self.dt); // imprint body at current pose
+        }
+        let mut body = self.body.borrow_mut();
+        let v = state.fields.by_id(self.velocity);
+        let (fx, fy, tq) = penal.force_torque(v.component(0), v.component(1), &mesh, body.body.cx, body.body.cy);
+        body.advance(fx, fy, tq, self.dt); // Newton–Euler
+        *penal = body.penalization(&mesh); // rebuild mask for the new pose
     }
 }
 

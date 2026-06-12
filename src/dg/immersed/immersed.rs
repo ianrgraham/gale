@@ -218,6 +218,102 @@ impl VolumePenalization {
         }
         (fx, fy)
     }
+
+    /// Hydrodynamic force AND torque the fluid exerts on the body, about the center
+    /// `(cx, cy)`: `(Fx, Fy, T)` with `F = ∫ (χ/η_b)(u − u_s) dV` and
+    /// `T = ∫ (χ/η_b) [(x−cx)(u_y−u_{s,y}) − (y−cy)(u_x−u_{s,x})] dV`. The torque is
+    /// the `z`-component of `∫ r × (χ/η_b)(u − u_s)`. Consistent with [`force`](Self::force)
+    /// (same per-node weight) — the additional moment arm gives the angular reaction for
+    /// the Newton–Euler update of a freely-moving body. See [`FreeBody::advance`].
+    pub fn force_torque(&self, ux: &[f64], uy: &[f64], mesh: &Mesh2d, cx: f64, cy: f64) -> (f64, f64, f64) {
+        let nn = mesh.refq.n_nodes();
+        let inv = 1.0 / self.eta_b;
+        let (mut fx, mut fy, mut tq) = (0.0, 0.0, 0.0);
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                let i = e * nn + k;
+                let c = self.mask[i] * inv * el.geom.jw[k];
+                let dux = ux[i] - self.us_x[i];
+                let duy = uy[i] - self.us_y[i];
+                fx += c * dux;
+                fy += c * duy;
+                tq += c * ((el.geom.x[k] - cx) * duy - (el.geom.y[k] - cy) * dux);
+            }
+        }
+        (fx, fy, tq)
+    }
+}
+
+/// A freely-moving rigid body: a [`RigidBody`] (shape + pose + rigid velocity)
+/// carrying mass, moment of inertia, and an optional constant external body force
+/// (e.g. buoyancy-corrected gravity). It owns the **explicit Newton–Euler** update
+/// driven by the hydrodynamic force/torque recovered from the volume penalization —
+/// the "M1" two-way coupling (research: `docs/research-moving-particle-coupling.md`).
+///
+/// Stability note: explicit (weak) coupling is only stable above a critical
+/// solid/fluid density ratio (the added-mass limit), so this is for **heavy**
+/// particles. Light / neutrally-buoyant particles need strong coupling (M3).
+///
+/// Each step the driver ([`crate::sim::MovingPenalizationHook`] and its GPU twin):
+/// 1. applies penalization to imprint the body at its current pose/velocity,
+/// 2. recovers `(Fx, Fy, T)` via [`VolumePenalization::force_torque`],
+/// 3. calls [`advance`](Self::advance) (Newton–Euler),
+/// 4. rebuilds the penalization mask via [`penalization`](Self::penalization).
+#[derive(Clone, Copy, Debug)]
+pub struct FreeBody {
+    /// Shape + pose (`cx, cy, phi`) + rigid velocity (`u, v, omega`); also supplies
+    /// the penalization indicator and the rigid-body velocity target field.
+    pub body: RigidBody,
+    /// Mass `m` (Newton: `m·dU/dt = F`).
+    pub mass: f64,
+    /// Moment of inertia `I` about the center (Euler: `I·dω/dt = T`).
+    pub inertia: f64,
+    /// Constant external body force `(Fx, Fy)` — e.g. `((ρ_s−ρ_f)·V·g)` for gravity
+    /// with buoyancy already removed. Zero by default.
+    pub fext: (f64, f64),
+    /// Penalization parameter `η_b` used to rebuild the mask as the body moves.
+    pub eta_b: f64,
+}
+
+impl FreeBody {
+    /// A freely-moving body from a [`RigidBody`] with `mass`, `inertia`, penalization
+    /// `eta_b`, and no external force.
+    pub fn new(body: RigidBody, mass: f64, inertia: f64, eta_b: f64) -> Self {
+        Self { body, mass, inertia, fext: (0.0, 0.0), eta_b }
+    }
+
+    /// A solid **disk** of radius `r` and uniform density `rho`: sets mass `ρ·πr²` and
+    /// inertia `½·m·r²` automatically. The classic M1 test particle.
+    pub fn disk(cx: f64, cy: f64, r: f64, rho: f64, eta_b: f64) -> Self {
+        let mass = rho * std::f64::consts::PI * r * r;
+        let inertia = 0.5 * mass * r * r;
+        Self::new(RigidBody::disk(cx, cy, r), mass, inertia, eta_b)
+    }
+
+    /// Set a constant external body force (e.g. gravity/buoyancy). Builder-style.
+    pub fn with_external_force(mut self, fx: f64, fy: f64) -> Self {
+        self.fext = (fx, fy);
+        self
+    }
+
+    /// Rebuild the volume-penalization operator for the body's current pose/velocity.
+    pub fn penalization(&self, mesh: &Mesh2d) -> VolumePenalization {
+        VolumePenalization::new(mesh, &self.body, self.eta_b)
+    }
+
+    /// Explicit **Newton–Euler** advance over `dt` given the hydrodynamic force/torque
+    /// `(fx, fy, torque)` from [`VolumePenalization::force_torque`]. Semi-implicit
+    /// (symplectic) Euler: update the rigid velocity first, then advect the pose with
+    /// the new velocity — better momentum behavior than fully-explicit Euler. The
+    /// external force is added to the hydrodynamic one.
+    pub fn advance(&mut self, fx: f64, fy: f64, torque: f64, dt: f64) {
+        self.body.u += dt * (fx + self.fext.0) / self.mass;
+        self.body.v += dt * (fy + self.fext.1) / self.mass;
+        self.body.omega += dt * torque / self.inertia;
+        self.body.cx += dt * self.body.u;
+        self.body.cy += dt * self.body.v;
+        self.body.phi += dt * self.body.omega;
+    }
 }
 
 #[cfg(test)]
@@ -440,6 +536,47 @@ mod tests {
         let jeffery_t = PI * (r + 1.0 / r) / gdot;
         eprintln!("Jeffery orbit: period={t:.3}, theory T={jeffery_t:.3} (r={r})");
         assert!((t - jeffery_t).abs() < 0.15 * jeffery_t, "period {t} vs Jeffery {jeffery_t}");
+    }
+
+    #[test]
+    fn force_torque_force_matches_force_and_newton_euler_arithmetic() {
+        // (1) The (Fx,Fy) returned by force_torque must equal force() exactly (same
+        // per-node weight); the torque is the added moment-arm integral. (2) FreeBody::
+        // advance must apply semi-implicit (symplectic) Euler: velocity first, then pose
+        // with the NEW velocity, hydrodynamic + external force summed.
+        let mesh = Mesh2d::rectangular(3, 4, 4, [0.0, 1.0], [0.0, 1.0]);
+        let disk = Disk::new(0.5, 0.5, 0.2);
+        let pen = VolumePenalization::new(&mesh, &disk, 1e-3);
+        let nn = mesh.refq.n_nodes();
+        let ndof = mesh.n_elements() * nn;
+        // An asymmetric field so the torque is genuinely nonzero.
+        let mut ux = vec![0.0; ndof];
+        let uy = vec![0.0; ndof];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                ux[e * nn + k] = el.geom.y[k]; // shear-like ⇒ net spin
+            }
+        }
+        let (fx, fy) = pen.force(&ux, &uy, &mesh);
+        let (fxt, fyt, tq) = pen.force_torque(&ux, &uy, &mesh, 0.5, 0.5);
+        assert_eq!((fx, fy), (fxt, fyt), "force_torque force components must match force()");
+        assert!(tq.abs() > 0.0 && tq.is_finite(), "expected nonzero finite torque, got {tq}");
+
+        // Newton–Euler arithmetic on a disk with a known external force.
+        let mut fb = FreeBody::disk(0.5, 0.5, 0.2, 10.0, 1e-3).with_external_force(0.0, -1.0);
+        let (m, inertia) = (fb.mass, fb.inertia);
+        let (dt, fxh, fyh, th) = (0.1, 3.0, 0.0, 0.5);
+        fb.advance(fxh, fyh, th, dt);
+        let want_u = dt * (fxh + 0.0) / m;
+        let want_v = dt * (fyh - 1.0) / m;
+        let want_w = dt * th / inertia;
+        assert!((fb.body.u - want_u).abs() < 1e-15, "u {} vs {want_u}", fb.body.u);
+        assert!((fb.body.v - want_v).abs() < 1e-15, "v {} vs {want_v}", fb.body.v);
+        assert!((fb.body.omega - want_w).abs() < 1e-15, "ω {} vs {want_w}", fb.body.omega);
+        // Pose advected with the NEW velocity (symplectic).
+        assert!((fb.body.cx - (0.5 + dt * want_u)).abs() < 1e-15);
+        assert!((fb.body.cy - (0.5 + dt * want_v)).abs() < 1e-15);
+        assert!((fb.body.phi - dt * want_w).abs() < 1e-15);
     }
 
     #[test]
