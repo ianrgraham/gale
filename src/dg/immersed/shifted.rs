@@ -85,6 +85,9 @@ pub struct ShiftedBoundary {
     pub active: Vec<bool>,
     /// The surrogate-boundary faces (active-element edges facing inactive elements).
     pub faces: Vec<SurrogateFace>,
+    /// Per element: indices into `faces` owned by that element (for parallel, per-element
+    /// operator assembly). `faces_by_elem[e]` lists the surrogate faces of element `e`.
+    pub faces_by_elem: Vec<Vec<usize>>,
 }
 
 impl ShiftedBoundary {
@@ -139,7 +142,11 @@ impl ShiftedBoundary {
                 faces.push(SurrogateFace { elem: e, edge: Edge::ALL[le], nodes });
             }
         }
-        Self { active, faces }
+        let mut faces_by_elem = vec![Vec::new(); mesh.n_elements()];
+        for (i, sf) in faces.iter().enumerate() {
+            faces_by_elem[sf.elem].push(i);
+        }
+        Self { active, faces, faces_by_elem }
     }
 
     /// Number of active (surrogate-fluid) elements.

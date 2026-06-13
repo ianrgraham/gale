@@ -526,108 +526,113 @@ impl<'m> ShiftedPoisson<'m> {
         let gy: Vec<&Vec<f64>> = grads.iter().map(|g| &g.1).collect();
         let mut r = self.base.volume_with_grads(&grads);
 
-        // Weak-Dirichlet (Nitsche) contribution of one active-element edge `f` of element `e`:
-        // consistency −∮(∇u·n)v, penalty +∮τ u v, symmetry −∮(∇v·n)u — used on BOTH the
-        // surrogate boundary and the outer mesh Dirichlet walls.
-        let dirichlet = |r: &mut [f64], e: usize, f: &crate::dg::FaceData, tau: f64| {
-            let el = &m.elements[e];
-            let (mut hx, mut hy) = (vec![0.0; nn], vec![0.0; nn]);
-            for a in 0..f.nodes.len() {
-                let v = f.nodes[a];
-                let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
-                let dun = nx * gx[e][v] + ny * gy[e][v];
-                let uval = u[e * nn + v];
-                r[e * nn + v] += -sw * dun + tau * sw * uval;
-                hx[v] += sw * uval * nx;
-                hy[v] += sw * uval * ny;
-            }
-            let l = add(el.geom.gradx_t(refq, &hx), el.geom.grady_t(refq, &hy));
-            for k in 0..nn {
-                r[e * nn + k] -= l[k];
-            }
-        };
-
-        for (e, el) in m.elements.iter().enumerate() {
-            if !active[e] {
-                continue;
-            }
-            for edge in Edge::ALL {
-                let f = &el.faces[edge as usize];
-                match &el.neighbors[edge as usize] {
-                    Neighbor::Interior { elem: re, edge: redge, perm } if active[*re] => {
-                        if e >= *re {
-                            continue; // active–active interior face: process once, low side
+        // Face + surrogate terms as per-element records computed in PARALLEL (each element's
+        // contribution — including its writes to interior neighbours — collected, then replayed
+        // serially in element order). Mirrors the parallel Poisson::apply; the MMS test guards
+        // correctness. Interior active–active faces use standard SIPG; surrogate faces use the
+        // SBM Nitsche (eq. 2.14): consistency −(∂ₙu,v), symmetry −(S_hu,∂ₙv), penalty
+        // +(γ/h)(S_hu,S_hv), S_h u = u+∇u·d (taylor) or u; outer walls use plain weak Dirichlet.
+        let records: Vec<Vec<(usize, f64)>> = m
+            .elements
+            .par_iter()
+            .enumerate()
+            .map(|(e, el)| {
+                let mut rec: Vec<(usize, f64)> = Vec::new();
+                if !active[e] {
+                    return rec;
+                }
+                for edge in Edge::ALL {
+                    let f = &el.faces[edge as usize];
+                    match &el.neighbors[edge as usize] {
+                        Neighbor::Interior { elem: re, edge: redge, perm } if active[*re] => {
+                            if e >= *re {
+                                continue;
+                            }
+                            let rel = &m.elements[*re];
+                            let rf = &rel.faces[*redge as usize];
+                            let tau = self.base.penalty(e, Some(*re));
+                            let (mut hxl, mut hyl, mut hxr, mut hyr) =
+                                (vec![0.0; nn], vec![0.0; nn], vec![0.0; nn], vec![0.0; nn]);
+                            for a in 0..f.nodes.len() {
+                                let b = perm[a];
+                                let (vl, vr) = (f.nodes[a], rf.nodes[b]);
+                                let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
+                                let avg = 0.5 * ((nx * gx[e][vl] + ny * gy[e][vl]) + (nx * gx[*re][vr] + ny * gy[*re][vr]));
+                                let jump = u[e * nn + vl] - u[*re * nn + vr];
+                                rec.push((e * nn + vl, -sw * avg + tau * sw * jump));
+                                rec.push((*re * nn + vr, sw * avg - tau * sw * jump));
+                                let g = 0.5 * sw * jump;
+                                hxl[vl] += g * nx;
+                                hyl[vl] += g * ny;
+                                hxr[vr] += g * nx;
+                                hyr[vr] += g * ny;
+                            }
+                            let ll = add(el.geom.gradx_t(refq, &hxl), el.geom.grady_t(refq, &hyl));
+                            let lr = add(rel.geom.gradx_t(refq, &hxr), rel.geom.grady_t(refq, &hyr));
+                            for k in 0..nn {
+                                rec.push((e * nn + k, -ll[k]));
+                                rec.push((*re * nn + k, -lr[k]));
+                            }
                         }
-                        let rel = &m.elements[*re];
-                        let rf = &rel.faces[*redge as usize];
-                        let tau = self.base.penalty(e, Some(*re));
-                        let (mut hxl, mut hyl, mut hxr, mut hyr) =
-                            (vec![0.0; nn], vec![0.0; nn], vec![0.0; nn], vec![0.0; nn]);
-                        for a in 0..f.nodes.len() {
-                            let b = perm[a];
-                            let (vl, vr) = (f.nodes[a], rf.nodes[b]);
-                            let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
-                            let avg = 0.5 * ((nx * gx[e][vl] + ny * gy[e][vl]) + (nx * gx[*re][vr] + ny * gy[*re][vr]));
-                            let jump = u[e * nn + vl] - u[*re * nn + vr];
-                            r[e * nn + vl] += -sw * avg + tau * sw * jump;
-                            r[*re * nn + vr] += sw * avg - tau * sw * jump;
-                            let g = 0.5 * sw * jump;
-                            hxl[vl] += g * nx;
-                            hyl[vl] += g * ny;
-                            hxr[vr] += g * nx;
-                            hyr[vr] += g * ny;
+                        Neighbor::Interior { .. } => {} // surrogate: handled below
+                        Neighbor::Boundary { tag } if !self.base.is_neumann(*tag) => {
+                            let tau = self.base.penalty(e, None);
+                            let (mut hx, mut hy) = (vec![0.0; nn], vec![0.0; nn]);
+                            for a in 0..f.nodes.len() {
+                                let v = f.nodes[a];
+                                let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
+                                let dun = nx * gx[e][v] + ny * gy[e][v];
+                                let uval = u[e * nn + v];
+                                rec.push((e * nn + v, -sw * dun + tau * sw * uval));
+                                hx[v] += sw * uval * nx;
+                                hy[v] += sw * uval * ny;
+                            }
+                            let l = add(el.geom.gradx_t(refq, &hx), el.geom.grady_t(refq, &hy));
+                            for k in 0..nn {
+                                rec.push((e * nn + k, -l[k]));
+                            }
                         }
-                        let ll = add(el.geom.gradx_t(refq, &hxl), el.geom.grady_t(refq, &hyl));
-                        let lr = add(rel.geom.gradx_t(refq, &hxr), rel.geom.grady_t(refq, &hyr));
+                        _ => {}
+                    }
+                }
+                // Surrogate faces owned by this element.
+                for &fi in &self.sb.faces_by_elem[e] {
+                    let sf = &self.sb.faces[fi];
+                    let fd = &el.faces[sf.edge as usize];
+                    let tau = self.base.penalty(e, None);
+                    let (mut hx, mut hy) = (vec![0.0; nn], vec![0.0; nn]);
+                    let (mut px, mut py) = (vec![0.0; nn], vec![0.0; nn]);
+                    for (a, sn) in sf.nodes.iter().enumerate() {
+                        let v = fd.nodes[a];
+                        let (nx, ny, sw) = (fd.nx[a], fd.ny[a], fd.sw[a]);
+                        let dun = nx * gx[e][v] + ny * gy[e][v];
+                        let su = u[e * nn + v]
+                            + if self.taylor { gx[e][v] * sn.dx + gy[e][v] * sn.dy } else { 0.0 };
+                        rec.push((e * nn + v, -sw * dun + tau * sw * su));
+                        hx[v] += sw * su * nx;
+                        hy[v] += sw * su * ny;
+                        if self.taylor {
+                            px[v] += tau * sw * su * sn.dx;
+                            py[v] += tau * sw * su * sn.dy;
+                        }
+                    }
+                    let l = add(el.geom.gradx_t(refq, &hx), el.geom.grady_t(refq, &hy));
+                    for k in 0..nn {
+                        rec.push((e * nn + k, -l[k]));
+                    }
+                    if self.taylor {
+                        let lp = add(el.geom.gradx_t(refq, &px), el.geom.grady_t(refq, &py));
                         for k in 0..nn {
-                            r[e * nn + k] -= ll[k];
-                            r[*re * nn + k] -= lr[k];
+                            rec.push((e * nn + k, lp[k]));
                         }
                     }
-                    // Surrogate boundary (interior neighbour INACTIVE): handled in the
-                    // sb.faces loop below (it carries the shift d for the Taylor correction).
-                    Neighbor::Interior { .. } => {}
-                    // Outer mesh wall: weak Dirichlet (unless Neumann-tagged).
-                    Neighbor::Boundary { tag } if !self.base.is_neumann(*tag) => {
-                        dirichlet(&mut r, e, f, self.base.penalty(e, None))
-                    }
-                    _ => {} // Neumann wall (RHS only) / AMR (unsupported in SBM yet)
                 }
-            }
-        }
-        // Surrogate-boundary Nitsche (eq. 2.14): consistency −(∂ₙu,v), symmetry −(S_hu,∂ₙv),
-        // penalty +(γ/h)(S_hu,S_hv). S_h u = u + ∇u·d (taylor) or u (first-order). The
-        // symmetry and penalty-gradient terms are gradient-transpose lifts.
-        for sf in &self.sb.faces {
-            let e = sf.elem;
-            let el = &m.elements[e];
-            let fd = &el.faces[sf.edge as usize];
-            let tau = self.base.penalty(e, None);
-            let (mut hx, mut hy) = (vec![0.0; nn], vec![0.0; nn]); // symmetry: −(S_hu,∂ₙv)
-            let (mut px, mut py) = (vec![0.0; nn], vec![0.0; nn]); // penalty-grad: (γ/h)(S_hu)(∇v·d)
-            for (a, sn) in sf.nodes.iter().enumerate() {
-                let v = fd.nodes[a];
-                let (nx, ny, sw) = (fd.nx[a], fd.ny[a], fd.sw[a]);
-                let dun = nx * gx[e][v] + ny * gy[e][v];
-                let su = u[e * nn + v]
-                    + if self.taylor { gx[e][v] * sn.dx + gy[e][v] * sn.dy } else { 0.0 };
-                r[e * nn + v] += -sw * dun + tau * sw * su; // consistency + penalty-value
-                hx[v] += sw * su * nx;
-                hy[v] += sw * su * ny;
-                if self.taylor {
-                    px[v] += tau * sw * su * sn.dx;
-                    py[v] += tau * sw * su * sn.dy;
-                }
-            }
-            let l = add(el.geom.gradx_t(refq, &hx), el.geom.grady_t(refq, &hy));
-            for k in 0..nn {
-                r[e * nn + k] -= l[k];
-            }
-            if self.taylor {
-                let lp = add(el.geom.gradx_t(refq, &px), el.geom.grady_t(refq, &py));
-                for k in 0..nn {
-                    r[e * nn + k] += lp[k];
-                }
+                rec
+            })
+            .collect();
+        for rec in &records {
+            for &(i, d) in rec {
+                r[i] += d;
             }
         }
         if self.base.reaction != 0.0 {
