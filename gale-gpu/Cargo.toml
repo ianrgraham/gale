@@ -201,6 +201,11 @@ path = "src/bin/cylinder_drag_check.rs"
 name = "settling-disk-check"
 path = "src/bin/settling_disk_check.rs"
 
+# SBM Schäfer-Turek cylinder (Re=20) — sharp-interface drag vs DFG reference + penalization.
+[[bin]]
+name = "sbm-cylinder-check"
+path = "src/bin/sbm_cylinder_check.rs"
+
 # Validates GPU per-region BCs (GpuStokes::with_bcs: inflow/outflow/walls) vs CPU.
 [[bin]]
 name = "flow-bc-check"

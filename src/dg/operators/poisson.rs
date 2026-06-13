@@ -499,20 +499,47 @@ pub struct ShiftedPoisson<'m> {
     /// value `S_h u = u + ∇u·d` in the symmetry/penalty terms, eq. 2.14 of arXiv:2006.00872);
     /// `false` ⇒ first-order (penalty acts on `u(x̃)`).
     taylor: bool,
+    /// Surrogate-boundary BC type: `true` ⇒ Dirichlet (weak/Nitsche — the no-slip velocity
+    /// solve); `false` ⇒ **natural / homogeneous-Neumann** (the surrogate carries no operator
+    /// term — the projection pressure-Poisson, where `∂p/∂n = 0` on the embedded surface).
+    surrogate_dirichlet: bool,
 }
 
 impl<'m> ShiftedPoisson<'m> {
     /// Build the SBM operator for reaction `λ` over the surrogate domain `sb` (all outer mesh
     /// boundaries are Dirichlet here; per-region tags can be added later). Defaults to
-    /// first-order; call [`taylor`](Self::taylor) for the high-order Taylor-corrected form.
+    /// first-order Dirichlet surrogate; see [`taylor`](Self::taylor) and
+    /// [`surrogate_neumann`](Self::surrogate_neumann).
     pub fn new(mesh: &'m Mesh2d, alpha: f64, reaction: f64, sb: crate::dg::shifted::ShiftedBoundary) -> Self {
-        Self { base: Poisson::with_reaction(mesh, alpha, reaction), sb, taylor: false }
+        Self { base: Poisson::with_reaction(mesh, alpha, reaction), sb, taylor: false, surrogate_dirichlet: true }
+    }
+
+    /// Full constructor with outer Neumann tags (for the pressure: inflow/walls Neumann,
+    /// outflow Dirichlet `p=0`).
+    pub fn with_bc(mesh: &'m Mesh2d, alpha: f64, reaction: f64, neumann_tags: Vec<u32>, sb: crate::dg::shifted::ShiftedBoundary) -> Self {
+        Self { base: Poisson::with_bc(mesh, alpha, reaction, neumann_tags), sb, taylor: false, surrogate_dirichlet: true }
     }
 
     /// Enable the high-order Taylor correction (the surrogate Nitsche acts on `S_h u = u+∇u·d`).
     pub fn taylor(mut self, taylor: bool) -> Self {
         self.taylor = taylor;
         self
+    }
+
+    /// Make the surrogate boundary **natural (homogeneous Neumann)** instead of Dirichlet —
+    /// the projection pressure-Poisson (`∂p/∂n = 0` at the embedded surface). Then the
+    /// surrogate faces contribute nothing to the operator/RHS (just the active restriction).
+    pub fn surrogate_neumann(mut self) -> Self {
+        self.surrogate_dirichlet = false;
+        self
+    }
+
+    /// Is the active block singular (pure-Neumann everywhere ⇒ deflate)? True when all outer
+    /// boundaries are Neumann AND the surrogate is natural — the closed-box pressure case.
+    pub fn is_singular(&self) -> bool {
+        self.base.reaction == 0.0
+            && !self.surrogate_dirichlet
+            && self.base.mesh.boundary_tags().iter().all(|t| self.base.neumann_tags.contains(t))
     }
 
     /// Matrix-free SBM action `A u`: real SIPG on the active block, identity on the inactive.
@@ -595,8 +622,12 @@ impl<'m> ShiftedPoisson<'m> {
                         _ => {}
                     }
                 }
-                // Surrogate faces owned by this element.
+                // Surrogate faces owned by this element (Dirichlet/Nitsche only — for the
+                // natural-Neumann pressure they contribute nothing, just the active restriction).
                 for &fi in &self.sb.faces_by_elem[e] {
+                    if !self.surrogate_dirichlet {
+                        break;
+                    }
                     let sf = &self.sb.faces[fi];
                     let fd = &el.faces[sf.edge as usize];
                     let tau = self.base.penalty(e, None);
@@ -687,8 +718,9 @@ impl<'m> ShiftedPoisson<'m> {
             }
         };
         // Surrogate boundary: data ḡ = g(true point x̃+d). RHS terms −(ḡ,∂ₙv) (symmetry) and
-        // +(γ/h)(ḡ, S_h v) (penalty value + Taylor penalty-gradient).
-        for sf in &self.sb.faces {
+        // +(γ/h)(ḡ, S_h v) (penalty value + Taylor penalty-gradient). Skipped for natural-Neumann
+        // surrogate (homogeneous ∂u/∂n = 0 ⇒ no RHS contribution).
+        for sf in self.sb.faces.iter().take(if self.surrogate_dirichlet { usize::MAX } else { 0 }) {
             let e = sf.elem;
             let el = &m.elements[e];
             let fd = &el.faces[sf.edge as usize];
@@ -737,11 +769,19 @@ impl<'m> ShiftedPoisson<'m> {
         b
     }
 
-    /// Plain CG (the active block is SPD: Dirichlet data on the surrogate + outer walls).
+    /// Plain CG from a zero initial guess.
     pub fn solve(&self, b: &[f64], tol: f64, maxit: usize) -> (Vec<f64>, usize) {
+        self.solve_from(b, vec![0.0; b.len()], tol, maxit)
+    }
+
+    /// Plain CG from an initial guess `x0` (the active block is SPD). Warm-starting with the
+    /// previous time step's field makes the iteration count collapse as the flow approaches
+    /// steady state — essential for time-marching without a multigrid preconditioner.
+    pub fn solve_from(&self, b: &[f64], x0: Vec<f64>, tol: f64, maxit: usize) -> (Vec<f64>, usize) {
         let n = b.len();
-        let mut x = vec![0.0; n];
-        let mut r = b.to_vec();
+        let mut x = x0;
+        let ax0 = self.apply(&x);
+        let mut r: Vec<f64> = b.iter().zip(&ax0).map(|(bi, a)| bi - a).collect();
         let mut p = r.clone();
         let mut rs = dot(&r, &r);
         let bn = dot(b, b).sqrt().max(1e-300);
