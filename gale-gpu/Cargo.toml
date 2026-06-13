@@ -191,6 +191,11 @@ path = "src/bin/ibm_strong_check.rs"
 name = "ibm-suspension-check"
 path = "src/bin/ibm_suspension_check.rs"
 
+# Quantitative validation: Schäfer–Turek 2D-1 cylinder drag (Re=20) vs DFG reference.
+[[bin]]
+name = "cylinder-drag-check"
+path = "src/bin/cylinder_drag_check.rs"
+
 # Validates GPU per-region BCs (GpuStokes::with_bcs: inflow/outflow/walls) vs CPU.
 [[bin]]
 name = "flow-bc-check"
