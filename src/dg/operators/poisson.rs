@@ -832,6 +832,45 @@ impl<'m> ShiftedPoisson<'m> {
         (x, maxit)
     }
 
+    /// **Preconditioned** CG from an initial guess, with an external preconditioner `precond`
+    /// (`r ↦ M⁻¹r`). The SBM operator is symmetric and (with an outflow Dirichlet) SPD but
+    /// ill-conditioned — unpreconditioned CG needs O(10³) iters. A standard full-mesh
+    /// `PMultigrid` V-cycle (same outer Neumann tags, ignoring the active mask/surrogate) is a
+    /// good *approximate* preconditioner: it kills the global smooth mode the two operators
+    /// share, reaching a loose projection tol in ~tens of mesh-independent iters. Pass e.g.
+    /// `|r| mg.precondition(r)`. Returns `(solution, iterations)`.
+    pub fn solve_pcg_from(
+        &self, b: &[f64], x0: Vec<f64>, precond: impl Fn(&[f64]) -> Vec<f64>, tol: f64, maxit: usize,
+    ) -> (Vec<f64>, usize) {
+        let n = b.len();
+        let mut x = x0;
+        let ax0 = self.apply(&x);
+        let mut r: Vec<f64> = b.iter().zip(&ax0).map(|(bi, a)| bi - a).collect();
+        let mut z = precond(&r);
+        let mut p = z.clone();
+        let mut rz = dot(&r, &z);
+        let bn = dot(b, b).sqrt().max(1e-300);
+        for it in 0..maxit {
+            let ap = self.apply(&p);
+            let alpha = rz / dot(&p, &ap);
+            for i in 0..n {
+                x[i] += alpha * p[i];
+                r[i] -= alpha * ap[i];
+            }
+            if dot(&r, &r).sqrt() / bn < tol {
+                return (x, it + 1);
+            }
+            z = precond(&r);
+            let rz_new = dot(&r, &z);
+            let beta = rz_new / rz;
+            for i in 0..n {
+                p[i] = z[i] + beta * p[i];
+            }
+            rz = rz_new;
+        }
+        (x, maxit)
+    }
+
     /// The active-element mask (surrogate fluid domain), for restricting error norms etc.
     pub fn active(&self) -> &[bool] {
         &self.sb.active

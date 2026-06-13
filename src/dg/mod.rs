@@ -64,6 +64,8 @@ pub mod viscoelastic3d;
 pub mod filter;
 #[path = "operators/multigrid.rs"]
 pub mod multigrid;
+#[path = "operators/shifted_multigrid.rs"]
+pub mod shifted_multigrid;
 
 // adaptive mesh refinement (2D/3D)
 #[path = "amr/amr.rs"]
@@ -109,6 +111,7 @@ pub use hyperbolic::{
 };
 pub use mesh::{Element, Mesh2d, Neighbor};
 pub use multigrid::PMultigrid;
+pub use shifted_multigrid::ShiftedMultigrid;
 pub use nonconforming::{NcAdvection, NcMesh, NcNeighbor};
 pub use poisson::{Poisson, ShiftedPoisson};
 pub use poisson3d::Poisson3d;

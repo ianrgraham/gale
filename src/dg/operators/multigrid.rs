@@ -21,7 +21,7 @@ fn norm(a: &[f64]) -> f64 {
 }
 
 /// Coarsening sequence of orders: `p, p/2, p/4, …, 1`.
-fn order_levels(p: usize) -> Vec<usize> {
+pub(crate) fn order_levels(p: usize) -> Vec<usize> {
     let mut v = Vec::new();
     let mut q = p;
     while q > 1 {
@@ -34,7 +34,7 @@ fn order_levels(p: usize) -> Vec<usize> {
 
 /// 1D Lagrange interpolation matrix (`fine × coarse`, row-major): value of each
 /// coarse basis function at each fine node.
-fn lagrange_matrix(coarse: &[f64], fine: &[f64]) -> Vec<f64> {
+pub(crate) fn lagrange_matrix(coarse: &[f64], fine: &[f64]) -> Vec<f64> {
     let nc = coarse.len();
     let nf = fine.len();
     let mut m = vec![0.0; nf * nc];
@@ -573,13 +573,22 @@ impl PMultigrid {
                 v.iter_mut().for_each(|x| *x -= mean);
             }
         };
+        // Coarse-grid solve tolerance/cap. With h-coarsening the coarsest grid is TINY (a few
+        // elements) ⇒ a tight, near-exact solve is cheap and minimizes outer iterations. But when
+        // the grid can't h-coarsen (odd dims, e.g. a 43×8 channel) the coarsest level is still
+        // order-1 on the FULL grid — there a tight 1e-10 solve runs hundreds of CG iters EVERY
+        // V-cycle (the step-2c cylinder was 86 s/step from exactly this). The coarse solve is only
+        // a preconditioner component, so for a large coarse grid use a loose tol + low cap and let
+        // the outer PCG absorb the inexactness. Mirrors the GPU `coarse_small` band-aid.
+        let coarse_small = n <= 1024;
+        let (ctol, cap) = if coarse_small { (1e-10, 500) } else { (1e-2, 40) };
         let mut x = vec![0.0; n];
         let mut r = b.to_vec();
         deflate(&mut r);
         let mut p = r.clone();
         let mut rs = dot(&r, &r);
         let bn = norm(b).max(1e-300);
-        for _ in 0..500 {
+        for _ in 0..cap {
             let ap = self.apply_level(l, &p);
             let pap = dot(&p, &ap);
             // CG breakdown guard: on the singular coarse op the only remaining mode can be the
@@ -594,7 +603,7 @@ impl PMultigrid {
             }
             deflate(&mut r);
             let rsn = dot(&r, &r);
-            if rsn.sqrt() / bn < 1e-10 {
+            if rsn.sqrt() / bn < ctol {
                 break;
             }
             let be = rsn / rs;

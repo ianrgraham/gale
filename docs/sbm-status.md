@@ -16,28 +16,41 @@ the "where we left off" so the stream can resume cleanly.
   penalization.*
 - **Parallel apply** (commit `c3fc92c`): record-replay over elements (rayon).
 
-## Built but BLOCKED
-- **Step 2c — SBM dual-splitting NS cylinder** (`sbm-cylinder-check`, commit `e77899b`): full
-  solver — convection + pressure projection (natural-Neumann surrogate) + SBM-Nitsche velocity
-  no-slip + true-circle drag recovery. Velocity path + geometry sound (stable, umax≈0.33), but
-  **the natural-Neumann pressure-Poisson under unpreconditioned CG STALLS** (hits maxit every
-  step) — no converged C_D produced. Triple-confirmed at ny=12 (>2s/step, never past step ~1,
-  even with warm-start + loose per-step tol).
+## Step 2c — UNBLOCKED (2026-06-13)
+The "stall" was diagnosed (bin `sbm-pressure-diag`) as **pure ill-conditioning**, NOT an operator
+bug: the SBM pressure operator is symmetric (asym ~1e-15), non-singular (outflow Dirichlet pins
+it, ‖A·1‖≫0), and well-posed — unpreconditioned CG just needed O(10³) iters (≈861 at ny=8, 1800
+for the unit-box MMS). Two solver pieces fixed it:
 
-## To resume (remaining 2c work)
-1. **Fast solver for the SBM operator** — the real blocker. The whole SBM stack is **CPU +
-   unpreconditioned CG**; the penalization path solves the same-sized pressure-Poisson fast
-   because it has the GPU p-MG-PCG. Options: an MG preconditioner for the SBM operator, or a
-   GPU port reusing the existing MG machinery.
-2. **Debug the pressure stall** — hitting maxit (not just slow) hints at near-singularity in the
-   natural-Neumann surrogate + inactive-identity spectrum; check correctness/conditioning of the
-   `surrogate_neumann()` pressure operator (a small-problem eigen/condition check, or compare its
-   apply to a reference) before/with the MG work.
-3. Then the C_D run + comparison: SBM should converge to DFG `C_D = 5.5795`, beating
-   penalization's ~2.1%-low plateau (`cylinder-drag-check`).
-4. Later: moving boundary, viscoelastic surface BC, AMR surrogate faces, and the cut-cell DG
-   backend (the second sharp-interface method per the research).
+1. **`ShiftedMultigrid`** (`src/dg/shifted_multigrid.rs`) — a p-multigrid using the **SBM operator
+   itself** at every level (p-only coarsening; per-level `ShiftedBoundary` rebuilt from the level
+   set; checkerboard-colored diagonal + damped-Jacobi smoother + Lagrange p-transfers + V-cycle
+   with deflation/coarse band-aid). The *standard* full-mesh `PMultigrid` was tried first and
+   FAILED — it ignores the active mask/surrogate, so it stagnates on the cylinder-local modes and
+   hits maxit on the physical RHS. The SBM-aware MG converges: MMS validated (Helmholtz 783→96
+   iters, Poisson 1800→108, matches direct to ~1e-8).
+2. **`ShiftedPoisson::solve_pcg_from`** — preconditioned CG taking an external preconditioner
+   closure; the cylinder drives both pressure and velocity with their matching `ShiftedMultigrid`.
 
-## Note
-The pressure-stall finding fed directly into the next work stream: **gale's CPU path needs a
-fast elliptic solve (preconditioner / CPU-MG) in general**, not just for SBM.
+**Result (`sbm-cylinder-check`, ny=16, D/h≈3.9):** the cylinder now runs — warm-started pressure
+**5–15 iters/step**, velocity **~18** (was a stall at maxit=5000) — and C_D **settles to ≈5.221**
+(transient 4.2→7.5→5.8→5.5→5.22, flat in the 4th digit by step ~175). That's **6.4% below** the
+DFG reference 5.5795 — STABLE and physically correct, but **not yet beating penalization's ~2.1%**.
+
+The residual error is localized (NOT the solver, which is converged): the **viscous drag recovery
+is only first-order** — `drag_x` Taylor-extrapolates the *pressure* to the true circle
+(`p_t = p + ∇p·d`) but uses **∇u at the surrogate point** (no Hessian extrapolation), so the
+viscous traction carries an O(h) error that the high-order SBM BC doesn't. Likely also the
+first-order *pressure* surrogate (the pressure operator runs WITHOUT `.taylor`). Closing the gap =
+high-order SBM force recovery (extrapolate ∇u via the velocity Hessian) + Taylor pressure surrogate
++ a resolution sweep — the next accuracy increment.
+
+Also fixed a general CPU-MG bug found en route: `PMultigrid::coarse_solve` ran 500 tight CG
+iters/V-cycle on non-h-coarsenable (odd-dim, e.g. 43×8) grids; now uses a loose-tol/cap band-aid
+like the GPU.
+
+## Remaining (later)
+- Higher-resolution C_D convergence study (ny sweep) to quantify SBM's order vs penalization.
+- Tune the SBM-MG smoother (96–108 iters is ~5× a clean p-MG's ~20 — likely smoother/coarse
+  refinement; functional but not optimal).
+- Moving boundary, viscoelastic surface BC, AMR surrogate faces, and the cut-cell DG backend.

@@ -21,7 +21,7 @@
 //!
 //! Run: cargo oxide run --bin sbm-cylinder-check   (SBM_NY=24 for a finer point)
 
-use gale::dg::{CircleLevelSet, Mesh2d, ShiftedBoundary, ShiftedPoisson};
+use gale::dg::{CircleLevelSet, Mesh2d, ShiftedBoundary, ShiftedMultigrid, ShiftedPoisson};
 use std::f64::consts::PI;
 
 fn env_usize(k: &str, d: usize) -> usize {
@@ -57,6 +57,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // pressure Poisson (natural-Neumann surrogate; inflow+walls Neumann, outflow Dirichlet p=0).
     let vel = ShiftedPoisson::with_bc(&mesh, alpha, lambda, vec![1], sb.clone()).taylor(true);
     let pres = ShiftedPoisson::with_bc(&mesh, alpha, 0.0, vec![3, 0, 2], sb.clone()).surrogate_neumann();
+    // Preconditioner for the ill-conditioned SBM pressure: an SBM-AWARE p-multigrid (the operator
+    // itself at every level — same config: natural-Neumann surrogate, no Taylor). Unlike the
+    // standard full-mesh MG (which stagnates on the cylinder-local modes and hits maxit), this
+    // converges, cutting O(10³) unpreconditioned iters to ~O(10²). See bin sbm-pressure-diag.
+    let pres_mg = ShiftedMultigrid::new(p, nx, ny, [0.0, 2.2], [0.0, h], alpha, 0.0, vec![3, 0, 2], &ls, false, false);
+    // Velocity Helmholtz is also ill-conditioned (the surrogate Nitsche penalty), so precondition
+    // it too with a matching SBM-MG (reaction λ, Dirichlet surrogate, Taylor; outflow Neumann).
+    let vel_mg = ShiftedMultigrid::new(p, nx, ny, [0.0, 2.2], [0.0, h], alpha, lambda, vec![1], &ls, true, true);
 
     // BC data (Dirichlet value at a point); surrogate (cylinder) evaluates these at the true
     // surface point ⇒ no-slip 0 there since the cylinder is interior (x≈0.2, not the inflow).
@@ -107,7 +115,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Stage 2: pressure projection −∇²p = (1/Δt)∇·û (warm-started from the previous step).
         let div: Vec<f64> = grad(&uhx, 0).iter().zip(grad(&uhy, 1).iter()).map(|(a, b)| a + b).collect();
         let fp: Vec<f64> = div.iter().map(|x| -x / dt).collect();
-        (pp, _) = pres.solve_from(&pres.rhs(&fp, g_p), pp.clone(), ptol, maxit);
+        let bp = pres.rhs(&fp, g_p);
+        let pit;
+        (pp, pit) = pres.solve_pcg_from(&bp, pp.clone(), |r| pres_mg.precondition(r), ptol, maxit);
         // Stage 2b: u* = û − Δt ∇p.
         let (px, py) = (grad(&pp, 0), grad(&pp, 1));
         for i in 0..ndof {
@@ -117,17 +127,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Stage 3: viscous Helmholtz (λM + A) uⁿ⁺¹ = λM u* with SBM no-slip.
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
-        let (uxn, _) = vel.solve_from(&vel.rhs(&fxv, g_u), ux.clone(), vtol, maxit);
-        let (uyn, _) = vel.solve_from(&vel.rhs(&fyv, g_v), uy.clone(), vtol, maxit);
+        let (uxn, vitx) = vel.solve_pcg_from(&vel.rhs(&fxv, g_u), ux.clone(), |r| vel_mg.precondition(r), vtol, maxit);
+        let (uyn, vity) = vel.solve_pcg_from(&vel.rhs(&fyv, g_v), uy.clone(), |r| vel_mg.precondition(r), vtol, maxit);
         ux = uxn;
         uy = uyn;
+        if std::env::var("SBM_VERBOSE").is_ok() {
+            println!("    [step {step}] p_iters={pit}  vel_iters={vitx}/{vity}");
+        }
 
         // Drag on the true circle (every 25 steps + steady check).
         if step % 25 == 0 || step == 1 {
             cd = norm * drag_x(&mesh, &sb, &ls, &ux, &uy, &pp, nu, &grad);
             if step % 25 == 0 || step == 1 {
                 let umax = ux.iter().zip(&uy).fold(0.0f64, |m, (a, b)| m.max(a.hypot(*b)));
-                println!("  step {step:5}  C_D={cd:.4}  (ref {cd_ref})  umax={umax:.3}");
+                println!("  step {step:5}  C_D={cd:.4}  (ref {cd_ref})  umax={umax:.3}  p_iters={pit}");
             }
             if step > 300 && ((cd - cd_prev) / cd.max(1e-30)).abs() < 2e-4 {
                 steady_at = Some(step);

@@ -403,3 +403,8 @@ path = "src/bin/pcg_pressure_check.rs"
 [[bin]]
 name = "cpu-profile"
 path = "src/bin/cpu_profile.rs"
+
+# SBM pressure-operator diagnostic: ill-conditioned vs ill-posed (the step-2c stall).
+[[bin]]
+name = "sbm-pressure-diag"
+path = "src/bin/sbm_pressure_diag.rs"
