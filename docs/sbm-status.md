@@ -37,20 +37,32 @@ for the unit-box MMS). Two solver pieces fixed it:
 (transient 4.2→7.5→5.8→5.5→5.22, flat in the 4th digit by step ~175). That's **6.4% below** the
 DFG reference 5.5795 — STABLE and physically correct, but **not yet beating penalization's ~2.1%**.
 
-The residual error is localized (NOT the solver, which is converged): the **viscous drag recovery
-is only first-order** — `drag_x` Taylor-extrapolates the *pressure* to the true circle
-(`p_t = p + ∇p·d`) but uses **∇u at the surrogate point** (no Hessian extrapolation), so the
-viscous traction carries an O(h) error that the high-order SBM BC doesn't. Likely also the
-first-order *pressure* surrogate (the pressure operator runs WITHOUT `.taylor`). Closing the gap =
-high-order SBM force recovery (extrapolate ∇u via the velocity Hessian) + Taylor pressure surrogate
-+ a resolution sweep — the next accuracy increment.
+The residual error was localized (NOT the solver, which is converged): the **viscous drag recovery
+was only first-order** — `drag_x` Taylor-extrapolated the *pressure* to the true circle
+(`p_t = p + ∇p·d`) but used **∇u at the surrogate point**, so the viscous traction carried an O(h)
+error the high-order SBM BC doesn't.
+
+## High-order drag recovery — DONE (SBM now BEATS penalization)
+`drag_x` now also Taylor-extrapolates the velocity GRADIENT to the true circle via the velocity
+Hessian: `∂u/∂x(x̃+d) ≈ ∂u/∂x(x̃) + ∇(∂u/∂x)·d` (second derivatives by element-local nodal
+differentiation — clean, not noisy in practice). Same flow field, both recoveries printed
+(`C_D` = high-order, `(lo …)` = first-order):
+
+| recovery | ny=16 settled C_D | err vs DFG 5.5795 |
+|----------|-------------------|-------------------|
+| first-order (∇u at surrogate) | 5.219 | −6.5% |
+| **high-order (Hessian-extrapolated ∇u)** | **5.637** | **+1.0%** |
+
+**+1.0% beats penalization's ~2.1% floor** (`cylinder-drag-check`) — the headline step-2c result:
+**SBM is sharper than diffuse volume penalization for the cylinder drag.**
 
 Also fixed a general CPU-MG bug found en route: `PMultigrid::coarse_solve` ran 500 tight CG
 iters/V-cycle on non-h-coarsenable (odd-dim, e.g. 43×8) grids; now uses a loose-tol/cap band-aid
 like the GPU.
 
 ## Remaining (later)
-- Higher-resolution C_D convergence study (ny sweep) to quantify SBM's order vs penalization.
-- Tune the SBM-MG smoother (96–108 iters is ~5× a clean p-MG's ~20 — likely smoother/coarse
-  refinement; functional but not optimal).
+- Resolution sweep (ny) to confirm the high-order drag converges (order estimate vs penalization).
+- Tune the SBM-MG smoother (96–108 iters is ~5× a clean p-MG's ~20 — functional but not optimal).
+- The first-order *pressure* surrogate (natural-Neumann at the surrogate location) — a higher-order
+  Neumann surrogate could shave the residual further.
 - Moving boundary, viscoelastic surface BC, AMR surrogate faces, and the cut-cell DG backend.

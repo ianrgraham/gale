@@ -135,12 +135,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("    [step {step}] p_iters={pit}  vel_iters={vitx}/{vity}");
         }
 
-        // Drag on the true circle (every 25 steps + steady check).
+        // Drag on the true circle (every 25 steps + steady check). C_D uses the high-order
+        // (Hessian-extrapolated) recovery; C_D_lo is the first-order recovery for comparison.
         if step % 25 == 0 || step == 1 {
-            cd = norm * drag_x(&mesh, &sb, &ls, &ux, &uy, &pp, nu, &grad);
+            cd = norm * drag_x(&mesh, &sb, &ls, &ux, &uy, &pp, nu, false, &grad);
+            let cd_lo = norm * drag_x(&mesh, &sb, &ls, &ux, &uy, &pp, nu, true, &grad);
             if step % 25 == 0 || step == 1 {
                 let umax = ux.iter().zip(&uy).fold(0.0f64, |m, (a, b)| m.max(a.hypot(*b)));
-                println!("  step {step:5}  C_D={cd:.4}  (ref {cd_ref})  umax={umax:.3}  p_iters={pit}");
+                println!("  step {step:5}  C_D={cd:.4} (lo {cd_lo:.4})  (ref {cd_ref})  umax={umax:.3}  p_iters={pit}");
             }
             if step > 300 && ((cd - cd_prev) / cd.max(1e-30)).abs() < 2e-4 {
                 steady_at = Some(step);
@@ -178,12 +180,22 @@ fn drag_x(
     uy: &[f64],
     pp: &[f64],
     nu: f64,
+    lo: bool, // true ⇒ first-order recovery (∇u at the surrogate); false ⇒ high-order (Hessian)
     grad: &impl Fn(&[f64], usize) -> Vec<f64>,
 ) -> f64 {
     let nn = mesh.refq.n_nodes();
     let (uxx, uxy) = (grad(ux, 0), grad(ux, 1));
-    let (uyx, uyy) = (grad(uy, 0), grad(uy, 1));
+    let uyx = grad(uy, 0); // ∂v/∂x (∂v/∂y unused in the x-traction)
     let (pgx, pgy) = (grad(pp, 0), grad(pp, 1));
+    // HIGH-ORDER force recovery: the traction lives on the TRUE circle, but the discrete fields
+    // live on the surrogate. The pressure is Taylor-extrapolated (p + ∇p·d); the velocity GRADIENT
+    // must be too, or the viscous traction is only O(h). Extrapolate ∇u via its own gradient (the
+    // velocity Hessian): ∂u/∂x(x̃+d) ≈ ∂u/∂x(x̃) + ∇(∂u/∂x)·d, etc. Set SBM_LO_DRAG to fall back to
+    // the first-order recovery (∇u at the surrogate) for comparison.
+    // Second derivatives needed for the three traction-x gradient components (∂u/∂x, ∂u/∂y, ∂v/∂x).
+    let (dxx_x, dxx_y) = (grad(&uxx, 0), grad(&uxx, 1)); // ∇(∂u/∂x)
+    let (dxy_x, dxy_y) = (grad(&uxy, 0), grad(&uxy, 1)); // ∇(∂u/∂y)
+    let (dyx_x, dyx_y) = (grad(&uyx, 0), grad(&uyx, 1)); // ∇(∂v/∂x)
     // Collect (angle, traction_x) per surrogate node at its true-boundary point.
     let (cx, cy) = (0.2, 0.2);
     let mut pts: Vec<(f64, f64)> = Vec::new();
@@ -193,14 +205,22 @@ fn drag_x(
         for (a, sn) in sf.nodes.iter().enumerate() {
             let v = fd.nodes[a];
             let i = e * nn + v;
-            // Taylor-extrapolate fields to the true point x̃+d.
-            let p_t = pp[i] + pgx[i] * sn.dx + pgy[i] * sn.dy;
-            let (dudx, dudy, dvdx, dvdy) = (uxx[i], uxy[i], uyx[i], uyy[i]); // ∇u at surrogate (O(h))
+            let (dx, dy) = (sn.dx, sn.dy);
+            // Taylor-extrapolate the fields to the true point x̃+d.
+            let p_t = pp[i] + pgx[i] * dx + pgy[i] * dy;
+            let (dudx, dudy, dvdx) = if lo {
+                (uxx[i], uxy[i], uyx[i]) // first-order: ∇u at the surrogate (O(h))
+            } else {
+                (
+                    uxx[i] + dxx_x[i] * dx + dxx_y[i] * dy,
+                    uxy[i] + dxy_x[i] * dx + dxy_y[i] * dy,
+                    uyx[i] + dyx_x[i] * dx + dyx_y[i] * dy,
+                )
+            };
             let (nx, ny) = (sn.tnx, sn.tny); // body-outward (into fluid) unit normal
             // (σ·n)_x = −p n_x + ν[2 ∂u/∂x n_x + (∂u/∂y+∂v/∂x) n_y]
             let tx = -p_t * nx + nu * (2.0 * dudx * nx + (dudy + dvdx) * ny);
-            let _ = dvdy;
-            let theta = (sn.y + sn.dy - cy).atan2(sn.x + sn.dx - cx);
+            let theta = (sn.y + dy - cy).atan2(sn.x + dx - cx);
             pts.push((theta, tx));
         }
     }
