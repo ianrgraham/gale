@@ -398,3 +398,8 @@ path = "src/bin/pcg_helmholtz_check.rs"
 [[bin]]
 name = "pcg-pressure-check"
 path = "src/bin/pcg_pressure_check.rs"
+
+# CPU-path profile: cg vs MG-PCG (algorithm) + apply throughput / core utilization (parallelism).
+[[bin]]
+name = "cpu-profile"
+path = "src/bin/cpu_profile.rs"

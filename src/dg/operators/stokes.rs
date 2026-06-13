@@ -14,6 +14,7 @@
 use super::bc::BoundaryConditions;
 use super::hyperbolic::{Hyperbolic, IncompressibleConvection, VolumeForm};
 use super::mesh::Mesh2d;
+use super::multigrid::PMultigrid;
 use super::poisson::Poisson;
 
 /// How the nonlinear convection `(u·∇)u` is discretized.
@@ -33,6 +34,12 @@ pub struct Stokes<'m> {
     pub convection_scheme: ConvectionScheme,
     /// Pressure-Poisson operator (pure Neumann, singular).
     pressure: Poisson<'m>,
+    /// Persistent p-multigrid preconditioner for the pressure-Poisson solve, built
+    /// once from the mesh (the pressure solve is the dominant per-step elliptic cost;
+    /// unpreconditioned CG needs O(10³) iters vs O(20) for MG-PCG). `None` when the
+    /// mesh isn't a structured rectangle (`PMultigrid::from_mesh` only supports those)
+    /// ⇒ fall back to plain/deflated CG. Reaction 0, same Neumann tags as `pressure`.
+    pressure_mg: Option<PMultigrid>,
     /// Velocity Helmholtz operators `(1/(νΔt))M + A`, one per component. They differ
     /// only in their Neumann-tag set, which matters for symmetry/slip faces (the normal
     /// component is Dirichlet, the tangential ones Neumann); identical otherwise.
@@ -43,6 +50,21 @@ pub struct Stokes<'m> {
     has_outflow: bool,
     tol: f64,
     maxit: usize,
+}
+
+/// Below this element count the pressure-Poisson is small enough that deflated/plain CG
+/// converges in few iterations and the p-MG V-cycle is pure overhead (measured net loss
+/// at ≤ ~8², break-even ~16²; the win grows with size — 2.5× at 32², 4.9× at 64²). At or
+/// above it, build the MG preconditioner. See `gale-gpu`'s `cpu-profile` for the crossover.
+const PRESSURE_MG_MIN_ELEMENTS: usize = 1024;
+
+/// Build the persistent pressure p-MG preconditioner only when the mesh is large enough to
+/// benefit (and is a uniform tensor grid `from_mesh` supports). `None` ⇒ caller uses CG.
+fn build_pressure_mg(mesh: &Mesh2d, alpha: f64, neumann_tags: Vec<u32>) -> Option<PMultigrid> {
+    if mesh.n_elements() < PRESSURE_MG_MIN_ELEMENTS {
+        return None;
+    }
+    PMultigrid::from_mesh(mesh, alpha, 0.0, neumann_tags)
 }
 
 impl<'m> Stokes<'m> {
@@ -58,6 +80,7 @@ impl<'m> Stokes<'m> {
             dt,
             convection_scheme: ConvectionScheme::Nodal,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
+            pressure_mg: build_pressure_mg(mesh, alpha, mesh.boundary_tags()),
             velocity_x: Poisson::with_reaction(mesh, alpha, lambda),
             velocity_y: Poisson::with_reaction(mesh, alpha, lambda),
             has_outflow: false,
@@ -81,6 +104,7 @@ impl<'m> Stokes<'m> {
             dt,
             convection_scheme: ConvectionScheme::Nodal,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, bcs.pressure_neumann_tags(mesh)),
+            pressure_mg: build_pressure_mg(mesh, alpha, bcs.pressure_neumann_tags(mesh)),
             velocity_x: Poisson::with_bc(mesh, alpha, lambda, bcs.velocity_neumann_tags(mesh, 0)),
             velocity_y: Poisson::with_bc(mesh, alpha, lambda, bcs.velocity_neumann_tags(mesh, 1)),
             has_outflow: bcs.has_outflow(mesh),
@@ -319,12 +343,14 @@ impl<'m> Stokes<'m> {
         // Dirichlet p=0 on outflow. An outflow pins the constant ⇒ plain CG; with no
         // outflow the system is singular ⇒ deflated CG (constant nullspace removed).
         let bp = self.pressure.rhs_mixed(&fp, |_, _| 0.0, |_, _| 0.0);
-        let p = if self.has_outflow {
-            let (p, _, _) = self.pressure.cg(&bp, self.tol, self.maxit);
-            p
-        } else {
-            let (p, _it) = self.pressure.cg_deflated(&bp, self.tol, self.maxit);
-            p
+        // Pressure-Poisson: the dominant per-step elliptic cost. Use the persistent
+        // p-MG-PCG when available (mesh-independent, O(20) iters vs O(10³) for plain CG);
+        // deflate the constant nullspace when there's no outflow (singular pure-Neumann).
+        let p = match (&self.pressure_mg, self.has_outflow) {
+            (Some(mg), true) => mg.pcg(&bp, self.tol, self.maxit).0,
+            (Some(mg), false) => mg.pcg_deflated(&bp, self.tol, self.maxit).0,
+            (None, true) => self.pressure.cg(&bp, self.tol, self.maxit).0,
+            (None, false) => self.pressure.cg_deflated(&bp, self.tol, self.maxit).0,
         };
         for (e, el) in mesh.elements.iter().enumerate() {
             let gpx = el.geom.grad_x(refq, &p[e * nn..(e + 1) * nn]);

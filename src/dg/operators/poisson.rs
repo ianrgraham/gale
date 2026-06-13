@@ -82,16 +82,43 @@ impl<'m> Poisson<'m> {
         let m = self.mesh;
         let refq = &m.refq;
         let nn = refq.n_nodes();
-        // Per-element physical gradients, computed once and shared by BOTH the volume term
-        // and the face terms (previously the volume term recomputed them — a full redundant
-        // gradient pass per apply).
-        let grads = self.elem_grads(u);
-        let gx: Vec<&Vec<f64>> = grads.iter().map(|g| &g.0).collect();
-        let gy: Vec<&Vec<f64>> = grads.iter().map(|g| &g.1).collect();
-
-        // Volume stiffness (fused form — the same operator the GPU kernel computes),
-        // so that `apply − apply_volume` is exactly the face contribution.
-        let mut r = self.volume_with_grads(&grads);
+        let ndof = self.ndof();
+        // FUSED gradient + volume-stiffness pass (single parallel region, per-thread scratch,
+        // no per-element allocation). Per element it computes the physical gradients into the
+        // FLAT `gx`/`gy` buffers (consumed by the face terms below — shared, not recomputed)
+        // AND the volume stiffness `r[e] = Drᵀ pr + Dsᵀ ps`, sharing ONE `diff_r`/`diff_s`
+        // pair (the old `grad_x`+`grad_y` recomputed both). Bit-for-bit identical to the prior
+        // `elem_grads` + `volume_with_grads` (same per-element arithmetic; `+` is commutative).
+        let mut r = vec![0.0; ndof];
+        let mut gx = vec![0.0; ndof];
+        let mut gy = vec![0.0; ndof];
+        r.par_chunks_mut(nn)
+            .zip(gx.par_chunks_mut(nn))
+            .zip(gy.par_chunks_mut(nn))
+            .zip(m.elements.par_iter())
+            .enumerate()
+            .for_each_init(
+                || (vec![0.0; nn], vec![0.0; nn], vec![0.0; nn], vec![0.0; nn], vec![0.0; nn]),
+                |(fr, fs, pr, ps, tr), (e, (((rc, gxc), gyc), el))| {
+                    let ue = &u[e * nn..(e + 1) * nn];
+                    refq.diff_r_into(ue, fr);
+                    refq.diff_s_into(ue, fs);
+                    let g = &el.geom;
+                    for k in 0..nn {
+                        gxc[k] = g.rx[k] * fr[k] + g.sx[k] * fs[k];
+                        gyc[k] = g.ry[k] * fr[k] + g.sy[k] * fs[k];
+                        let wx = g.jw[k] * gxc[k];
+                        let wy = g.jw[k] * gyc[k];
+                        pr[k] = g.rx[k] * wx + g.ry[k] * wy;
+                        ps[k] = g.sx[k] * wx + g.sy[k] * wy;
+                    }
+                    refq.diff_r_t_into(pr, tr);
+                    refq.diff_s_t_into(ps, rc);
+                    for k in 0..nn {
+                        rc[k] += tr[k];
+                    }
+                },
+            );
 
         // Mortar projections (only used at non-conforming faces).
         let mortar = RefineQuad::new(m.order);
@@ -138,8 +165,8 @@ impl<'m> Poisson<'m> {
                                 let b = perm[a];
                                 let (vl, vr) = (f.nodes[a], rf.nodes[b]);
                                 let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
-                                let dun_l = nx * gx[e][vl] + ny * gy[e][vl];
-                                let dun_r = nx * gx[*re][vr] + ny * gy[*re][vr];
+                                let dun_l = nx * gx[e * nn + vl] + ny * gy[e * nn + vl];
+                                let dun_r = nx * gx[*re * nn + vr] + ny * gy[*re * nn + vr];
                                 let avg = 0.5 * (dun_l + dun_r);
                                 let jump = u[e * nn + vl] - u[*re * nn + vr];
                                 // consistency  −∮{∇u·n}[v]
@@ -174,7 +201,7 @@ impl<'m> Poisson<'m> {
                             for a in 0..f.nodes.len() {
                                 let v = f.nodes[a];
                                 let (nx, ny, sw) = (f.nx[a], f.ny[a], f.sw[a]);
-                                let dun = nx * gx[e][v] + ny * gy[e][v];
+                                let dun = nx * gx[e * nn + v] + ny * gy[e * nn + v];
                                 let uval = u[e * nn + v];
                                 rec.push((e * nn + v, -sw * dun)); // consistency  −∮(∇u·n)v
                                 rec.push((e * nn + v, tau * sw * uval)); // penalty  +∮ τ u v
@@ -197,7 +224,7 @@ impl<'m> Poisson<'m> {
                                 .iter()
                                 .map(|&i| {
                                     let v = f.nodes[i];
-                                    ncx * gx[e][v] + ncy * gy[e][v]
+                                    ncx * gx[e * nn + v] + ncy * gy[e * nn + v]
                                 })
                                 .collect();
                             let mut hxe = vec![0.0; nn];
@@ -217,7 +244,7 @@ impl<'m> Poisson<'m> {
                                 for (mi, &i) in rw.iter().enumerate() {
                                     let vf = frw.nodes[i];
                                     let sw = frw.sw[i];
-                                    let dnf = ncx * gx[re][vf] + ncy * gy[re][vf];
+                                    let dnf = ncx * gx[re * nn + vf] + ncy * gy[re * nn + vf];
                                     let jump = uc_m[mi] - u[re * nn + vf];
                                     let avg = 0.5 * (dnc_m[mi] + dnf);
                                     // Fine test (direct): consistency +∮{∇u·n}v_f, penalty −∮τ[u]v_f.

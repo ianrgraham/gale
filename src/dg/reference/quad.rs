@@ -70,10 +70,18 @@ impl Reference2dQuad {
     /// `∂f/∂r` at every node, via sum factorization (1D `D` along the `r`-direction).
     /// Exact for any polynomial of degree ≤ `p` in `r`.
     pub fn diff_r(&self, f: &[f64]) -> Vec<f64> {
+        let mut out = vec![0.0; f.len()];
+        self.diff_r_into(f, &mut out);
+        out
+    }
+
+    /// [`diff_r`] writing into a caller-provided `out` (no allocation; for hot matrix-free
+    /// loops that reuse per-thread scratch). Bit-for-bit identical to [`diff_r`].
+    #[inline]
+    pub fn diff_r_into(&self, f: &[f64], out: &mut [f64]) {
         let n = self.n_1d();
         assert_eq!(f.len(), n * n, "diff_r: expected {} values", n * n);
         let d = &self.line.diff; // n×n, row-major
-        let mut out = vec![0.0; n * n];
         for j in 0..n {
             for i in 0..n {
                 let mut acc = 0.0;
@@ -83,16 +91,22 @@ impl Reference2dQuad {
                 out[i + j * n] = acc;
             }
         }
-        out
     }
 
     /// Transpose of [`diff_r`]: `out_i = Σ_k Dᵀ_ik f_k` swept along `r`. Used for
     /// the adjoint (stiffness / SIPG lift) terms.
     pub fn diff_r_t(&self, f: &[f64]) -> Vec<f64> {
+        let mut out = vec![0.0; f.len()];
+        self.diff_r_t_into(f, &mut out);
+        out
+    }
+
+    /// [`diff_r_t`] writing into a caller-provided `out` (no allocation).
+    #[inline]
+    pub fn diff_r_t_into(&self, f: &[f64], out: &mut [f64]) {
         let n = self.n_1d();
         assert_eq!(f.len(), n * n, "diff_r_t: expected {} values", n * n);
         let d = &self.line.diff;
-        let mut out = vec![0.0; n * n];
         for j in 0..n {
             for i in 0..n {
                 let mut acc = 0.0;
@@ -102,15 +116,21 @@ impl Reference2dQuad {
                 out[i + j * n] = acc;
             }
         }
-        out
     }
 
     /// Transpose of [`diff_s`], swept along `s`.
     pub fn diff_s_t(&self, f: &[f64]) -> Vec<f64> {
+        let mut out = vec![0.0; f.len()];
+        self.diff_s_t_into(f, &mut out);
+        out
+    }
+
+    /// [`diff_s_t`] writing into a caller-provided `out` (no allocation).
+    #[inline]
+    pub fn diff_s_t_into(&self, f: &[f64], out: &mut [f64]) {
         let n = self.n_1d();
         assert_eq!(f.len(), n * n, "diff_s_t: expected {} values", n * n);
         let d = &self.line.diff;
-        let mut out = vec![0.0; n * n];
         for j in 0..n {
             for i in 0..n {
                 let mut acc = 0.0;
@@ -120,16 +140,22 @@ impl Reference2dQuad {
                 out[i + j * n] = acc;
             }
         }
-        out
     }
 
     /// `∂f/∂s` at every node, via sum factorization (1D `D` along the `s`-direction).
     /// Exact for any polynomial of degree ≤ `p` in `s`.
     pub fn diff_s(&self, f: &[f64]) -> Vec<f64> {
+        let mut out = vec![0.0; f.len()];
+        self.diff_s_into(f, &mut out);
+        out
+    }
+
+    /// [`diff_s`] writing into a caller-provided `out` (no allocation).
+    #[inline]
+    pub fn diff_s_into(&self, f: &[f64], out: &mut [f64]) {
         let n = self.n_1d();
         assert_eq!(f.len(), n * n, "diff_s: expected {} values", n * n);
         let d = &self.line.diff; // n×n, row-major
-        let mut out = vec![0.0; n * n];
         for j in 0..n {
             for i in 0..n {
                 let mut acc = 0.0;
@@ -139,7 +165,6 @@ impl Reference2dQuad {
                 out[i + j * n] = acc;
             }
         }
-        out
     }
 }
 
