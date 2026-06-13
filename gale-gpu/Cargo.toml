@@ -196,6 +196,11 @@ path = "src/bin/ibm_suspension_check.rs"
 name = "cylinder-drag-check"
 path = "src/bin/cylinder_drag_check.rs"
 
+# Quantitative validation: Wan–Turek single settling disk — terminal Re vs reference (moving).
+[[bin]]
+name = "settling-disk-check"
+path = "src/bin/settling_disk_check.rs"
+
 # Validates GPU per-region BCs (GpuStokes::with_bcs: inflow/outflow/walls) vs CPU.
 [[bin]]
 name = "flow-bc-check"
