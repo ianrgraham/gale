@@ -408,3 +408,8 @@ path = "src/bin/cpu_profile.rs"
 [[bin]]
 name = "sbm-pressure-diag"
 path = "src/bin/sbm_pressure_diag.rs"
+
+# GPU SBM operator (natural-Neumann surrogate) vs CPU ShiftedPoisson oracle (port increment 1).
+[[bin]]
+name = "sbm-poisson-check"
+path = "src/bin/sbm_poisson_check.rs"

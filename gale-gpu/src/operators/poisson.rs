@@ -278,6 +278,117 @@ mod kernels {
         }
     }
 
+    /// **SBM operator** (Shifted Boundary Method, natural-Neumann surrogate): the SIPG operator
+    /// restricted to the ACTIVE (surrogate-fluid) elements, with identity on the inactive ones.
+    /// Identical to [`operator`] except (a) it reads an `active_elem` mask, (b) an inactive element
+    /// writes the identity `out = u` (the decoupled inactive block), and (c) the connectivity
+    /// `face_nbr` already has every active→inactive face marked `NEU` (the natural-Neumann surrogate
+    /// — no operator term), so no surrogate-specific arithmetic is needed here. Bit-for-bit equal to
+    /// `gale::dg::ShiftedPoisson::…surrogate_neumann().apply` on a uniform axis-aligned mesh.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sbm_operator<U: Scalar, G: Scalar>(
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
+        active_elem: &[u32], mut out: DisjointSlice<U>,
+    ) {
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | PR(epb·nn) | PS(epb·nn) ]
+        let n1 = n1 as usize;
+        let nn = n1 * n1;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let in_range = e < ne as usize;
+        // Inactive elements (and the partial final block's padding) skip the SIPG accumulation but
+        // still reach the barrier. `active_elem` is read only when in range (avoids OOB).
+        let elem_active = if in_range { active_elem[e] != 0 } else { false };
+        let pr = nn + el * nn;
+        let ps = nn + epb * nn + el * nn;
+        let b = e * nn + m;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = d[t];
+            }
+        }
+        let jw_b = jac * mass[m];
+        let mut rf = 0.0f64;
+        if elem_active {
+            unsafe {
+                let wx = jw_b * gx[b].to_f64();
+                let wy = jw_b * gy[b].to_f64();
+                *sm.add(pr + m) = rx * wx;
+                *sm.add(ps + m) = sy * wy;
+            }
+            let ii = m % n1;
+            let jj = m / n1;
+            let mut hx = 0.0f64;
+            let mut hy = 0.0f64;
+            let mut t4 = 0usize;
+            while t4 < 4 {
+                let (on, a, nx, ny, xface) = if t4 == 0 {
+                    (jj == 0, ii, 0.0f64, -1.0f64, true)
+                } else if t4 == 1 {
+                    (ii == n1 - 1, jj, 1.0f64, 0.0f64, false)
+                } else if t4 == 2 {
+                    (jj == n1 - 1, ii, 0.0f64, 1.0f64, true)
+                } else {
+                    (ii == 0, jj, -1.0f64, 0.0f64, false)
+                };
+                if on {
+                    let idx = (e * 4 + t4) * n1 + a;
+                    let nbr = face_nbr[idx];
+                    if nbr != NEU {
+                        let sw = if xface { fswx[a] } else { fswy[a] };
+                        let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
+                        let ug = u[b].to_f64();
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0)
+                        } else {
+                            let ng = nbr as usize;
+                            (0.5 * (dun_e + nx * gx[ng].to_f64() + ny * gy[ng].to_f64()), ug - u[ng].to_f64(), 0.5)
+                        };
+                        let g = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * nx;
+                        hy += g * ny;
+                    }
+                }
+                t4 += 1;
+            }
+            unsafe {
+                *sm.add(pr + m) -= rx * hx;
+                *sm.add(ps + m) -= sy * hy;
+            }
+        }
+        thread::sync_threads();
+        if !in_range {
+            return;
+        }
+        if !elem_active {
+            // Identity on the inactive (solid) block: out = u, decoupled from the active operator.
+            if let Some(o) = out.get_mut(thread::index_1d()) {
+                *o = U::from_f64(u[b].to_f64());
+            }
+            return;
+        }
+        let i = m % n1;
+        let j = m / n1;
+        let mut acc = 0.0f64;
+        let mut k = 0usize;
+        while k < n1 {
+            unsafe {
+                acc += *sm.add(k * n1 + i) * *sm.add(pr + k + j * n1)
+                    + *sm.add(k * n1 + j) * *sm.add(ps + i + k * n1);
+            }
+            k += 1;
+        }
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = U::from_f64(acc + rf + lambda * jw_b * u[b].to_f64());
+        }
+    }
+
     /// **Fused matvec + damped-Jacobi smoother step.** Computes `Ap = A·u` exactly as
     /// [`operator`], then writes the smoother update `out ← u + ω·invd·(rhs − Ap)` instead of
     /// `Ap` — so the per-node `Ap` never round-trips through DRAM and the separate `jacobi`
@@ -863,6 +974,76 @@ pub fn poisson_apply(
     module.operator::<f64, f64>(
         &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &mass_dev, &fswx_dev, &fswy_dev, ma.n1, nev,
         ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, 0.0, &mut out_dev,
+    )?;
+    Ok(out_dev.to_host_vec(&stream)?)
+}
+
+/// SBM mesh arrays: like [`flatten_mesh`], but every interior face touching an INACTIVE element is
+/// retagged `NEU` (the natural-Neumann surrogate — no operator term), and an `active_elem` mask
+/// (1 = active, 0 = inactive) is returned alongside so the `sbm_operator` kernel can write identity
+/// on the inactive block. The metrics/mass/face-weights/penalty are unchanged (same uniform mesh).
+fn sbm_flatten_mesh(
+    mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32], active: &[bool],
+) -> (MeshArrays, Vec<u32>) {
+    let mut ma = flatten_mesh(mesh, alpha, neumann_tags);
+    let nn = ma.nn;
+    let n1u = ma.n1 as usize;
+    for (e, el) in mesh.elements.iter().enumerate() {
+        for (t, edge) in Edge::ALL.iter().enumerate() {
+            if let Neighbor::Interior { elem: re, .. } = &el.neighbors[*edge as usize] {
+                // Active→inactive (and any inactive element's) interior face ⇒ natural-Neumann.
+                if !active[e] || !active[*re] {
+                    for a in 0..n1u {
+                        ma.fnbr[(e * 4 + t) * n1u + a] = NEU;
+                    }
+                }
+            }
+        }
+    }
+    let _ = nn;
+    let active_elem: Vec<u32> = (0..mesh.n_elements()).map(|e| active[e] as u32).collect();
+    (ma, active_elem)
+}
+
+/// Apply the matrix-free **SBM** operator `A·u` once on the GPU (natural-Neumann surrogate):
+/// real SIPG/Helmholtz on the active elements, identity on the inactive ones. `reaction = 0` is the
+/// pressure-Poisson; `reaction = λ` the viscous Helmholtz. `neumann_tags` are the outer natural
+/// boundaries (e.g. inflow/walls; outflow stays Dirichlet). Bit-for-bit equal to
+/// `gale::dg::ShiftedPoisson::with_bc(mesh, alpha, reaction, neumann_tags, sb).surrogate_neumann().apply`.
+pub fn sbm_poisson_apply(
+    mesh: &Mesh2d,
+    active: &[bool],
+    u: &[f64],
+    alpha: f64,
+    reaction: f64,
+    neumann_tags: &[u32],
+) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+    let (ma, active_elem) = sbm_flatten_mesh(mesh, alpha, neumann_tags, active);
+    assert_eq!(u.len(), ma.ndof, "state length must be n_elements·n_nodes");
+
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+    let d_dev = up(&ma.diff)?;
+    let u_dev = up(u)?;
+    let mass_dev = up(&ma.mass)?;
+    let fswx_dev = up(&ma.fswx)?;
+    let fswy_dev = up(&ma.fswy)?;
+    let fnbr_dev = upu(&ma.fnbr)?;
+    let act_dev = upu(&active_elem)?;
+    let mut gx_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
+    let mut gy_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
+    let mut out_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
+
+    let module = kernels::load(&ctx)?;
+    let nev = ma.ne as u32;
+    let (gcfg, ocfg) = matvec_cfgs(ma.ne, ma.n1);
+    module.gradient::<f64, f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, ma.n1, nev, &mut gx_dev, &mut gy_dev)?;
+    module.sbm_operator::<f64, f64>(
+        &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &mass_dev, &fswx_dev, &fswy_dev, ma.n1, nev,
+        ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, reaction, &act_dev, &mut out_dev,
     )?;
     Ok(out_dev.to_host_vec(&stream)?)
 }
