@@ -110,7 +110,7 @@ pub use hyperbolic::{
 pub use mesh::{Element, Mesh2d, Neighbor};
 pub use multigrid::PMultigrid;
 pub use nonconforming::{NcAdvection, NcMesh, NcNeighbor};
-pub use poisson::Poisson;
+pub use poisson::{Poisson, ShiftedPoisson};
 pub use poisson3d::Poisson3d;
 pub use stokes3d::Stokes3d;
 pub use quad::Reference2dQuad;
