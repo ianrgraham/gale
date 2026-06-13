@@ -60,7 +60,30 @@ Also fixed a general CPU-MG bug found en route: `PMultigrid::coarse_solve` ran 5
 iters/V-cycle on non-h-coarsenable (odd-dim, e.g. 43×8) grids; now uses a loose-tol/cap band-aid
 like the GPU.
 
-## Remaining (later)
+## GPU port — IN PROGRESS (pressure done)
+Extending the existing on-device p-MG-PCG (`gale-gpu` `poisson.rs`) to SBM. The affine-collapse +
+`fnbr` sentinel design makes the natural-Neumann (pressure) case nearly free: an active→inactive
+face is just `NEU`, an inactive element is an identity block.
+- **Increment 1 DONE** (commit `00fbf09`): `sbm_operator` kernel (= `operator` + `active_elem`
+  mask → inactive=identity) + `sbm_flatten_mesh` (active→inactive faces `NEU`) + `sbm_poisson_apply`.
+  Bin `sbm-poisson-check`: GPU matches CPU `ShiftedPoisson::apply` to rel 7.6e-15 (bit-for-bit).
+- **Increment 2 DONE** (commit `9584ec9`): `sbm_operator_jacobi` + an optional `active` mask on
+  `MgConst` + `MgConst::build_sbm` (p-only, from a CPU `ShiftedMultigrid`) + the 4 matvec/smoother
+  macros branch on `active` (Poisson path byte-identical, re-validated). `sbm_pcg_solve` + bin
+  `sbm-pcg-check`: GPU SBM-MG-PCG matches CPU `ShiftedMultigrid::pcg` to rel 4.2e-8, 19=19 iters.
+- **Increment 3 TODO — velocity operator (Dirichlet + Taylor surrogate)**: the genuinely new
+  kernel. Design: mark active→inactive faces with a new `SURR` sentinel (vs `NEU`), upload per
+  face-node shift vectors `sdx/sdy` (length `ne·4·n1`, like `fnbr`). In the kernel's edge loop,
+  for a `SURR` face: `su = u + gx·sdx + gy·sdy`; add consistency+penalty `-sw·∂ₙu + τ·sw·su` to
+  `rf`; symmetry lift `hx += sw·su·nx, hy += sw·su·ny` (gfac=1, single-sided, same fold as now);
+  Taylor penalty lift `px += τ·sw·su·sdx, py += τ·sw·su·sdy` folded as `pr = rx·(wx − hx + px)`,
+  `ps = sy·(wy − hy + py)` (since `gradx_t(px)+grady_t(py) = Drᵀ(rx·px)+Dsᵀ(sy·py)`). Extend
+  `sbm_operator`/`sbm_operator_jacobi` with `sdx/sdy` (pressure passes zeros + no `SURR`), add a
+  velocity `build_sbm` (taylor flag). Validate vs CPU `ShiftedPoisson::…taylor(true).apply`.
+- **Increment 4 TODO**: full GPU SBM cylinder (convection + GPU pressure + GPU velocity + drag),
+  matching the CPU C_D.
+
+## Remaining (accuracy / features, later)
 - Resolution sweep (ny) to confirm the high-order drag converges (order estimate vs penalization).
 - Tune the SBM-MG smoother (96–108 iters is ~5× a clean p-MG's ~20 — functional but not optimal).
 - The first-order *pressure* surrogate (natural-Neumann at the surrogate location) — a higher-order
