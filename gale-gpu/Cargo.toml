@@ -413,3 +413,8 @@ path = "src/bin/sbm_pressure_diag.rs"
 [[bin]]
 name = "sbm-poisson-check"
 path = "src/bin/sbm_poisson_check.rs"
+
+# GPU SBM-MG-PCG (natural-Neumann surrogate) vs CPU ShiftedMultigrid::pcg (port increment 2).
+[[bin]]
+name = "sbm-pcg-check"
+path = "src/bin/sbm_pcg_check.rs"

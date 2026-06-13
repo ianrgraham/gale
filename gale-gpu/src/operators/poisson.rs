@@ -20,7 +20,7 @@ use cuda_core::{CaptureMode, CudaContext, CudaGraphExec, CudaStream, DeviceBuffe
 use cuda_device::{kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
 use std::sync::Arc;
 use cuda_host::cuda_module;
-use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid};
+use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid, ShiftedMultigrid};
 
 const NN_MAX: usize = 81; // (order 8 + 1)²
 const RED: usize = 256; // reduction block size
@@ -491,6 +491,110 @@ mod kernels {
         if let Some(o) = out.get_mut(thread::index_1d()) {
             // Ap = A·u (SIPG + λM), then the damped-Jacobi update folded in: out ← u + ω·invd·(rhs − Ap).
             let ap = acc + rf + lambda * jw_b * u[b].to_f64();
+            *o = U::from_f64(u[b].to_f64() + omega * invd[b] * (rhs[b] - ap));
+        }
+    }
+
+    /// **SBM fused matvec + damped-Jacobi smoother** ([`operator_jacobi`] with the active mask).
+    /// Inactive elements use `Ap = u` (identity), so the update `u + ω·invd·(rhs − u)` (with the
+    /// uploaded `invd = 1` on the inactive block and `rhs = 0` there) drives them toward 0 — the
+    /// same decoupled identity behaviour as the CPU `ShiftedMultigrid` smoother.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sbm_operator_jacobi<U: Scalar, G: Scalar>(
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
+        rhs: &[f64], invd: &[f64], omega: f64, active_elem: &[u32], mut out: DisjointSlice<U>,
+    ) {
+        let sm = DynamicSharedArray::<f64>::get();
+        let n1 = n1 as usize;
+        let nn = n1 * n1;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let in_range = e < ne as usize;
+        let elem_active = if in_range { active_elem[e] != 0 } else { false };
+        let pr = nn + el * nn;
+        let ps = nn + epb * nn + el * nn;
+        let b = e * nn + m;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = d[t];
+            }
+        }
+        let jw_b = jac * mass[m];
+        let mut rf = 0.0f64;
+        if elem_active {
+            unsafe {
+                let wx = jw_b * gx[b].to_f64();
+                let wy = jw_b * gy[b].to_f64();
+                *sm.add(pr + m) = rx * wx;
+                *sm.add(ps + m) = sy * wy;
+            }
+            let ii = m % n1;
+            let jj = m / n1;
+            let mut hx = 0.0f64;
+            let mut hy = 0.0f64;
+            let mut t4 = 0usize;
+            while t4 < 4 {
+                let (on, a, nx, ny, xface) = if t4 == 0 {
+                    (jj == 0, ii, 0.0f64, -1.0f64, true)
+                } else if t4 == 1 {
+                    (ii == n1 - 1, jj, 1.0f64, 0.0f64, false)
+                } else if t4 == 2 {
+                    (jj == n1 - 1, ii, 0.0f64, 1.0f64, true)
+                } else {
+                    (ii == 0, jj, -1.0f64, 0.0f64, false)
+                };
+                if on {
+                    let idx = (e * 4 + t4) * n1 + a;
+                    let nbr = face_nbr[idx];
+                    if nbr != NEU {
+                        let sw = if xface { fswx[a] } else { fswy[a] };
+                        let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
+                        let ug = u[b].to_f64();
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0)
+                        } else {
+                            let ng = nbr as usize;
+                            (0.5 * (dun_e + nx * gx[ng].to_f64() + ny * gy[ng].to_f64()), ug - u[ng].to_f64(), 0.5)
+                        };
+                        let g = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * nx;
+                        hy += g * ny;
+                    }
+                }
+                t4 += 1;
+            }
+            unsafe {
+                *sm.add(pr + m) -= rx * hx;
+                *sm.add(ps + m) -= sy * hy;
+            }
+        }
+        thread::sync_threads();
+        if !in_range {
+            return;
+        }
+        let ap = if elem_active {
+            let i = m % n1;
+            let j = m / n1;
+            let mut acc = 0.0f64;
+            let mut k = 0usize;
+            while k < n1 {
+                unsafe {
+                    acc += *sm.add(k * n1 + i) * *sm.add(pr + k + j * n1)
+                        + *sm.add(k * n1 + j) * *sm.add(ps + i + k * n1);
+                }
+                k += 1;
+            }
+            acc + rf + lambda * jw_b * u[b].to_f64()
+        } else {
+            u[b].to_f64() // inactive: Ap = u (identity)
+        };
+        if let Some(o) = out.get_mut(thread::index_1d()) {
             *o = U::from_f64(u[b].to_f64() + omega * invd[b] * (rhs[b] - ap));
         }
     }
@@ -1350,6 +1454,10 @@ struct MgConst {
     ninv0: f64,
     ninv_c: f64,
     clast: usize,
+    /// **SBM** only: per-level active-element mask (1 = active surrogate-fluid, 0 = inactive solid).
+    /// `Some` ⇒ the matvec/smoother macros call `sbm_operator`/`sbm_operator_jacobi` (identity on the
+    /// inactive block, active→inactive faces already `NEU` in `fnbr`); `None` ⇒ the plain Poisson path.
+    active: Option<Vec<DeviceBuffer<u32>>>,
 }
 
 impl MgConst {
@@ -1453,6 +1561,101 @@ impl MgConst {
             ninv0: 1.0 / n0 as f64,
             ninv_c,
             clast,
+            active: None,
+        })
+    }
+
+    /// Build + upload every level of an **SBM** hierarchy (`ShiftedMultigrid`, natural-Neumann
+    /// surrogate). Like [`build`](Self::build) but per level it uses [`sbm_flatten_mesh`] (active→
+    /// inactive faces tagged `NEU`) and uploads the active-element mask, so the driver's matvec/
+    /// smoother run `sbm_operator`/`sbm_operator_jacobi`. p-only coarsening (no h-transfers).
+    fn build_sbm(
+        stream: &CudaStream, smg: &ShiftedMultigrid,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let nlev = smg.n_levels();
+        let (n_pre, n_post) = smg.smoothing();
+        let n0 = smg.mesh(0).n_elements() * smg.mesh(0).refq.n_nodes();
+        let up = |v: &[f64]| DeviceBuffer::from_host(stream, v);
+        let upu = |v: &[u32]| DeviceBuffer::from_host(stream, v);
+
+        let active_mask = smg.active(); // element-based, identical across p-levels
+        let neumann_tags = smg.neumann_tags();
+        let (mut n1v, mut nev, mut ndofv) = (vec![], vec![], vec![]);
+        let (mut dl, mut massl, mut invd) = (vec![], vec![], vec![]);
+        let (mut rxs, mut sys, mut jacs): (Vec<f64>, Vec<f64>, Vec<f64>) = (vec![], vec![], vec![]);
+        let (mut fnbr, mut fswx, mut fswy, mut taus, mut omega) = (vec![], vec![], vec![], vec![], vec![]);
+        let mut active = Vec::new();
+        for l in 0..nlev {
+            let m = smg.mesh(l);
+            let (ma, act) = sbm_flatten_mesh(m, smg.alpha(), neumann_tags, active_mask);
+            n1v.push(ma.n1);
+            nev.push(ma.ne as u32);
+            ndofv.push(ma.ndof);
+            dl.push(up(&ma.diff)?);
+            massl.push(up(&ma.mass)?);
+            rxs.push(ma.rx);
+            sys.push(ma.sy);
+            jacs.push(ma.jac);
+            invd.push(up(smg.inv_diagonal(l))?);
+            fnbr.push(upu(&ma.fnbr)?);
+            fswx.push(up(&ma.fswx)?);
+            fswy.push(up(&ma.fswy)?);
+            taus.push(ma.tau);
+            omega.push(smg.jacobi_omega(l));
+            active.push(upu(&act)?);
+        }
+        // p-only coarsening: every transition carries a tensor interp matrix; no h-transfers.
+        let mut interp = Vec::new();
+        for l in 0..nlev - 1 {
+            interp.push(up(smg.interp_matrix(l))?);
+        }
+        let is_h = vec![false; nlev - 1];
+        let nxv: Vec<u32> = (0..nlev).map(|_| smg.mesh(0).n_elements() as u32).collect(); // unused (p-only)
+        let pq = up(&[0.0f64; 64][..])?; // dummy (no h-transfers)
+
+        let cfg: Vec<LaunchConfig> = (0..nlev)
+            .map(|l| LaunchConfig { grid_dim: (nev[l], 1, 1), block_dim: (n1v[l] * n1v[l], 1, 1), shared_mem_bytes: 0 })
+            .collect();
+        let vcfg: Vec<LaunchConfig> = ndofv.iter().map(|&n| LaunchConfig::for_num_elems(n as u32)).collect();
+
+        let clast = nlev - 1;
+        let deflate = smg.is_singular();
+        let ones0 = up(&vec![1.0f64; n0])?;
+        let ones_c = up(&vec![1.0f64; ndofv[clast]])?;
+        let ninv_c = 1.0 / ndofv[clast] as f64;
+        Ok(Self {
+            nlev,
+            n_pre,
+            n_post,
+            n0,
+            n1v,
+            nev,
+            ndofv,
+            dl,
+            massl,
+            rxs,
+            sys,
+            jacs,
+            invd,
+            fnbr,
+            fswx,
+            fswy,
+            taus,
+            omega,
+            interp,
+            is_h,
+            nxv,
+            pq,
+            cfg,
+            vcfg,
+            reaction: smg.reaction(),
+            deflate,
+            ones0,
+            ones_c,
+            ninv0: 1.0 / n0 as f64,
+            ninv_c,
+            clast,
+            active: Some(active),
         })
     }
 }
@@ -1482,6 +1685,24 @@ pub fn poisson_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build(&stream, mg)?;
+    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, tol, maxit, false)
+}
+
+/// Solve the **SBM** system `A·u = rhs` by SBM-aware p-multigrid-preconditioned CG, fully on
+/// device (natural-Neumann surrogate). One-shot analogue of [`poisson_pcg_solve`] driven by a CPU
+/// [`ShiftedMultigrid`] (its per-level meshes, inverse diagonals, Jacobi `ω`, p-transfers + the
+/// active mask). The V-cycle smoother/matvec run `sbm_operator`/`sbm_operator_jacobi`; the
+/// singular (closed-box) case is deflated. Mirrors `gale::dg::ShiftedMultigrid::pcg`.
+pub fn sbm_pcg_solve(
+    smg: &ShiftedMultigrid,
+    rhs: &[f64],
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let module = kernels::load(&ctx)?;
+    let dev = MgConst::build_sbm(&stream, smg)?;
     pcg_solve_with::<f64>(&stream, &module, &dev, rhs, tol, maxit, false)
 }
 
@@ -1542,6 +1763,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ninv0,
         ninv_c,
         clast,
+        ref active,
     } = *dev;
     // Per-level packed matvec launch configs (gradient_cfg, operator_cfg) — derived from the
     // element count + order at each level; the transfer/vector kernels keep `cfg`/`vcfg`.
@@ -1645,10 +1867,17 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
             module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
-            module.operator::<f64, G>(
-                &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
-                rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, $dst,
-            )?;
+            if let Some(act) = active {
+                module.sbm_operator::<f64, G>(
+                    &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &act[l], $dst,
+                )?;
+            } else {
+                module.operator::<f64, G>(
+                    &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, $dst,
+                )?;
+            }
         }};
     }
     // One fused damped-Jacobi smoother sweep: gradient + `operator_jacobi` (the matvec with the
@@ -1660,10 +1889,17 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ($l:expr) => {{
             let l = $l;
             module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], &xb[l], rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
-            module.operator_jacobi::<f64, G>(
-                &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
-                rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l], omega[l], &mut sm[l],
-            )?;
+            if let Some(act) = active {
+                module.sbm_operator_jacobi::<f64, G>(
+                    &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l], omega[l], &act[l], &mut sm[l],
+                )?;
+            } else {
+                module.operator_jacobi::<f64, G>(
+                    &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l], omega[l], &mut sm[l],
+                )?;
+            }
             std::mem::swap(&mut xb[l], &mut sm[l]);
         }};
     }
@@ -1682,20 +1918,34 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     macro_rules! matvec0 {
         ($src:expr, $dst:expr) => {{
             module.gradient::<f64, f64>(&stream, mvcfg[0].0, &dl[0], $src, rxs[0], sys[0], n1v[0], nev[0], &mut gx0, &mut gy0)?;
-            module.operator::<f64, f64>(
-                &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], &fswx[0], &fswy[0], n1v[0], nev[0],
-                rxs[0], sys[0], jacs[0], &fnbr[0], taus[0], reaction, $dst,
-            )?;
+            if let Some(act) = active {
+                module.sbm_operator::<f64, f64>(
+                    &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], &fswx[0], &fswy[0], n1v[0], nev[0],
+                    rxs[0], sys[0], jacs[0], &fnbr[0], taus[0], reaction, &act[0], $dst,
+                )?;
+            } else {
+                module.operator::<f64, f64>(
+                    &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], &fswx[0], &fswy[0], n1v[0], nev[0],
+                    rxs[0], sys[0], jacs[0], &fnbr[0], taus[0], reaction, $dst,
+                )?;
+            }
         }};
     }
     macro_rules! matvec_c {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
             module.gradient::<f64, f64>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxc, &mut gyc)?;
-            module.operator::<f64, f64>(
-                &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
-                rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, $dst,
-            )?;
+            if let Some(act) = active {
+                module.sbm_operator::<f64, f64>(
+                    &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &act[l], $dst,
+                )?;
+            } else {
+                module.operator::<f64, f64>(
+                    &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, $dst,
+                )?;
+            }
         }};
     }
     // Coarsest-level solve tolerance/cap. With h-coarsening the coarsest grid is TINY (a few

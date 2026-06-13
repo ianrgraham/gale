@@ -102,11 +102,55 @@ impl ShiftedMultigrid {
         s
     }
 
-    fn n_levels(&self) -> usize {
+    /// Number of multigrid levels (finest … coarsest).
+    pub fn n_levels(&self) -> usize {
         self.orders.len()
     }
     fn ndof(&self, l: usize) -> usize {
         self.meshes[l].n_elements() * self.meshes[l].refq.n_nodes()
+    }
+
+    // --- accessors for an external (GPU) driver that reuses this setup (mirrors PMultigrid) ---
+
+    /// Pre/post smoother sweep counts.
+    pub fn smoothing(&self) -> (usize, usize) {
+        (self.n_pre, self.n_post)
+    }
+    /// Mesh at level `l`.
+    pub fn mesh(&self, l: usize) -> &Mesh2d {
+        &self.meshes[l]
+    }
+    /// SIPG penalty scale.
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+    /// Helmholtz reaction `λ` baked into the hierarchy.
+    pub fn reaction(&self) -> f64 {
+        self.reaction
+    }
+    /// Outer natural (Neumann) boundary tags.
+    pub fn neumann_tags(&self) -> &[u32] {
+        &self.neumann_tags
+    }
+    /// Active-element mask (surrogate-fluid domain) — element-based, identical across p-levels.
+    pub fn active(&self) -> &[bool] {
+        &self.sbs[0].active
+    }
+    /// Inverse operator diagonal (damped-Jacobi denominator) at level `l`.
+    pub fn inv_diagonal(&self, l: usize) -> &[f64] {
+        &self.inv_diag[l]
+    }
+    /// Damped-Jacobi weight `ω = (4/3)/λ_max(D⁻¹A)` at level `l`.
+    pub fn jacobi_omega(&self, l: usize) -> f64 {
+        (4.0 / 3.0) / self.lam_hi[l]
+    }
+    /// 1D p-transfer (Lagrange) matrix for the `l → l+1` transition.
+    pub fn interp_matrix(&self, l: usize) -> &[f64] {
+        &self.interps[l]
+    }
+    /// Whether the operator is singular (constant nullspace) ⇒ deflate.
+    pub fn is_singular(&self) -> bool {
+        self.singular
     }
 
     /// Build the SBM operator for level `l` (rebuilt per call, like `PMultigrid::apply_level`).
