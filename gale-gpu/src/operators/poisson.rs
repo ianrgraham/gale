@@ -853,6 +853,25 @@ mod kernels {
         }
     }
 
+    /// Fused CG update: `α = rz/pap` (computed per-thread, same on-device breakdown guard as
+    /// [`cg_alpha`]), then `x ← x + α·p` and `r ← r − α·Ap` in ONE kernel — replacing the
+    /// `cg_alpha + axpy_s(x,p,α) + axpy_s(r,Ap,−α)` triple. The cylinder solve is GPU-dispatch-bound
+    /// (tiny kernels at the ~1.5–2.4µs per-launch floor), so collapsing 3 dispatches into 1 directly
+    /// cuts wall-clock. `x` and `r` are equal length; the redundant per-thread scalar divide is free.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cg_xr(mut x: DisjointSlice<f64>, mut r: DisjointSlice<f64>, p: &[f64], ap: &[f64], rz: &[f64], pap: &[f64]) {
+        let i = thread::index_1d().get();
+        let a = rz[0] / pap[0];
+        let a = if a.is_finite() { a } else { 0.0 };
+        if let Some(xo) = x.get_mut(thread::index_1d()) {
+            *xo += a * p[i];
+            if let Some(ro) = r.get_mut(thread::index_1d()) {
+                *ro -= a * ap[i];
+            }
+        }
+    }
+
     /// `y ← y + a[0]·x` with the scalar read from a device buffer (the on-device-scalar
     /// companion to [`axpy`], so CG coefficients never round-trip to the host).
     #[kernel]
@@ -1852,8 +1871,6 @@ struct SolverWorkspace<G: Scalar + DeviceCopy> {
     d_rz: DeviceBuffer<f64>,
     d_rznew: DeviceBuffer<f64>,
     d_pap_o: DeviceBuffer<f64>,
-    d_alpha_o: DeviceBuffer<f64>,
-    d_nalpha_o: DeviceBuffer<f64>,
     d_beta_o: DeviceBuffer<f64>,
     d_rr: DeviceBuffer<f64>,
     d_bn2: DeviceBuffer<f64>,
@@ -1862,8 +1879,6 @@ struct SolverWorkspace<G: Scalar + DeviceCopy> {
     d_rs: DeviceBuffer<f64>,
     d_rsnew: DeviceBuffer<f64>,
     d_pap_c: DeviceBuffer<f64>,
-    d_alpha_c: DeviceBuffer<f64>,
-    d_nalpha_c: DeviceBuffer<f64>,
     d_beta_c: DeviceBuffer<f64>,
     d_nmean_c: DeviceBuffer<f64>,
     d_bn_c: DeviceBuffer<f64>,  // coarse ‖b‖² (nested-WHILE coarse convergence test)
@@ -1902,11 +1917,11 @@ impl<G: Scalar + DeviceCopy> SolverWorkspace<G> {
             pz: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             pap: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             partial: DeviceBuffer::<f64>::zeroed(stream, dot_blocks(n0))?,
-            d_rz: z()?, d_rznew: z()?, d_pap_o: z()?, d_alpha_o: z()?, d_nalpha_o: z()?,
+            d_rz: z()?, d_rznew: z()?, d_pap_o: z()?,
             d_beta_o: z()?, d_rr: z()?, d_bn2: z()?,
             d_it: DeviceBuffer::<u32>::zeroed(stream, 1)?,
-            d_nmean_o: z()?, d_rs: z()?, d_rsnew: z()?, d_pap_c: z()?, d_alpha_c: z()?,
-            d_nalpha_c: z()?, d_beta_c: z()?, d_nmean_c: z()?, d_bn_c: z()?,
+            d_nmean_o: z()?, d_rs: z()?, d_rsnew: z()?, d_pap_c: z()?,
+            d_beta_c: z()?, d_nmean_c: z()?, d_bn_c: z()?,
             d_it_c: DeviceBuffer::<u32>::zeroed(stream, 1)?,
             gx0: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             gy0: DeviceBuffer::<f64>::zeroed(stream, n0)?,
@@ -2038,8 +2053,6 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     let mut d_rz = &mut ws.d_rz;
     let mut d_rznew = &mut ws.d_rznew;
     let mut d_pap_o = &mut ws.d_pap_o;
-    let mut d_alpha_o = &mut ws.d_alpha_o;
-    let mut d_nalpha_o = &mut ws.d_nalpha_o;
     let mut d_beta_o = &mut ws.d_beta_o;
     let mut d_rr = &mut ws.d_rr;
     let mut d_bn2 = &mut ws.d_bn2;
@@ -2048,8 +2061,6 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     let mut d_rs = &mut ws.d_rs;
     let mut d_rsnew = &mut ws.d_rsnew;
     let mut d_pap_c = &mut ws.d_pap_c;
-    let mut d_alpha_c = &mut ws.d_alpha_c;
-    let mut d_nalpha_c = &mut ws.d_nalpha_c;
     let mut d_beta_c = &mut ws.d_beta_c;
     let mut d_nmean_c = &mut ws.d_nmean_c;
     let d_bn_c = &mut ws.d_bn_c;
@@ -2253,9 +2264,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             for it in 0..coarse_cap {
                 matvec_c!(l, &tmpb[l], &mut apb[l]); // coarse A·p — FP64 (deflated CG needs exactness)
                 dot_to!(&tmpb[l], &apb[l], n, &mut d_pap_c);
-                module.cg_alpha(&stream, one, &d_rs, &d_pap_c, &mut d_alpha_c, &mut d_nalpha_c)?;
-                module.axpy_s(&stream, vcfg[l], &mut xb[l], &tmpb[l], &d_alpha_c)?; // x += α p
-                module.axpy_s(&stream, vcfg[l], &mut rb[l], &apb[l], &d_nalpha_c)?; // r −= α ap
+                module.cg_xr(&stream, vcfg[l], &mut xb[l], &mut rb[l], &tmpb[l], &apb[l], &d_rs, &d_pap_c)?; // x+=αp; r−=αap
                 deflate_c!(&mut rb[l]); // keep the coarse residual in the range each iter
                 dot_to!(&rb[l], &rb[l], n, &mut d_rsnew);
                 if !fixed_coarse && ((it + 1) % COARSE_CHECK == 0 || it + 1 == coarse_cap) {
@@ -2310,9 +2319,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                         module.operator::<f64, f64>(s2, mvcfg[l].1, &dl[l], &tmpb[l], &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &mut apb[l])?;
                     }
                     dot_s2!(&tmpb[l], &apb[l], &mut d_pap_c);
-                    module.cg_alpha(s2, one, &d_rs, &d_pap_c, &mut d_alpha_c, &mut d_nalpha_c)?;
-                    module.axpy_s(s2, vcfg[l], &mut xb[l], &tmpb[l], &d_alpha_c)?; // x += α p
-                    module.axpy_s(s2, vcfg[l], &mut rb[l], &apb[l], &d_nalpha_c)?; // r −= α ap
+                    module.cg_xr(s2, vcfg[l], &mut xb[l], &mut rb[l], &tmpb[l], &apb[l], &d_rs, &d_pap_c)?; // x+=αp; r−=αap
                     if deflate {
                         dot_s2!(&rb[l], &ones_c, &mut d_nmean_c);
                         module.cg_negmean(s2, one, &mut d_nmean_c, ninv_c)?;
@@ -2442,9 +2449,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             *graph_cache = Some(stream.capture_while(CaptureMode::ThreadLocal, 1, |handle, _s| {
                 matvec0!(&pp, &mut pap); // A·p
                 dot_to!(&pp, &pap, n0, &mut d_pap_o);
-                module.cg_alpha(&stream, one, &d_rz, &d_pap_o, &mut d_alpha_o, &mut d_nalpha_o)?;
-                module.axpy_s(&stream, vcfg[0], &mut psol, &pp, &d_alpha_o)?; // x += α p
-                module.axpy_s(&stream, vcfg[0], &mut pres, &pap, &d_nalpha_o)?; // r −= α Ap
+                module.cg_xr(&stream, vcfg[0], &mut psol, &mut pres, &pp, &pap, &d_rz, &d_pap_o)?; // x+=αp; r−=αAp
                 deflate0!(&mut pres);
                 dot_to!(&pres, &pres, n0, &mut d_rr); // ‖r‖²
                 dcopy!(&bb[0], &pres, n0);
@@ -2475,9 +2480,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     for it in 0..maxit {
         matvec0!(&pp, &mut pap); // outer A·p — FP64 (CG needs an exact operator)
         dot_to!(&pp, &pap, n0, &mut d_pap_o);
-        module.cg_alpha(&stream, one, &d_rz, &d_pap_o, &mut d_alpha_o, &mut d_nalpha_o)?;
-        module.axpy_s(&stream, vcfg[0], &mut psol, &pp, &d_alpha_o)?; // x += α p
-        module.axpy_s(&stream, vcfg[0], &mut pres, &pap, &d_nalpha_o)?; // r −= α Ap
+        module.cg_xr(&stream, vcfg[0], &mut psol, &mut pres, &pp, &pap, &d_rz, &d_pap_o)?; // x+=αp; r−=αAp
         deflate0!(&mut pres); // keep the residual in the range each iteration
         iters = it + 1;
         dot_to!(&pres, &pres, n0, &mut d_rr);
