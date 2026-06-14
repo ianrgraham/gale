@@ -685,6 +685,16 @@ mod kernels {
         }
     }
 
+    /// Prime a graph conditional handle to 1 ("enter the loop"), single-thread. Emitted upstream of
+    /// a nested WHILE node each outer iteration so the inner loop re-enters fresh (the handle's
+    /// ASSIGN_DEFAULT only resets once per top-level launch, not per outer-body iteration).
+    #[kernel]
+    pub fn prime_cond(handle: u64) {
+        if thread::index_1d().get() == 0 {
+            set_conditional(handle, true);
+        }
+    }
+
     /// Two-product fused multiply-add `out[i] = a[i]·b[i] + c[i]·d[i]` (Hadamard). The
     /// device-resident convection primitive: `(u·∇)u`-component `= u·∂ₓu + v·∂ᵧu` from the
     /// element-local gradients, with the field kept on device.
@@ -1856,6 +1866,8 @@ struct SolverWorkspace<G: Scalar + DeviceCopy> {
     d_nalpha_c: DeviceBuffer<f64>,
     d_beta_c: DeviceBuffer<f64>,
     d_nmean_c: DeviceBuffer<f64>,
+    d_bn_c: DeviceBuffer<f64>,  // coarse ‖b‖² (nested-WHILE coarse convergence test)
+    d_it_c: DeviceBuffer<u32>,  // coarse iteration counter (nested-WHILE coarse)
     gx0: DeviceBuffer<f64>,
     gy0: DeviceBuffer<f64>,
     gxc: DeviceBuffer<f64>,
@@ -1894,7 +1906,8 @@ impl<G: Scalar + DeviceCopy> SolverWorkspace<G> {
             d_beta_o: z()?, d_rr: z()?, d_bn2: z()?,
             d_it: DeviceBuffer::<u32>::zeroed(stream, 1)?,
             d_nmean_o: z()?, d_rs: z()?, d_rsnew: z()?, d_pap_c: z()?, d_alpha_c: z()?,
-            d_nalpha_c: z()?, d_beta_c: z()?, d_nmean_c: z()?,
+            d_nalpha_c: z()?, d_beta_c: z()?, d_nmean_c: z()?, d_bn_c: z()?,
+            d_it_c: DeviceBuffer::<u32>::zeroed(stream, 1)?,
             gx0: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             gy0: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             gxc: DeviceBuffer::<f64>::zeroed(stream, dev.ndofv[clast])?,
@@ -2039,6 +2052,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     let mut d_nalpha_c = &mut ws.d_nalpha_c;
     let mut d_beta_c = &mut ws.d_beta_c;
     let mut d_nmean_c = &mut ws.d_nmean_c;
+    let d_bn_c = &mut ws.d_bn_c;
+    let mut d_it_c = &mut ws.d_it_c;
     let mut gx0 = &mut ws.gx0;
     let mut gy0 = &mut ws.gy0;
     let mut gxc = &mut ws.gxc;
@@ -2184,6 +2199,13 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // the V-cycle is captured into a graph — both the per-V-cycle `use_graph` path and the
     // whole-loop `while_graph` path.
     let fixed_coarse = use_graph || while_graph;
+    // WHILE_NESTED_COARSE: use the adaptive nested-WHILE coarse (device-side early-exit, no cap
+    // tuning) instead of the fixed `coarse_cap` inside the captured WHILE body. More robust (no
+    // per-problem cap), but the conditional-node per-iteration overhead makes it SLOWER than a
+    // well-tuned fixed count on warm/few-iteration regimes (SBM cylinder: 22.5 vs 19.5 ms/step),
+    // while being faster on cold many-iteration solves. Off by default ⇒ fixed cap (faster); opt in
+    // for robustness on problems where a fixed cap would inflate the outer iteration count.
+    let nested_coarse = while_graph && std::env::var("WHILE_NESTED_COARSE").is_ok();
     // Adaptive (non-graph) iteration cap. Under a fixed-coarse path the coarse CG instead runs a
     // small FIXED count: the h-coarsened coarsest grid is tiny (CG converges in ≤ ndof iters), so a
     // handful suffices, and a long fixed chain would bloat the captured graph (cuGraphInstantiate
@@ -2204,6 +2226,12 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     } else {
         40
     };
+    // Nested-WHILE coarse: the coarse CG runs as its OWN conditional WHILE node with a device-side
+    // early-exit (`pcg_cond` on the coarse residual), so no fixed-cap tuning is needed — this is the
+    // generous SAFETY bound (a runaway guard; the adaptive exit handles the normal case) and the
+    // squared coarse tolerance the device test compares against.
+    let coarse_cap_safety = (ndofv[clast] + 4).min(if coarse_small { 100 } else { 40 });
+    let coarse_tol2 = coarse_tol * coarse_tol;
     // Coarsest-level CG, on-device scalars; the residual is polled to the host only every
     // COARSE_CHECK iterations (no per-iter sync).
     macro_rules! coarse_cg {
@@ -2240,9 +2268,70 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             }
         }};
     }
-    // One V-cycle: input in bb[0], solution in xb[0].
+    // Coarse CG as a NESTED WHILE conditional node (only valid inside an ACTIVE capture, i.e. the
+    // captured outer-PCG WHILE body). Gives the coarse solve a device-side ADAPTIVE early-exit
+    // instead of a fixed count: the pre-coarse setup + a `prime` kernel run on the main (capturing)
+    // stream each outer iteration; one coarse CG iteration is captured as the loop body on a
+    // SECONDARY stream, and `pcg_cond` on the coarse residual sets the predicate. No `coarse_cap`
+    // tuning, no host readback. Requires the cuda-oxide nested-conditional support.
+    macro_rules! coarse_cg_nested {
+        ($l:expr) => {{
+            let l = $l;
+            let n = ndofv[l];
+            module.scal(&stream, vcfg[l], &mut xb[l], 0.0)?;
+            dcopy!(&rb[l], &bb[l], n);
+            deflate_c!(&mut rb[l]);
+            dcopy!(&tmpb[l], &rb[l], n);
+            dot_to!(&rb[l], &rb[l], n, &mut d_rs); // initial coarse residual²
+            dcopy!(&d_bn_c, &d_rs, 1); // ‖b‖² for the device convergence test
+            // Reset the coarse iteration counter via a capturable DEVICE memset (a host→device
+            // memcpy is not legal mid-capture). Captured into the outer body ⇒ runs each iteration.
+            unsafe {
+                cuda_core::memory::memset_d8_async(d_it_c.cu_deviceptr(), 0, 4, stream.cu_stream())?;
+            }
+            stream.capture_nested_while(
+                |chandle, sp| module.prime_cond(sp, one, chandle.value()),
+                |chandle, s2| {
+                    // dot a·b → out on the secondary (body) stream.
+                    macro_rules! dot_s2 {
+                        ($a:expr, $b:expr, $out:expr) => {{
+                            let nbl = dot_blocks(n);
+                            let redcfg = LaunchConfig { grid_dim: (nbl as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+                            let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+                            module.dot_partial(s2, redcfg, $a, $b, n as u64, &mut partial)?;
+                            module.reduce_scalar(s2, red1, &partial, nbl as u64, $out)?;
+                        }};
+                    }
+                    // coarse A·p on s2
+                    module.gradient::<f64, f64>(s2, mvcfg[l].0, &dl[l], &tmpb[l], rxs[l], sys[l], n1v[l], nev[l], &mut gxc, &mut gyc)?;
+                    if let Some(sbb) = sbm {
+                        module.sbm_operator::<f64, f64>(s2, mvcfg[l].1, &dl[l], &tmpb[l], &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &sbb.sdx[l], &sbb.sdy[l], &sbb.act[l], &mut apb[l])?;
+                    } else {
+                        module.operator::<f64, f64>(s2, mvcfg[l].1, &dl[l], &tmpb[l], &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l], rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &mut apb[l])?;
+                    }
+                    dot_s2!(&tmpb[l], &apb[l], &mut d_pap_c);
+                    module.cg_alpha(s2, one, &d_rs, &d_pap_c, &mut d_alpha_c, &mut d_nalpha_c)?;
+                    module.axpy_s(s2, vcfg[l], &mut xb[l], &tmpb[l], &d_alpha_c)?; // x += α p
+                    module.axpy_s(s2, vcfg[l], &mut rb[l], &apb[l], &d_nalpha_c)?; // r −= α ap
+                    if deflate {
+                        dot_s2!(&rb[l], &ones_c, &mut d_nmean_c);
+                        module.cg_negmean(s2, one, &mut d_nmean_c, ninv_c)?;
+                        module.axpy_s(s2, vcfg[l], &mut rb[l], &ones_c, &d_nmean_c)?;
+                    }
+                    dot_s2!(&rb[l], &rb[l], &mut d_rsnew);
+                    module.cg_beta(s2, one, &d_rsnew, &mut d_rs, &mut d_beta_c)?; // β; rs←rsnew
+                    module.xpby_s(s2, vcfg[l], &mut tmpb[l], &rb[l], &d_beta_c)?; // p = r + β p
+                    // Device-side coarse convergence: exit when ‖r‖²/‖b‖² < tol² (or the safety cap).
+                    module.pcg_cond(s2, one, &d_rsnew, &d_bn_c, coarse_tol2, &mut d_it_c, coarse_cap_safety as u32, chandle.value())?;
+                    Ok(())
+                },
+            )?;
+        }};
+    }
+    // One V-cycle: input in bb[0], solution in xb[0]. `$nested` selects the coarse solver: the
+    // adaptive nested-WHILE coarse (only valid during capture) vs the fixed-count coarse.
     macro_rules! vcycle {
-        () => {{
+        ($nested:expr) => {{
             let last = nlev - 1;
             for l in 0..last {
                 module.scal(&stream, vcfg[l], &mut xb[l], 0.0)?;
@@ -2258,7 +2347,11 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                     module.restrict(&stream, cfg[l], &interp[l], &rb[l], n1v[l], n1v[l + 1], &mut bb[l + 1])?;
                 }
             }
-            coarse_cg!(last);
+            if $nested {
+                coarse_cg_nested!(last);
+            } else {
+                coarse_cg!(last);
+            }
             for l in (0..last).rev() {
                 if is_h[l] {
                     // h-prolong: one block per FINE element (cfg[l]); coarse l+1 → fine l.
@@ -2285,18 +2378,21 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // per-V-cycle `use_graph` path keeps the nested graph for its launch-replay loop.
     let vcycle_graph: Option<CudaGraphExec> = if use_graph && !while_graph {
         Some(stream.capture(CaptureMode::ThreadLocal, || {
-            vcycle!();
+            vcycle!(false); // per-V-cycle graph: fixed coarse (no active outer capture to nest in)
             Ok(())
         })?)
     } else {
         None
     };
+    // `$nested` ⇒ the V-cycle's coarse solve is the adaptive nested-WHILE (only legal when this call
+    // is itself inside an active capture, i.e. the captured outer-PCG body). The live pre-loop and
+    // non-graph paths pass `false`.
     macro_rules! run_vcycle {
-        () => {{
+        ($nested:expr) => {{
             if let Some(ref g) = vcycle_graph {
                 g.launch(stream)?;
             } else {
-                vcycle!();
+                vcycle!($nested);
             }
         }};
     }
@@ -2316,7 +2412,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     }
     deflate0!(&mut pres); // project the initial residual onto the range
     dcopy!(&bb[0], &pres, n0);
-    run_vcycle!();
+    run_vcycle!(false);
     dcopy!(&pz, &xb[0], n0);
     dcopy!(&pp, &pz, n0);
     dot_to!(rhs_dev, rhs_dev, n0, &mut d_bn2); // ‖b‖² kept on device for the convergence test
@@ -2352,7 +2448,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                 deflate0!(&mut pres);
                 dot_to!(&pres, &pres, n0, &mut d_rr); // ‖r‖²
                 dcopy!(&bb[0], &pres, n0);
-                run_vcycle!(); // preconditioner (inlined; vcycle_graph is None under while_graph)
+                run_vcycle!(nested_coarse); // preconditioner; coarse = adaptive nested-WHILE if opted in, else fixed
                 dcopy!(&pz, &xb[0], n0);
                 dot_to!(&pres, &pz, n0, &mut d_rznew);
                 module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β; rz←rznew
@@ -2397,7 +2493,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             break;
         }
         dcopy!(&bb[0], &pres, n0);
-        run_vcycle!();
+        run_vcycle!(false);
         dcopy!(&pz, &xb[0], n0);
         dot_to!(&pres, &pz, n0, &mut d_rznew);
         module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β=rznew/rz; rz←rznew
