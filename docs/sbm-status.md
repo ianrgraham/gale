@@ -1,7 +1,8 @@
 # Sharp-interface (SBM) work stream — status & pin (2026-06-13)
 
-**Pinned / paused here.** Design reference: `docs/research-sharp-interface.md`. This file is
-the "where we left off" so the stream can resume cleanly.
+**Pinned / paused here.** Design reference: `docs/research-sharp-interface.md`. Method landscape +
+**fallback plan** for the uncharted work (moving / many-body / viscoelastic):
+`docs/embedded-boundary-methods.md`. This file is the "where we left off" so the stream resumes cleanly.
 
 ## Done & validated
 - **Step 1 — geometry** (`gale::dg::shifted`, commit `cc38e47`): `LevelSet`/`CircleLevelSet`,
