@@ -92,6 +92,26 @@ face is just `NEU`, an inactive element is an identity block.
   cylinder `SBM_GPU` flag (per-step pressure + velocity on device). Reproduces the CPU trajectory
   to 4 digits; ~35 s settled run (see above).
 
+## Freely-moving SBM — DONE (settling disk, CPU + GPU, validated)
+First moving-body increment (`sbm-moving-disk-check`). A heavy disk (ρs/ρf=4, explicit
+Newton-Euler) settles in a closed no-slip box; each step rebuilds the surrogate at the new center,
+solves the dual-splitting NS step with the body's RIGID velocity as the surrogate no-slip BC, and
+advances `FreeBody::advance` from the recovered force/torque.
+- New: `sbm_force_torque` (force vector + torque on the true circle, high-order Taylor recovery —
+  generalizes `drag_x`); `ShiftedMultigrid::pcg_deflated` (singular closed-box pressure) + a
+  trivial-RHS guard (a body from rest gives a zero step-1 RHS ⇒ unguarded α=0/0=NaN).
+- GPU: `GpuPoissonMg::rebuild_sbm` re-uploads the moving surrogate onto a persistent handle each
+  step (no per-step CUDA-context churn) + warm-started `solve_from`.
+- **Full GPU settling (ny=16):** terminal velocity reached, **v≈−0.0505**, drag **Fy≈0.134 ≈
+  f_net 0.1357** (98.7% force balance), ω≈0 (symmetric fall); 250 steps in ~91 s.
+- **CPU↔GPU cross-check (ny=12, 25 steps):** identical trajectory to 4 digits (v=−0.0186,
+  y=0.8994, Fy=+0.0905, ω=+0.001 on both). GPU ~3–6×/step (muted vs the fixed case because the
+  per-step host MG setup — diagonal probing — is shared; amortizing it is the next lever).
+
+Commits: `f9fc256` (CPU force/torque + Newton-Euler), `346f0be` (GPU rebuild_sbm + bin).
+Next moving-SBM work: amortize the per-step MG setup (reuse while the active mask is unchanged),
+strong coupling for light/neutrally-buoyant particles (added-mass), then many-body suspensions.
+
 ## Remaining (accuracy / features, later)
 - Resolution sweep (ny) to confirm the high-order drag converges (order estimate vs penalization).
 - Tune the SBM-MG smoother (96–108 iters is ~5× a clean p-MG's ~20 — functional but not optimal).
