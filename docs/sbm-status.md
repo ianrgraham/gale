@@ -63,9 +63,10 @@ like the GPU.
 ## GPU port — DONE (full cylinder on device, validated)
 All four increments complete; the SBM cylinder runs entirely on the GPU and reproduces the CPU
 result. **ny=16: GPU C_D = 5.6375 (+1.0%), identical to CPU to 4 digits**; full 260-step settled
-run in **~35 s wall-clock** (incl. build/setup, ~3 CPU cores) vs the CPU's ~15–18 min — roughly
-**~40–75× per step** (the GPU does ~30 iters/step with no warm-start vs the CPU's warm-started
-5–15, yet each iter is far cheaper). Validation bins all pass: sbm-poisson-check (apply 7.6e-15),
+run in **~23 s wall-clock** (incl. build/setup, ~3 CPU cores) vs the CPU's ~15–18 min — a large
+per-step speedup. The GPU solve is **warm-started** (`solve_from`, x0 = previous step), so it
+runs ~4–5 iters/step near steady, matching the CPU's warm-started counts (was ~30/step cold —
+warm-start cut the settled run 35 s → 23 s). Validation bins all pass: sbm-poisson-check (apply 7.6e-15),
 sbm-pcg-check (pressure MG 4.2e-8), sbm-velocity-check (Dirichlet+Taylor 9.2e-14 / 3.8e-12),
 and the standard Poisson path is unaffected (pcg-pressure-check 4.3e-10). Run the GPU cylinder
 with `SBM_GPU=1 cargo oxide run --bin sbm-cylinder-check`.
