@@ -2228,6 +2228,16 @@ impl GpuPoissonMg {
         Ok(Self { stream, module, dev, mixed: false, graph: false })
     }
 
+    /// Re-upload the SBM hierarchy from `smg` onto this handle's **existing context/stream/module**
+    /// (drops the old per-level device buffers). For a MOVING body whose surrogate changes each
+    /// step — rebuild the geometry on the host, then `rebuild_sbm` instead of constructing a new
+    /// `GpuPoissonMg` (which would spawn a fresh CUDA context per step). Module load + context
+    /// creation are amortized; only the per-level arrays are re-copied.
+    pub fn rebuild_sbm(&mut self, smg: &ShiftedMultigrid) -> Result<(), Box<dyn std::error::Error>> {
+        self.dev = MgConst::build_sbm(&self.stream, smg)?;
+        Ok(())
+    }
+
     /// Enable the mixed-precision V-cycle (FP32 gradient intermediates). Opt-in; default is the
     /// bit-exact FP64 path. The final solution stays FP64-accurate (outer CG + reductions are FP64).
     pub fn with_mixed_precision(mut self, mixed: bool) -> Self {

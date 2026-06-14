@@ -14,6 +14,7 @@ use gale::dg::{
     sbm_force_torque, CircleLevelSet, FreeBody, Mesh2d, ShiftedBoundary, ShiftedMultigrid,
     ShiftedPoisson,
 };
+use gale_gpu::operators::poisson::GpuPoissonMg;
 
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
@@ -61,6 +62,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vmax = 0.0f64;
     let y0 = body.body.cy;
 
+    // SBM_GPU: do the per-step elliptic solves on the GPU. The surrogate changes every step, so the
+    // device hierarchy is re-uploaded each step (`rebuild_sbm`) onto persistent handles (context +
+    // module created ONCE). The host still builds the CPU ShiftedMultigrid for the per-level
+    // diagonal/ω (shared setup); the GPU accelerates the solves. Built from the initial pose.
+    let use_gpu = std::env::var("SBM_GPU").is_ok();
+    let (mut gpu_pres, mut gpu_vel) = if use_gpu {
+        let ls0 = CircleLevelSet::new(body.body.cx, body.body.cy, r);
+        let gp = GpuPoissonMg::new_sbm(ShiftedMultigrid::new(
+            p, nx, ny, [0.0, w], [0.0, h], alpha, 0.0, wall_tags.clone(), &ls0, false, false,
+        ))?;
+        let gv = GpuPoissonMg::new_sbm(ShiftedMultigrid::new(
+            p, nx, ny, [0.0, w], [0.0, h], alpha, lambda, vec![], &ls0, true, true,
+        ))?;
+        (Some(gp), Some(gv))
+    } else {
+        (None, None)
+    };
+
     for step in 1..=max_steps {
         let (cx, cy) = (body.body.cx, body.body.cy);
         let (bu, bv, bom) = (body.body.u, body.body.v, body.body.omega);
@@ -70,9 +89,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Operators + SBM-aware multigrids (rebuilt each step as the body moves).
         let pres = ShiftedPoisson::with_bc(&mesh, alpha, 0.0, wall_tags.clone(), sb.clone()).surrogate_neumann();
-        let pres_mg = ShiftedMultigrid::new(p, nx, ny, [0.0, w], [0.0, h], alpha, 0.0, wall_tags.clone(), &ls, false, false);
+        let pres_smg = ShiftedMultigrid::new(p, nx, ny, [0.0, w], [0.0, h], alpha, 0.0, wall_tags.clone(), &ls, false, false);
         let vel = ShiftedPoisson::with_bc(&mesh, alpha, lambda, vec![], sb.clone()).taylor(true);
-        let vel_mg = ShiftedMultigrid::new(p, nx, ny, [0.0, w], [0.0, h], alpha, lambda, vec![], &ls, true, true);
+        let vel_smg = ShiftedMultigrid::new(p, nx, ny, [0.0, w], [0.0, h], alpha, lambda, vec![], &ls, true, true);
 
         // Rigid-body no-slip on the surrogate: u_s = U − ω(y−c_y), v_s = V + ω(x−c_x), evaluated at
         // the true point. Outer walls are no-slip (0). Gate by distance to the center: surrogate
@@ -93,7 +112,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let div: Vec<f64> = grad(&uhx, 0).iter().zip(grad(&uhy, 1).iter()).map(|(a, b)| a + b).collect();
         let fp: Vec<f64> = div.iter().map(|x| -x / dt).collect();
         let bp = pres.rhs(&fp, |_, _| 0.0);
-        (pp, _) = pres_mg.pcg_deflated(&bp, tol, maxit);
+        (pp, _) = if let Some(gp) = gpu_pres.as_mut() {
+            gp.rebuild_sbm(&pres_smg)?;
+            gp.solve_from(&bp, &pp, tol, maxit)? // GPU, warm-started; deflated (singular box)
+        } else {
+            pres_smg.pcg_deflated(&bp, tol, maxit)
+        };
         let (px, py) = (grad(&pp, 0), grad(&pp, 1));
         for i in 0..ndof {
             uhx[i] -= dt * px[i];
@@ -102,8 +126,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Stage 3 — viscous Helmholtz (λM + A)uⁿ⁺¹ = λM û with SBM rigid no-slip.
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
-        ux = vel_mg.pcg(&vel.rhs(&fxv, g_u), tol, maxit).0;
-        uy = vel_mg.pcg(&vel.rhs(&fyv, g_v), tol, maxit).0;
+        let (bx, by) = (vel.rhs(&fxv, g_u), vel.rhs(&fyv, g_v));
+        if let Some(gv) = gpu_vel.as_mut() {
+            gv.rebuild_sbm(&vel_smg)?; // velocity operator (same for both components this step)
+            ux = gv.solve_from(&bx, &ux, tol, maxit)?.0;
+            uy = gv.solve_from(&by, &uy, tol, maxit)?.0;
+        } else {
+            ux = vel_smg.pcg(&bx, tol, maxit).0;
+            uy = vel_smg.pcg(&by, tol, maxit).0;
+        }
 
         // Hydrodynamic force/torque on the true circle, then explicit Newton–Euler.
         let (fx, fy, tq) = sbm_force_torque(&mesh, &sb, &ux, &uy, &pp, nu, cx, cy, r);
