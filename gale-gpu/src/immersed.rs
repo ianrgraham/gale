@@ -55,34 +55,97 @@ pub fn penalize_apply(
     pen: &VolumePenalization,
     dt: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let nn = mesh.refq.n_nodes();
-    let ne = mesh.n_elements();
-    let ndof = ne * nn;
-    assert_eq!(ux.len(), ndof, "ux length must be n_elements·n_nodes");
-    assert_eq!(uy.len(), ndof, "uy length must be n_elements·n_nodes");
+    let mut backend = PenalizeBackend::new(mesh)?;
+    backend.apply(ux, uy, pen, dt)
+}
 
-    let ctx = CudaContext::new(0)?;
-    let stream = ctx.default_stream();
-    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
-    let mut ux_dev = up(ux)?;
-    let mut uy_dev = up(uy)?;
-    let mask_dev = up(&pen.mask)?;
-    let usx_dev = up(&pen.us_x)?;
-    let usy_dev = up(&pen.us_y)?;
+/// **Persistent** 2D penalization backend: loads the device module **once** and keeps reusable
+/// device buffers, so each [`apply`](Self::apply) only uploads the per-step fields (velocity + the
+/// — possibly moving — mask/solid-velocity), launches, and downloads. This is what makes the
+/// penalization stage hooks usable in a real time loop; the one-shot [`penalize_apply`] reloads +
+/// recompiles the whole module (NVVM→nvJitLink→cubin, ~hundreds of ms) every call, which is
+/// catastrophic when driven once per RK stage.
+struct PenalizeBackend {
+    _ctx: std::sync::Arc<CudaContext>,
+    stream: std::sync::Arc<cuda_core::CudaStream>,
+    module: kernels::LoadedModule,
+    cfg: LaunchConfig,
+    nn: u32,
+    ndof: usize,
+    ux_dev: DeviceBuffer<f64>,
+    uy_dev: DeviceBuffer<f64>,
+    mask_dev: DeviceBuffer<f64>,
+    usx_dev: DeviceBuffer<f64>,
+    usy_dev: DeviceBuffer<f64>,
+}
 
-    let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig {
-        grid_dim: (ne as u32, 1, 1),
-        block_dim: (nn as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    module.penalize(
-        &stream, cfg, &mut ux_dev, &mut uy_dev, &mask_dev, &usx_dev, &usy_dev,
-        dt / pen.eta_b, nn as u32,
-    )?;
-    ux.copy_from_slice(&ux_dev.to_host_vec(&stream)?);
-    uy.copy_from_slice(&uy_dev.to_host_vec(&stream)?);
-    Ok(())
+impl PenalizeBackend {
+    fn new(mesh: &Mesh2d) -> Result<Self, Box<dyn std::error::Error>> {
+        let nn = mesh.refq.n_nodes();
+        let ne = mesh.n_elements();
+        let ndof = ne * nn;
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let z = || DeviceBuffer::<f64>::zeroed(&stream, ndof);
+        let (ux_dev, uy_dev, mask_dev, usx_dev, usy_dev) = (z()?, z()?, z()?, z()?, z()?);
+        let module = kernels::load(&ctx)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ne as u32, 1, 1),
+            block_dim: (nn as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        Ok(Self {
+            _ctx: ctx, stream, module, cfg, nn: nn as u32, ndof,
+            ux_dev, uy_dev, mask_dev, usx_dev, usy_dev,
+        })
+    }
+
+    /// One in-place penalization on the persistent backend. Uploads `ux/uy` and the mask + solid
+    /// velocity (re-uploaded every call so a *moving* body's rebuilt mask is honored), launches,
+    /// downloads `ux/uy`. No module load — microseconds, not a per-call recompile.
+    fn apply(
+        &mut self,
+        ux: &mut [f64],
+        uy: &mut [f64],
+        pen: &VolumePenalization,
+        dt: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(ux.len(), self.ndof, "ux length must be n_elements·n_nodes");
+        assert_eq!(uy.len(), self.ndof, "uy length must be n_elements·n_nodes");
+        let s = self.stream.cu_stream();
+        unsafe {
+            use cuda_core::memory::memcpy_htod_async as h2d;
+            h2d(self.ux_dev.cu_deviceptr(), ux.as_ptr(), std::mem::size_of_val(ux), s)?;
+            h2d(self.uy_dev.cu_deviceptr(), uy.as_ptr(), std::mem::size_of_val(uy), s)?;
+            h2d(self.mask_dev.cu_deviceptr(), pen.mask.as_ptr(), std::mem::size_of_val(&pen.mask[..]), s)?;
+            h2d(self.usx_dev.cu_deviceptr(), pen.us_x.as_ptr(), std::mem::size_of_val(&pen.us_x[..]), s)?;
+            h2d(self.usy_dev.cu_deviceptr(), pen.us_y.as_ptr(), std::mem::size_of_val(&pen.us_y[..]), s)?;
+        }
+        self.module.penalize(
+            &self.stream, self.cfg, &mut self.ux_dev, &mut self.uy_dev,
+            &self.mask_dev, &self.usx_dev, &self.usy_dev, dt / pen.eta_b, self.nn,
+        )?;
+        ux.copy_from_slice(&self.ux_dev.to_host_vec(&self.stream)?);
+        uy.copy_from_slice(&self.uy_dev.to_host_vec(&self.stream)?);
+        Ok(())
+    }
+}
+
+/// Lazily build (on first call) and reuse a [`PenalizeBackend`] held in a hook's `RefCell`, then
+/// apply it. Shared by all 2D penalization stage hooks so none reloads the module per stage.
+fn run_penalize(
+    backend: &std::cell::RefCell<Option<PenalizeBackend>>,
+    mesh: &Mesh2d,
+    ux: &mut [f64],
+    uy: &mut [f64],
+    pen: &VolumePenalization,
+    dt: f64,
+) {
+    let mut slot = backend.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(PenalizeBackend::new(mesh).expect("gale-gpu: penalize backend build failed"));
+    }
+    slot.as_mut().unwrap().apply(ux, uy, pen, dt).expect("gale-gpu: penalize_apply failed");
 }
 
 /// Implicit volume-penalization **stage hook** for the GPU flow integrators: applies
@@ -95,13 +158,14 @@ pub struct GpuPenalizationHook {
     velocity: gale::sim::FieldId,
     penal: VolumePenalization,
     dt: f64,
+    backend: std::cell::RefCell<Option<PenalizeBackend>>,
 }
 
 impl GpuPenalizationHook {
     /// Penalize the 2-component `velocity` field with `penal` over a step `dt` (must
     /// match the integrator's step size; β = (dt/η_b)·χ).
     pub fn new(velocity: gale::sim::FieldId, penal: VolumePenalization, dt: f64) -> Self {
-        Self { velocity, penal, dt }
+        Self { velocity, penal, dt, backend: std::cell::RefCell::new(None) }
     }
 }
 
@@ -110,8 +174,7 @@ impl gale::sim::StateStageHook for GpuPenalizationHook {
         let mesh = state.mesh.clone();
         let comps = state.fields.by_id_mut(self.velocity).components_mut();
         let (ux, uy) = comps.split_at_mut(1);
-        penalize_apply(&mesh, &mut ux[0], &mut uy[0], &self.penal, self.dt)
-            .expect("gale-gpu: GpuPenalizationHook penalize_apply failed");
+        run_penalize(&self.backend, &mesh, &mut ux[0], &mut uy[0], &self.penal, self.dt);
     }
 }
 
@@ -133,6 +196,7 @@ pub struct GpuMovingPenalizationHook {
     /// `true` ⇒ strong (implicit) coupling (M3, light/zero-mass stable); `false` ⇒
     /// explicit Newton–Euler (M1, heavy only).
     strong: bool,
+    backend: std::cell::RefCell<Option<PenalizeBackend>>,
 }
 
 impl GpuMovingPenalizationHook {
@@ -148,7 +212,7 @@ impl GpuMovingPenalizationHook {
     ) -> (Self, gale::sim::BodyHandle) {
         let penal = body.penalization(mesh);
         let handle: gale::sim::BodyHandle = std::rc::Rc::new(std::cell::RefCell::new(body));
-        (Self { velocity, dt, body: handle.clone(), penal: std::cell::RefCell::new(penal), strong: false }, handle)
+        (Self { velocity, dt, body: handle.clone(), penal: std::cell::RefCell::new(penal), strong: false, backend: std::cell::RefCell::new(None) }, handle)
     }
 
     /// Enable strong (implicit) fluid–body coupling — required for light /
@@ -179,8 +243,7 @@ impl gale::sim::StateStageHook for GpuMovingPenalizationHook {
             *penal = body.penalization(&mesh); // current pose, NEW rigid velocity
             let comps = state.fields.by_id_mut(self.velocity).components_mut();
             let (ux, uy) = comps.split_at_mut(1);
-            penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
-                .expect("gale-gpu: GpuMovingPenalizationHook penalize_apply (strong) failed");
+            run_penalize(&self.backend, &mesh, &mut ux[0], &mut uy[0], &penal, self.dt);
             body.body.cx += self.dt * u;
             body.body.cy += self.dt * vv;
             body.body.phi += self.dt * om;
@@ -189,8 +252,7 @@ impl gale::sim::StateStageHook for GpuMovingPenalizationHook {
             {
                 let comps = state.fields.by_id_mut(self.velocity).components_mut();
                 let (ux, uy) = comps.split_at_mut(1);
-                penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
-                    .expect("gale-gpu: GpuMovingPenalizationHook penalize_apply failed");
+                run_penalize(&self.backend, &mesh, &mut ux[0], &mut uy[0], &penal, self.dt);
             }
             let v = state.fields.by_id(self.velocity);
             let (fx, fy, tq) =
@@ -216,6 +278,7 @@ pub struct GpuMultiMovingPenalizationHook {
     penal: std::cell::RefCell<VolumePenalization>,
     base_fext: Vec<(f64, f64)>,
     strong: bool,
+    backend: std::cell::RefCell<Option<PenalizeBackend>>,
 }
 
 impl GpuMultiMovingPenalizationHook {
@@ -231,7 +294,7 @@ impl GpuMultiMovingPenalizationHook {
         let penal = suspension.combined_penalization(mesh);
         let base_fext = suspension.bodies.iter().map(|b| b.fext).collect();
         let handle: gale::sim::SuspensionHandle = std::rc::Rc::new(std::cell::RefCell::new(suspension));
-        (Self { velocity, dt, susp: handle.clone(), penal: std::cell::RefCell::new(penal), base_fext, strong: false }, handle)
+        (Self { velocity, dt, susp: handle.clone(), penal: std::cell::RefCell::new(penal), base_fext, strong: false, backend: std::cell::RefCell::new(None) }, handle)
     }
 
     /// Enable strong (implicit) per-body coupling (light/neutrally-buoyant particles).
@@ -274,8 +337,7 @@ impl gale::sim::StateStageHook for GpuMultiMovingPenalizationHook {
             {
                 let comps = state.fields.by_id_mut(self.velocity).components_mut();
                 let (ux, uy) = comps.split_at_mut(1);
-                penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
-                    .expect("gale-gpu: GpuMultiMovingPenalizationHook penalize_apply (strong) failed");
+                run_penalize(&self.backend, &mesh, &mut ux[0], &mut uy[0], &penal, self.dt);
             }
             for b in 0..nb {
                 let (u, vv, om) = newvel[b];
@@ -287,8 +349,7 @@ impl gale::sim::StateStageHook for GpuMultiMovingPenalizationHook {
             {
                 let comps = state.fields.by_id_mut(self.velocity).components_mut();
                 let (ux, uy) = comps.split_at_mut(1);
-                penalize_apply(&mesh, &mut ux[0], &mut uy[0], &penal, self.dt)
-                    .expect("gale-gpu: GpuMultiMovingPenalizationHook penalize_apply failed");
+                run_penalize(&self.backend, &mesh, &mut ux[0], &mut uy[0], &penal, self.dt);
             }
             let ft: Vec<(f64, f64, f64)> = {
                 let v = state.fields.by_id(self.velocity);
@@ -362,36 +423,98 @@ pub fn penalize3d_apply(
     pen: &VolumePenalization3d,
     dt: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let nn = mesh.refh.n_nodes();
-    let ne = mesh.n_elements();
-    let ndof = ne * nn;
-    assert_eq!(ux.len(), ndof, "ux length must be n_elements·n_nodes");
+    let mut backend = Penalize3dBackend::new(mesh)?;
+    backend.apply(ux, uy, uz, pen, dt)
+}
 
-    let ctx = CudaContext::new(0)?;
-    let stream = ctx.default_stream();
-    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
-    let mut ux_dev = up(ux)?;
-    let mut uy_dev = up(uy)?;
-    let mut uz_dev = up(uz)?;
-    let mask_dev = up(&pen.mask)?;
-    let usx_dev = up(&pen.us_x)?;
-    let usy_dev = up(&pen.us_y)?;
-    let usz_dev = up(&pen.us_z)?;
+/// **Persistent** 3D penalization backend — the 3D analogue of [`PenalizeBackend`]: module loaded
+/// once, reusable device buffers, each [`apply`](Self::apply) only uploads the per-step fields.
+struct Penalize3dBackend {
+    _ctx: std::sync::Arc<CudaContext>,
+    stream: std::sync::Arc<cuda_core::CudaStream>,
+    module: kernels3d::LoadedModule,
+    cfg: LaunchConfig,
+    nn: u32,
+    ndof: usize,
+    ux_dev: DeviceBuffer<f64>,
+    uy_dev: DeviceBuffer<f64>,
+    uz_dev: DeviceBuffer<f64>,
+    mask_dev: DeviceBuffer<f64>,
+    usx_dev: DeviceBuffer<f64>,
+    usy_dev: DeviceBuffer<f64>,
+    usz_dev: DeviceBuffer<f64>,
+}
 
-    let module = kernels3d::load(&ctx)?;
-    let cfg = LaunchConfig {
-        grid_dim: (ne as u32, 1, 1),
-        block_dim: (nn as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    module.penalize3d(
-        &stream, cfg, &mut ux_dev, &mut uy_dev, &mut uz_dev, &mask_dev, &usx_dev, &usy_dev,
-        &usz_dev, dt / pen.eta_b, nn as u32,
-    )?;
-    ux.copy_from_slice(&ux_dev.to_host_vec(&stream)?);
-    uy.copy_from_slice(&uy_dev.to_host_vec(&stream)?);
-    uz.copy_from_slice(&uz_dev.to_host_vec(&stream)?);
-    Ok(())
+impl Penalize3dBackend {
+    fn new(mesh: &Mesh3d) -> Result<Self, Box<dyn std::error::Error>> {
+        let nn = mesh.refh.n_nodes();
+        let ne = mesh.n_elements();
+        let ndof = ne * nn;
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let z = || DeviceBuffer::<f64>::zeroed(&stream, ndof);
+        let (ux_dev, uy_dev, uz_dev) = (z()?, z()?, z()?);
+        let (mask_dev, usx_dev, usy_dev, usz_dev) = (z()?, z()?, z()?, z()?);
+        let module = kernels3d::load(&ctx)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ne as u32, 1, 1),
+            block_dim: (nn as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        Ok(Self {
+            _ctx: ctx, stream, module, cfg, nn: nn as u32, ndof,
+            ux_dev, uy_dev, uz_dev,
+            mask_dev, usx_dev, usy_dev, usz_dev,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply(
+        &mut self,
+        ux: &mut [f64],
+        uy: &mut [f64],
+        uz: &mut [f64],
+        pen: &VolumePenalization3d,
+        dt: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(ux.len(), self.ndof, "ux length must be n_elements·n_nodes");
+        let s = self.stream.cu_stream();
+        unsafe {
+            use cuda_core::memory::memcpy_htod_async as h2d;
+            h2d(self.ux_dev.cu_deviceptr(), ux.as_ptr(), std::mem::size_of_val(ux), s)?;
+            h2d(self.uy_dev.cu_deviceptr(), uy.as_ptr(), std::mem::size_of_val(uy), s)?;
+            h2d(self.uz_dev.cu_deviceptr(), uz.as_ptr(), std::mem::size_of_val(uz), s)?;
+            h2d(self.mask_dev.cu_deviceptr(), pen.mask.as_ptr(), std::mem::size_of_val(&pen.mask[..]), s)?;
+            h2d(self.usx_dev.cu_deviceptr(), pen.us_x.as_ptr(), std::mem::size_of_val(&pen.us_x[..]), s)?;
+            h2d(self.usy_dev.cu_deviceptr(), pen.us_y.as_ptr(), std::mem::size_of_val(&pen.us_y[..]), s)?;
+            h2d(self.usz_dev.cu_deviceptr(), pen.us_z.as_ptr(), std::mem::size_of_val(&pen.us_z[..]), s)?;
+        }
+        self.module.penalize3d(
+            &self.stream, self.cfg, &mut self.ux_dev, &mut self.uy_dev, &mut self.uz_dev,
+            &self.mask_dev, &self.usx_dev, &self.usy_dev, &self.usz_dev, dt / pen.eta_b, self.nn,
+        )?;
+        ux.copy_from_slice(&self.ux_dev.to_host_vec(&self.stream)?);
+        uy.copy_from_slice(&self.uy_dev.to_host_vec(&self.stream)?);
+        uz.copy_from_slice(&self.uz_dev.to_host_vec(&self.stream)?);
+        Ok(())
+    }
+}
+
+/// Lazily build + reuse a [`Penalize3dBackend`] held in a hook's `RefCell`, then apply it.
+fn run_penalize3d(
+    backend: &std::cell::RefCell<Option<Penalize3dBackend>>,
+    mesh: &Mesh3d,
+    ux: &mut [f64],
+    uy: &mut [f64],
+    uz: &mut [f64],
+    pen: &VolumePenalization3d,
+    dt: f64,
+) {
+    let mut slot = backend.borrow_mut();
+    if slot.is_none() {
+        *slot = Some(Penalize3dBackend::new(mesh).expect("gale-gpu: penalize3d backend build failed"));
+    }
+    slot.as_mut().unwrap().apply(ux, uy, uz, pen, dt).expect("gale-gpu: penalize3d_apply failed");
 }
 
 /// 3D volume-penalization **stage hook** (`gale::sim::StateStageHook<Mesh3d>`): the 3D
@@ -402,11 +525,12 @@ pub struct GpuPenalization3dHook {
     velocity: gale::sim::FieldId,
     penal: VolumePenalization3d,
     dt: f64,
+    backend: std::cell::RefCell<Option<Penalize3dBackend>>,
 }
 
 impl GpuPenalization3dHook {
     pub fn new(velocity: gale::sim::FieldId, penal: VolumePenalization3d, dt: f64) -> Self {
-        Self { velocity, penal, dt }
+        Self { velocity, penal, dt, backend: std::cell::RefCell::new(None) }
     }
 }
 
@@ -416,7 +540,6 @@ impl gale::sim::StateStageHook<Mesh3d> for GpuPenalization3dHook {
         let comps = state.fields.by_id_mut(self.velocity).components_mut();
         let (ux, rest) = comps.split_at_mut(1);
         let (uy, uz) = rest.split_at_mut(1);
-        penalize3d_apply(&mesh, &mut ux[0], &mut uy[0], &mut uz[0], &self.penal, self.dt)
-            .expect("gale-gpu: GpuPenalization3dHook penalize3d_apply failed");
+        run_penalize3d(&self.backend, &mesh, &mut ux[0], &mut uy[0], &mut uz[0], &self.penal, self.dt);
     }
 }

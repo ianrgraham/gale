@@ -21,6 +21,13 @@ path = "src/lib.rs"
 # LLVM-21 + LLVMEnzyme-21 + ptxas toolchain), so normal builds stay on the fast
 # default NVVM path. Enable with `cargo oxide run --features autodiff …`.
 autodiff = []
+# Single-kernel cooperative (grid::sync) dot `dot_coop`, fusing dot_partial+reduce_scalar
+# into one launch (selected at RUNTIME by the DOT_COOP env var). OFF by default and gated at
+# BUILD time because `grid::sync`'s device atomics currently fail gale's NVVM-IR→nvJitLink
+# runtime link ("NVVM_ERROR_COMPILATION: unsupported operation") — the cooperative-launch
+# graph-capture gate itself PASSES (cuda-oxide coop_capture_spike), the blocker is the LTO
+# atomic lowering. Keeping the kernel out of the default bundle keeps module load working.
+dot_coop = []
 
 [dependencies]
 gale = { path = ".." }

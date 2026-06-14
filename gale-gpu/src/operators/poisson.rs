@@ -67,6 +67,47 @@ fn dot_blocks(ndof: usize) -> usize {
     ndof.div_ceil(RED).clamp(1, 1024)
 }
 
+/// Issue one **cooperative** launch of the `dot_coop` single-kernel dot (the grid::sync fusion of
+/// `dot_partial` + `reduce_scalar`). The cooperative launch path isn't exposed through the typed
+/// `#[cuda_module]` methods, so the kernel ABI is marshalled by hand: each `&[f64]`/`DisjointSlice`
+/// lowers to a `(CUdeviceptr, u64 len)` pair and the scalar `n` to one slot, in declared order.
+/// `grid` must be ≤ one co-resident wave; `grid::sync` deadlocks otherwise. Build-gated behind the
+/// `dot_coop` feature alongside the kernel (see [`kernels::dot_coop`] for why it's off by default).
+#[cfg(feature = "dot_coop")]
+#[allow(clippy::too_many_arguments)]
+fn dot_coop_launch(
+    func: &cuda_core::CudaFunction,
+    stream: &CudaStream,
+    grid: u32,
+    a: &DeviceBuffer<f64>,
+    b: &DeviceBuffer<f64>,
+    n: u64,
+    partial: &mut DeviceBuffer<f64>,
+    out: &mut DeviceBuffer<f64>,
+) -> Result<(), DriverError> {
+    let (mut a_ptr, mut a_len) = cuda_host::read_only_device_buffer_arg(a);
+    let (mut b_ptr, mut b_len) = cuda_host::read_only_device_buffer_arg(b);
+    let mut nn = n;
+    let (mut p_ptr, mut p_len) = cuda_host::writable_device_buffer_arg(partial);
+    let (mut o_ptr, mut o_len) = cuda_host::writable_device_buffer_arg(out);
+    let mut args: Vec<*mut std::ffi::c_void> = Vec::with_capacity(9);
+    cuda_host::push_kernel_device_slice(&mut args, &mut a_ptr, &mut a_len);
+    cuda_host::push_kernel_device_slice(&mut args, &mut b_ptr, &mut b_len);
+    cuda_host::push_kernel_scalar(&mut args, &mut nn);
+    cuda_host::push_kernel_device_slice(&mut args, &mut p_ptr, &mut p_len);
+    cuda_host::push_kernel_device_slice(&mut args, &mut o_ptr, &mut o_len);
+    unsafe {
+        cuda_core::launch_kernel_cooperative_on_stream(
+            func,
+            (grid, 1, 1),
+            (RED as u32, 1, 1),
+            0,
+            stream,
+            &mut args,
+        )
+    }
+}
+
 /// Launch configs for the multi-element-per-block matvec (`gradient`, `operator`) over `ne`
 /// elements at order `n1-1`. Packs `epb` elements per block targeting ~192 threads (≥1), so the
 /// block runs enough warps to hide memory latency (the ncu-identified fix: one element = `nn`
@@ -799,6 +840,108 @@ mod kernels {
         }
         if tid == 0 {
             unsafe { *out.get_unchecked_mut(0) = SH[0]; }
+        }
+    }
+
+    /// Fused dot reduction + CG `β` update. Reduces the `n` block-partials to the new residual
+    /// scalar `rz_new` (exactly like [`reduce_scalar`]), then on thread 0 computes `β = rz_new/rz`
+    /// and advances `rz ← rz_new`. Folds [`cg_beta`]'s separate 1-thread dispatch into the rz·z dot
+    /// it always follows — removing one dispatch-floor kernel per PCG iteration. The β/rz read-write
+    /// is on a single thread of a single block, so it is sequential and race-free (the reason a
+    /// plain parallel `cg_beta`+`xpby` fusion is unsafe). Same breakdown guard as [`cg_beta`].
+    #[kernel]
+    pub fn reduce_beta(partial: &[f64], n: u64, mut rz: DisjointSlice<f64>, mut beta: DisjointSlice<f64>) {
+        static mut SH: SharedArray<f64, RED> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let stride = thread::blockDim_x() as usize;
+        let mut acc = 0.0f64;
+        let mut i = tid;
+        while i < n as usize {
+            acc += partial[i];
+            i += stride;
+        }
+        unsafe { SH[tid] = acc; }
+        thread::sync_threads();
+        let mut s = stride / 2;
+        while s > 0 {
+            if tid < s {
+                unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
+            }
+            thread::sync_threads();
+            s /= 2;
+        }
+        if tid == 0 {
+            unsafe {
+                let rn = SH[0];
+                let ro = *rz.get_unchecked_mut(0);
+                let b = rn / ro;
+                *beta.get_unchecked_mut(0) = if b.is_finite() { b } else { 0.0 };
+                *rz.get_unchecked_mut(0) = rn;
+            }
+        }
+    }
+
+    /// Single-kernel fully-on-device dot `a·b → out[0]`, fusing `dot_partial` + `reduce_scalar`
+    /// via a grid-wide barrier. Each block reduces its grid-strided slice into `partial[blockIdx]`,
+    /// then `grid::sync()` makes all partials visible and block 0 sums them into `out[0]`. Replaces
+    /// the two-dispatch dot with ONE kernel — eliminating `reduce_scalar`'s separate launch (a pure
+    /// dispatch-floor cost, ~16% of GPU compute on the dispatch-bound cylinder). REQUIRES a
+    /// **cooperative launch** (`grid::sync` needs all blocks co-resident), so the grid must be sized
+    /// to one wave: `gridDim ≤ sm_count × max_active_blocks_per_sm`. The cooperative-launch
+    /// graph-capture gate PASSES (cuda-oxide coop_capture_spike), but `grid::sync`'s device atomics
+    /// currently fail gale's NVVM-IR→nvJitLink runtime link, so this kernel is BUILD-gated behind
+    /// the `dot_coop` cargo feature (off by default) to keep the default bundle loadable.
+    #[cfg(feature = "dot_coop")]
+    #[kernel]
+    pub fn dot_coop(a: &[f64], b: &[f64], n: u64, mut partial: DisjointSlice<f64>, mut out: DisjointSlice<f64>) {
+        static mut SH: SharedArray<f64, RED> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let bdim = thread::blockDim_x() as usize;
+        let nblocks = thread::gridDim_x() as usize;
+        let gstride = (thread::gridDim_x() * thread::blockDim_x()) as usize;
+        let mut acc = 0.0f64;
+        let mut i = (thread::blockIdx_x() * thread::blockDim_x()) as usize + tid;
+        while i < n as usize {
+            acc += a[i] * b[i];
+            i += gstride;
+        }
+        unsafe { SH[tid] = acc; }
+        thread::sync_threads();
+        let mut s = bdim / 2;
+        while s > 0 {
+            if tid < s {
+                unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
+            }
+            thread::sync_threads();
+            s /= 2;
+        }
+        if tid == 0 {
+            unsafe { *partial.get_unchecked_mut(thread::blockIdx_x() as usize) = SH[0]; }
+        }
+        // Grid-wide barrier: every block's partial is now visible to block 0.
+        cuda_device::grid::sync();
+        if thread::blockIdx_x() == 0 {
+            // Block 0 sums the `nblocks` partials (grid-strided over this block's threads).
+            let base = partial.as_mut_ptr() as *const f64;
+            let mut acc2 = 0.0f64;
+            let mut j = tid;
+            while j < nblocks {
+                unsafe { acc2 += *base.add(j); }
+                j += bdim;
+            }
+            unsafe { SH[tid] = acc2; }
+            thread::sync_threads();
+            let mut s = bdim / 2;
+            while s > 0 {
+                if tid < s {
+                    unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
+                }
+                thread::sync_threads();
+                s /= 2;
+            }
+            if tid == 0 {
+                unsafe { *out.get_unchecked_mut(0) = SH[0]; }
+            }
         }
     }
 
@@ -1869,7 +2012,6 @@ struct SolverWorkspace<G: Scalar + DeviceCopy> {
     pap: DeviceBuffer<f64>,
     partial: DeviceBuffer<f64>,
     d_rz: DeviceBuffer<f64>,
-    d_rznew: DeviceBuffer<f64>,
     d_pap_o: DeviceBuffer<f64>,
     d_beta_o: DeviceBuffer<f64>,
     d_rr: DeviceBuffer<f64>,
@@ -1887,6 +2029,12 @@ struct SolverWorkspace<G: Scalar + DeviceCopy> {
     gy0: DeviceBuffer<f64>,
     gxc: DeviceBuffer<f64>,
     gyc: DeviceBuffer<f64>,
+    /// Lazily-loaded cooperative `dot_coop` kernel + its one-wave resident block cap
+    /// (`sm_count × max_active_blocks_per_sm`). `None` until first use; populated only when the
+    /// `DOT_COOP` env flag selects the single-kernel grid::sync dot. The grid for a length-`n`
+    /// dot is then `min(dot_blocks(n), cap)`. Build-gated with the kernel (see [`kernels::dot_coop`]).
+    #[cfg(feature = "dot_coop")]
+    dot_coop: Option<(cuda_core::CudaFunction, usize)>,
 }
 
 impl<G: Scalar + DeviceCopy> SolverWorkspace<G> {
@@ -1917,7 +2065,7 @@ impl<G: Scalar + DeviceCopy> SolverWorkspace<G> {
             pz: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             pap: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             partial: DeviceBuffer::<f64>::zeroed(stream, dot_blocks(n0))?,
-            d_rz: z()?, d_rznew: z()?, d_pap_o: z()?,
+            d_rz: z()?, d_pap_o: z()?,
             d_beta_o: z()?, d_rr: z()?, d_bn2: z()?,
             d_it: DeviceBuffer::<u32>::zeroed(stream, 1)?,
             d_nmean_o: z()?, d_rs: z()?, d_rsnew: z()?, d_pap_c: z()?,
@@ -1927,6 +2075,8 @@ impl<G: Scalar + DeviceCopy> SolverWorkspace<G> {
             gy0: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             gxc: DeviceBuffer::<f64>::zeroed(stream, dev.ndofv[clast])?,
             gyc: DeviceBuffer::<f64>::zeroed(stream, dev.ndofv[clast])?,
+            #[cfg(feature = "dot_coop")]
+            dot_coop: None,
         })
     }
 }
@@ -2051,7 +2201,6 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     let mut pap = &mut ws.pap;
     let mut partial = &mut ws.partial;
     let mut d_rz = &mut ws.d_rz;
-    let mut d_rznew = &mut ws.d_rznew;
     let mut d_pap_o = &mut ws.d_pap_o;
     let mut d_beta_o = &mut ws.d_beta_o;
     let mut d_rr = &mut ws.d_rr;
@@ -2071,7 +2220,40 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     let mut gyc = &mut ws.gyc;
     let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
 
-    // Fully on-device dot a·b → device scalar `$out` (dot_partial → reduce_scalar), no sync.
+    // Optional single-kernel grid::sync dot (DOT_COOP=1): fuses dot_partial+reduce_scalar into one
+    // cooperative launch, eliminating reduce_scalar's separate dispatch (~16% of GPU compute on the
+    // dispatch-bound cylinder). Lazily load the `dot_coop` kernel + its one-wave resident block cap
+    // on first use; `None` ⇒ keep the two-stage dot. The cooperative launch captures+replays in the
+    // WHILE graph (verified: cuda-oxide coop_capture_spike).
+    #[cfg(feature = "dot_coop")]
+    let dot_coop_slot = &mut ws.dot_coop;
+    #[cfg(feature = "dot_coop")]
+    if std::env::var("DOT_COOP").is_ok() && dot_coop_slot.is_none() {
+        let f = module.as_cuda_module().load_function("dot_coop")?;
+        let per_sm = f.max_active_blocks_per_multiprocessor(RED as i32, 0)?.max(1);
+        let sms = stream.context().multiprocessor_count()?.max(1);
+        *dot_coop_slot = Some((f, (per_sm * sms) as usize));
+    }
+
+    // Fully on-device dot a·b → device scalar `$out`, no host sync. The two-stage dot_partial →
+    // reduce_scalar (default), or — under the `dot_coop` feature — the fused cooperative single
+    // launch when the `DOT_COOP` env var selected it (`dot_coop_slot` populated above).
+    #[cfg(feature = "dot_coop")]
+    macro_rules! dot_to {
+        ($a:expr, $b:expr, $n:expr, $out:expr) => {{
+            if let Some((ref f, cap)) = *dot_coop_slot {
+                let grid = (dot_blocks($n).min(cap).max(1)) as u32;
+                dot_coop_launch(f, &stream, grid, $a, $b, $n as u64, &mut *partial, $out)?;
+            } else {
+                let nbl = dot_blocks($n);
+                let redcfg = LaunchConfig { grid_dim: (nbl as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+                let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+                module.dot_partial(&stream, redcfg, $a, $b, $n as u64, &mut partial)?;
+                module.reduce_scalar(&stream, red1, &partial, nbl as u64, $out)?;
+            }
+        }};
+    }
+    #[cfg(not(feature = "dot_coop"))]
     macro_rules! dot_to {
         ($a:expr, $b:expr, $n:expr, $out:expr) => {{
             let nbl = dot_blocks($n);
@@ -2079,6 +2261,19 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
             module.dot_partial(&stream, redcfg, $a, $b, $n as u64, &mut partial)?;
             module.reduce_scalar(&stream, red1, &partial, nbl as u64, $out)?;
+        }};
+    }
+    // Fused rz·z dot + CG β: dot `$a·$b` → rz_new, then β = rz_new/$rz and $rz ← rz_new, all on the
+    // reduction's thread 0 (race-free). Replaces a `dot_to!(…, d_rznew)` + `cg_beta(d_rznew, rz, β)`
+    // pair, removing the cg_beta dispatch. Two-stage even under DOT_COOP (the β tail needs the
+    // single-block reduce_beta); the rz·z dot is the only `dot_beta!` user.
+    macro_rules! dot_beta {
+        ($a:expr, $b:expr, $n:expr, $rz:expr, $beta:expr) => {{
+            let nbl = dot_blocks($n);
+            let redcfg = LaunchConfig { grid_dim: (nbl as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+            let red1 = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+            module.dot_partial(&stream, redcfg, $a, $b, $n as u64, &mut partial)?;
+            module.reduce_beta(&stream, red1, &partial, nbl as u64, $rz, $beta)?;
         }};
     }
     macro_rules! dcopy {
@@ -2266,13 +2461,20 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                 dot_to!(&tmpb[l], &apb[l], n, &mut d_pap_c);
                 module.cg_xr(&stream, vcfg[l], &mut xb[l], &mut rb[l], &tmpb[l], &apb[l], &d_rs, &d_pap_c)?; // x+=αp; r−=αap
                 deflate_c!(&mut rb[l]); // keep the coarse residual in the range each iter
-                dot_to!(&rb[l], &rb[l], n, &mut d_rsnew);
-                if !fixed_coarse && ((it + 1) % COARSE_CHECK == 0 || it + 1 == coarse_cap) {
-                    if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bn < coarse_tol {
-                        break;
+                if fixed_coarse {
+                    // Graph mode runs no host residual check, so d_rsnew is consumed ONLY by cg_beta
+                    // ⇒ fold the β-update into the reduction (race-free thread-0 tail), one fewer
+                    // dispatch per coarse iter (the coarse loop is the bulk of the cg_beta calls).
+                    dot_beta!(&rb[l], &rb[l], n, &mut d_rs, &mut d_beta_c); // rs←r·r; β; (fused cg_beta)
+                } else {
+                    dot_to!(&rb[l], &rb[l], n, &mut d_rsnew);
+                    if (it + 1) % COARSE_CHECK == 0 || it + 1 == coarse_cap {
+                        if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bn < coarse_tol {
+                            break;
+                        }
                     }
+                    module.cg_beta(&stream, one, &d_rsnew, &mut d_rs, &mut d_beta_c)?; // β=rsnew/rs; rs←rsnew
                 }
-                module.cg_beta(&stream, one, &d_rsnew, &mut d_rs, &mut d_beta_c)?; // β=rsnew/rs; rs←rsnew
                 module.xpby_s(&stream, vcfg[l], &mut tmpb[l], &rb[l], &d_beta_c)?; // p = r + β p
             }
         }};
@@ -2455,8 +2657,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                 dcopy!(&bb[0], &pres, n0);
                 run_vcycle!(nested_coarse); // preconditioner; coarse = adaptive nested-WHILE if opted in, else fixed
                 dcopy!(&pz, &xb[0], n0);
-                dot_to!(&pres, &pz, n0, &mut d_rznew);
-                module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β; rz←rznew
+                dot_beta!(&pres, &pz, n0, &mut d_rz, &mut d_beta_o); // rz←r·z; β; (fused cg_beta)
                 module.xpby_s(&stream, vcfg[0], &mut pp, &pz, &d_beta_o)?; // p = z + β p
                 // Device-side convergence: increment the counter + set the WHILE predicate. No readback.
                 module.pcg_cond(&stream, one, &d_rr, &d_bn2, tol2, &mut d_it, maxit as u32, handle.value())?;
@@ -2498,8 +2699,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         dcopy!(&bb[0], &pres, n0);
         run_vcycle!(false);
         dcopy!(&pz, &xb[0], n0);
-        dot_to!(&pres, &pz, n0, &mut d_rznew);
-        module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β=rznew/rz; rz←rznew
+        dot_beta!(&pres, &pz, n0, &mut d_rz, &mut d_beta_o); // rz←r·z; β; (fused cg_beta)
         module.xpby_s(&stream, vcfg[0], &mut pp, &pz, &d_beta_o)?; // p = z + β p
     }
     let kind = if deflate { "singular-Neumann pressure" } else { "Helmholtz" };
