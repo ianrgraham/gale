@@ -62,6 +62,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vmax = 0.0f64;
     let y0 = body.body.cy;
 
+    // Amortized MG setup: the expensive colored-diagonal probing + power iteration only changes
+    // when the active-element mask changes (the slow-moving body keeps it fixed for many steps).
+    // Cache the smoother and reuse it (geometry still rebuilt fresh each step) until the mask flips.
+    let mut prev_active: Vec<bool> = Vec::new();
+    let mut cached_pres: Option<(Vec<Vec<f64>>, Vec<f64>)> = None;
+    let mut cached_vel: Option<(Vec<Vec<f64>>, Vec<f64>)> = None;
+    let mut rebuilds = 0usize;
+
     // SBM_GPU: do the per-step elliptic solves on the GPU. The surrogate changes every step, so the
     // device hierarchy is re-uploaded each step (`rebuild_sbm`) onto persistent handles (context +
     // module created ONCE). The host still builds the CPU ShiftedMultigrid for the per-level
@@ -87,11 +95,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ls = CircleLevelSet::new(cx, cy, r);
         let sb = ShiftedBoundary::new(&mesh, &ls);
 
-        // Operators + SBM-aware multigrids (rebuilt each step as the body moves).
+        // Operators (geometry always current). The SBM multigrids' expensive smoother is rebuilt
+        // only when the active mask changes; otherwise it is reused (amortized) with fresh geometry.
         let pres = ShiftedPoisson::with_bc(&mesh, alpha, 0.0, wall_tags.clone(), sb.clone()).surrogate_neumann();
-        let pres_smg = ShiftedMultigrid::new(p, nx, ny, [0.0, w], [0.0, h], alpha, 0.0, wall_tags.clone(), &ls, false, false);
         let vel = ShiftedPoisson::with_bc(&mesh, alpha, lambda, vec![], sb.clone()).taylor(true);
-        let vel_smg = ShiftedMultigrid::new(p, nx, ny, [0.0, w], [0.0, h], alpha, lambda, vec![], &ls, true, true);
+        let (pres_smg, vel_smg) = if sb.active != prev_active {
+            let ps = ShiftedMultigrid::new(p, nx, ny, [0.0, w], [0.0, h], alpha, 0.0, wall_tags.clone(), &ls, false, false);
+            let vs = ShiftedMultigrid::new(p, nx, ny, [0.0, w], [0.0, h], alpha, lambda, vec![], &ls, true, true);
+            cached_pres = Some(ps.smoother_data());
+            cached_vel = Some(vs.smoother_data());
+            prev_active = sb.active.clone();
+            rebuilds += 1;
+            (ps, vs)
+        } else {
+            let ps = ShiftedMultigrid::new_reusing_smoother(p, nx, ny, [0.0, w], [0.0, h], alpha, 0.0, wall_tags.clone(), &ls, false, false, cached_pres.clone().unwrap());
+            let vs = ShiftedMultigrid::new_reusing_smoother(p, nx, ny, [0.0, w], [0.0, h], alpha, lambda, vec![], &ls, true, true, cached_vel.clone().unwrap());
+            (ps, vs)
+        };
 
         // Rigid-body no-slip on the surrogate: u_s = U − ω(y−c_y), v_s = V + ω(x−c_x), evaluated at
         // the true point. Outer walls are no-slip (0). Gate by distance to the center: surrogate
@@ -161,7 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let finite = body.body.cy.is_finite() && body.body.v.is_finite();
     let descending = body.body.v < 0.0;
     let bounded = vmax < 1.0; // a blow-up would race past O(1) immediately
-    println!("\nRESULT  y {:.3}→{:.3}, v={:+.4}, max|v|≈{:.4}", y0, body.body.cy, body.body.v, vmax);
+    println!("\nRESULT  y {:.3}→{:.3}, v={:+.4}, max|v|≈{:.4}  (MG rebuilds: {rebuilds})", y0, body.body.cy, body.body.v, vmax);
     if finite && descending && bounded {
         println!("OK: freely-moving SBM disk is stable & physical (descends, drag resists, no blow-up)");
         Ok(())

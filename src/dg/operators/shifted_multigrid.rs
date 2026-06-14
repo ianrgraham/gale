@@ -63,6 +63,33 @@ impl ShiftedMultigrid {
         order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64, reaction: f64,
         neumann_tags: Vec<u32>, ls: &impl LevelSet, taylor: bool, surrogate_dirichlet: bool,
     ) -> Self {
+        Self::build(order, nx, ny, xr, yr, alpha, reaction, neumann_tags, ls, taylor, surrogate_dirichlet, None)
+    }
+
+    /// Like [`new`](Self::new) but **reuses a cached smoother** (`inv_diag`, `lam_hi`) instead of
+    /// recomputing it (the expensive part of setup: colored-diagonal probing + power iteration).
+    /// For a MOVING body whose active-element mask is unchanged step-to-step — the geometry (meshes,
+    /// surrogate, shift vectors) is rebuilt fresh so the *operator* is current, while the smoother
+    /// (only a preconditioner component) is amortized from the last mask change. Caller passes the
+    /// values from [`smoother_data`](Self::smoother_data) of the previous build; they must match the
+    /// level structure (same `order`/`nx`/`ny`). Recompute (call `new`) when the mask changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_reusing_smoother(
+        order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64, reaction: f64,
+        neumann_tags: Vec<u32>, ls: &impl LevelSet, taylor: bool, surrogate_dirichlet: bool,
+        smoother: (Vec<Vec<f64>>, Vec<f64>),
+    ) -> Self {
+        Self::build(
+            order, nx, ny, xr, yr, alpha, reaction, neumann_tags, ls, taylor, surrogate_dirichlet, Some(smoother),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64, reaction: f64,
+        neumann_tags: Vec<u32>, ls: &impl LevelSet, taylor: bool, surrogate_dirichlet: bool,
+        smoother: Option<(Vec<Vec<f64>>, Vec<f64>)>,
+    ) -> Self {
         let orders = order_levels(order);
         let meshes: Vec<Mesh2d> = orders.iter().map(|&o| Mesh2d::rectangular(o, nx, ny, xr, yr)).collect();
         let sbs: Vec<ShiftedBoundary> = meshes.iter().map(|m| ShiftedBoundary::new(m, ls)).collect();
@@ -94,12 +121,28 @@ impl ShiftedMultigrid {
             xr,
             yr,
         };
-        s.inv_diag = (0..s.orders.len())
-            .into_par_iter()
-            .map(|l| s.diagonal(l).iter().map(|&v| 1.0 / v).collect())
-            .collect();
-        s.lam_hi = (0..s.orders.len()).map(|l| 1.1 * s.power_lambda(l)).collect();
+        match smoother {
+            Some((inv_diag, lam_hi)) => {
+                // Amortized: reuse the cached smoother (geometry above is still current).
+                s.inv_diag = inv_diag;
+                s.lam_hi = lam_hi;
+            }
+            None => {
+                // Full setup: colored-diagonal probing + power iteration (the expensive part).
+                s.inv_diag = (0..s.orders.len())
+                    .into_par_iter()
+                    .map(|l| s.diagonal(l).iter().map(|&v| 1.0 / v).collect())
+                    .collect();
+                s.lam_hi = (0..s.orders.len()).map(|l| 1.1 * s.power_lambda(l)).collect();
+            }
+        }
         s
+    }
+
+    /// The cached smoother data (`inv_diag` per level, `lam_hi` per level) — pass to
+    /// [`new_reusing_smoother`](Self::new_reusing_smoother) to amortize a moving body's per-step setup.
+    pub fn smoother_data(&self) -> (Vec<Vec<f64>>, Vec<f64>) {
+        (self.inv_diag.clone(), self.lam_hi.clone())
     }
 
     /// Number of multigrid levels (finest … coarsest).
