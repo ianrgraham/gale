@@ -60,7 +60,17 @@ Also fixed a general CPU-MG bug found en route: `PMultigrid::coarse_solve` ran 5
 iters/V-cycle on non-h-coarsenable (odd-dim, e.g. 43×8) grids; now uses a loose-tol/cap band-aid
 like the GPU.
 
-## GPU port — IN PROGRESS (pressure done)
+## GPU port — DONE (full cylinder on device, validated)
+All four increments complete; the SBM cylinder runs entirely on the GPU and reproduces the CPU
+result. **ny=16: GPU C_D = 5.6375 (+1.0%), identical to CPU to 4 digits**; full 260-step settled
+run in **~35 s wall-clock** (incl. build/setup, ~3 CPU cores) vs the CPU's ~15–18 min — roughly
+**~40–75× per step** (the GPU does ~30 iters/step with no warm-start vs the CPU's warm-started
+5–15, yet each iter is far cheaper). Validation bins all pass: sbm-poisson-check (apply 7.6e-15),
+sbm-pcg-check (pressure MG 4.2e-8), sbm-velocity-check (Dirichlet+Taylor 9.2e-14 / 3.8e-12),
+and the standard Poisson path is unaffected (pcg-pressure-check 4.3e-10). Run the GPU cylinder
+with `SBM_GPU=1 cargo oxide run --bin sbm-cylinder-check`.
+
+### Increment log
 Extending the existing on-device p-MG-PCG (`gale-gpu` `poisson.rs`) to SBM. The affine-collapse +
 `fnbr` sentinel design makes the natural-Neumann (pressure) case nearly free: an active→inactive
 face is just `NEU`, an inactive element is an identity block.
@@ -71,17 +81,14 @@ face is just `NEU`, an inactive element is an identity block.
   `MgConst` + `MgConst::build_sbm` (p-only, from a CPU `ShiftedMultigrid`) + the 4 matvec/smoother
   macros branch on `active` (Poisson path byte-identical, re-validated). `sbm_pcg_solve` + bin
   `sbm-pcg-check`: GPU SBM-MG-PCG matches CPU `ShiftedMultigrid::pcg` to rel 4.2e-8, 19=19 iters.
-- **Increment 3 TODO — velocity operator (Dirichlet + Taylor surrogate)**: the genuinely new
-  kernel. Design: mark active→inactive faces with a new `SURR` sentinel (vs `NEU`), upload per
-  face-node shift vectors `sdx/sdy` (length `ne·4·n1`, like `fnbr`). In the kernel's edge loop,
-  for a `SURR` face: `su = u + gx·sdx + gy·sdy`; add consistency+penalty `-sw·∂ₙu + τ·sw·su` to
-  `rf`; symmetry lift `hx += sw·su·nx, hy += sw·su·ny` (gfac=1, single-sided, same fold as now);
-  Taylor penalty lift `px += τ·sw·su·sdx, py += τ·sw·su·sdy` folded as `pr = rx·(wx − hx + px)`,
-  `ps = sy·(wy − hy + py)` (since `gradx_t(px)+grady_t(py) = Drᵀ(rx·px)+Dsᵀ(sy·py)`). Extend
-  `sbm_operator`/`sbm_operator_jacobi` with `sdx/sdy` (pressure passes zeros + no `SURR`), add a
-  velocity `build_sbm` (taylor flag). Validate vs CPU `ShiftedPoisson::…taylor(true).apply`.
-- **Increment 4 TODO**: full GPU SBM cylinder (convection + GPU pressure + GPU velocity + drag),
-  matching the CPU C_D.
+- **Increment 3 DONE** (commit `9fad3e9`): velocity operator (Dirichlet + Taylor surrogate). New
+  `SURR` sentinel + per-face-node shift vectors `sdx/sdy`; in the kernel `su = u + gx·sdx + gy·sdy`,
+  consistency+penalty + symmetry lift + the Taylor penalty lift folded as `pr = rx·(wx − hx + px)`.
+  `sbm_flatten_mesh` takes the `ShiftedBoundary` + (surrogate_dirichlet, taylor); `MgConst` bundles
+  per-level `SbmData{act,sdx,sdy}`. Bin `sbm-velocity-check`: apply 9.2e-14, MG-PCG 303=303 / 3.8e-12.
+- **Increment 4 DONE** (commit `cf44f77`): `GpuPoissonMg::new_sbm` (persistent SBM handle) + the
+  cylinder `SBM_GPU` flag (per-step pressure + velocity on device). Reproduces the CPU trajectory
+  to 4 digits; ~35 s settled run (see above).
 
 ## Remaining (accuracy / features, later)
 - Resolution sweep (ny) to confirm the high-order drag converges (order estimate vs penalization).
