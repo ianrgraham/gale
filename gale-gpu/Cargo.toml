@@ -418,3 +418,8 @@ path = "src/bin/sbm_poisson_check.rs"
 [[bin]]
 name = "sbm-pcg-check"
 path = "src/bin/sbm_pcg_check.rs"
+
+# GPU SBM velocity operator (Dirichlet+Taylor surrogate) vs CPU oracle (port increment 3).
+[[bin]]
+name = "sbm-velocity-check"
+path = "src/bin/sbm_velocity_check.rs"

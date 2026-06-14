@@ -152,6 +152,18 @@ impl ShiftedMultigrid {
     pub fn is_singular(&self) -> bool {
         self.singular
     }
+    /// Surrogate boundary (active mask + surrogate faces + shift vectors) at level `l`.
+    pub fn shifted_boundary(&self, l: usize) -> &ShiftedBoundary {
+        &self.sbs[l]
+    }
+    /// Surrogate BC type: `true` ⇒ Dirichlet/Nitsche (velocity no-slip), `false` ⇒ natural-Neumann.
+    pub fn surrogate_dirichlet(&self) -> bool {
+        self.surrogate_dirichlet
+    }
+    /// Whether the high-order Taylor surrogate correction is enabled.
+    pub fn taylor(&self) -> bool {
+        self.taylor
+    }
 
     /// Build the SBM operator for level `l` (rebuilt per call, like `PMultigrid::apply_level`).
     fn op(&self, l: usize) -> ShiftedPoisson<'_> {

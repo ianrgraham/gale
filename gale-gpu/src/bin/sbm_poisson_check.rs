@@ -21,7 +21,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ndof = ne * nn;
     let ls = CircleLevelSet::new(0.7, 0.7, 0.25);
     let sb = ShiftedBoundary::new(&mesh, &ls);
-    let active = sb.active.clone();
     println!("mesh {}×{} p={P}, active {}/{} elements\n", 8, 6, sb.n_active(), ne);
 
     // A broadband state to exercise every term.
@@ -38,7 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cpu_op =
             ShiftedPoisson::with_bc(&mesh, alpha, reaction, neumann.clone(), sb.clone()).surrogate_neumann();
         let cpu = cpu_op.apply(&u);
-        let gpu = gale_gpu::operators::poisson::sbm_poisson_apply(&mesh, &active, &u, alpha, reaction, &neumann)?;
+        // Natural-Neumann surrogate (surrogate_dirichlet = false, taylor = false): the pressure case.
+        let gpu = gale_gpu::operators::poisson::sbm_poisson_apply(&mesh, &sb, &u, alpha, reaction, &neumann, false, false)?;
 
         let mut max_abs = 0.0f64;
         let mut cpu_norm = 0.0f64;

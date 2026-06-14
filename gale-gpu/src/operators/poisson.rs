@@ -20,12 +20,13 @@ use cuda_core::{CaptureMode, CudaContext, CudaGraphExec, CudaStream, DeviceBuffe
 use cuda_device::{kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
 use std::sync::Arc;
 use cuda_host::cuda_module;
-use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid, ShiftedMultigrid};
+use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid, ShiftedBoundary, ShiftedMultigrid};
 
 const NN_MAX: usize = 81; // (order 8 + 1)²
 const RED: usize = 256; // reduction block size
 const BND: u32 = u32::MAX; // sentinel: Dirichlet boundary face (SIPG consistency+penalty)
 const NEU: u32 = u32::MAX - 1; // sentinel: Neumann boundary face (natural BC ⇒ no contribution)
+const SURR: u32 = u32::MAX - 2; // sentinel: SBM Dirichlet surrogate face (Nitsche on S_h u = u+∇u·d)
 
 /// Storage scalar for the matvec / V-cycle, with widen/narrow to the f64 accumulation type. The
 /// matvec is **f32-storage / f64-accumulate**: field vectors live in `T` (halving DRAM traffic when
@@ -290,7 +291,7 @@ mod kernels {
     pub fn sbm_operator<U: Scalar, G: Scalar>(
         d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
         n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
-        active_elem: &[u32], mut out: DisjointSlice<U>,
+        sdx: &[f64], sdy: &[f64], active_elem: &[u32], mut out: DisjointSlice<U>,
     ) {
         let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | PR(epb·nn) | PS(epb·nn) ]
         let n1 = n1 as usize;
@@ -315,16 +316,14 @@ mod kernels {
         let jw_b = jac * mass[m];
         let mut rf = 0.0f64;
         if elem_active {
-            unsafe {
-                let wx = jw_b * gx[b].to_f64();
-                let wy = jw_b * gy[b].to_f64();
-                *sm.add(pr + m) = rx * wx;
-                *sm.add(ps + m) = sy * wy;
-            }
+            let wx = jw_b * gx[b].to_f64();
+            let wy = jw_b * gy[b].to_f64();
             let ii = m % n1;
             let jj = m / n1;
-            let mut hx = 0.0f64;
+            let mut hx = 0.0f64; // symmetry-lift source (subtracted)
             let mut hy = 0.0f64;
+            let mut px = 0.0f64; // SBM Taylor penalty-lift source (added)
+            let mut py = 0.0f64;
             let mut t4 = 0usize;
             while t4 < 4 {
                 let (on, a, nx, ny, xface) = if t4 == 0 {
@@ -339,7 +338,19 @@ mod kernels {
                 if on {
                     let idx = (e * 4 + t4) * n1 + a;
                     let nbr = face_nbr[idx];
-                    if nbr != NEU {
+                    if nbr == SURR {
+                        // SBM Dirichlet surrogate face: single-sided Nitsche on the shifted value
+                        // S_h u = u + ∇u·d (Taylor). Consistency −∮∂ₙu, penalty +∮τ S_h u, symmetry
+                        // lift (hx,hy) and the Taylor penalty lift (px,py), per arXiv:2006.00872 eq 2.14.
+                        let sw = if xface { fswx[a] } else { fswy[a] };
+                        let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
+                        let su = u[b].to_f64() + gx[b].to_f64() * sdx[idx] + gy[b].to_f64() * sdy[idx];
+                        rf += -sw * dun_e + tau * sw * su;
+                        hx += sw * su * nx;
+                        hy += sw * su * ny;
+                        px += tau * sw * su * sdx[idx];
+                        py += tau * sw * su * sdy[idx];
+                    } else if nbr != NEU {
                         let sw = if xface { fswx[a] } else { fswy[a] };
                         let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
                         let ug = u[b].to_f64();
@@ -357,9 +368,12 @@ mod kernels {
                 }
                 t4 += 1;
             }
+            // Fold the volume term, the symmetry lift (−hx,−hy) and the Taylor penalty lift (+px,+py)
+            // into the PR/PS tiles: gradx_t(px)+grady_t(py) = Drᵀ(rx·px)+Dsᵀ(sy·py), so adding rx·px
+            // to PR / sy·py to PS reproduces the CPU's `+lp` exactly (ry=sx=0 affine).
             unsafe {
-                *sm.add(pr + m) -= rx * hx;
-                *sm.add(ps + m) -= sy * hy;
+                *sm.add(pr + m) = rx * (wx - hx + px);
+                *sm.add(ps + m) = sy * (wy - hy + py);
             }
         }
         thread::sync_threads();
@@ -504,7 +518,8 @@ mod kernels {
     pub fn sbm_operator_jacobi<U: Scalar, G: Scalar>(
         d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
         n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
-        rhs: &[f64], invd: &[f64], omega: f64, active_elem: &[u32], mut out: DisjointSlice<U>,
+        rhs: &[f64], invd: &[f64], omega: f64, sdx: &[f64], sdy: &[f64], active_elem: &[u32],
+        mut out: DisjointSlice<U>,
     ) {
         let sm = DynamicSharedArray::<f64>::get();
         let n1 = n1 as usize;
@@ -527,16 +542,14 @@ mod kernels {
         let jw_b = jac * mass[m];
         let mut rf = 0.0f64;
         if elem_active {
-            unsafe {
-                let wx = jw_b * gx[b].to_f64();
-                let wy = jw_b * gy[b].to_f64();
-                *sm.add(pr + m) = rx * wx;
-                *sm.add(ps + m) = sy * wy;
-            }
+            let wx = jw_b * gx[b].to_f64();
+            let wy = jw_b * gy[b].to_f64();
             let ii = m % n1;
             let jj = m / n1;
             let mut hx = 0.0f64;
             let mut hy = 0.0f64;
+            let mut px = 0.0f64;
+            let mut py = 0.0f64;
             let mut t4 = 0usize;
             while t4 < 4 {
                 let (on, a, nx, ny, xface) = if t4 == 0 {
@@ -551,7 +564,16 @@ mod kernels {
                 if on {
                     let idx = (e * 4 + t4) * n1 + a;
                     let nbr = face_nbr[idx];
-                    if nbr != NEU {
+                    if nbr == SURR {
+                        let sw = if xface { fswx[a] } else { fswy[a] };
+                        let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
+                        let su = u[b].to_f64() + gx[b].to_f64() * sdx[idx] + gy[b].to_f64() * sdy[idx];
+                        rf += -sw * dun_e + tau * sw * su;
+                        hx += sw * su * nx;
+                        hy += sw * su * ny;
+                        px += tau * sw * su * sdx[idx];
+                        py += tau * sw * su * sdy[idx];
+                    } else if nbr != NEU {
                         let sw = if xface { fswx[a] } else { fswy[a] };
                         let dun_e = nx * gx[b].to_f64() + ny * gy[b].to_f64();
                         let ug = u[b].to_f64();
@@ -570,8 +592,8 @@ mod kernels {
                 t4 += 1;
             }
             unsafe {
-                *sm.add(pr + m) -= rx * hx;
-                *sm.add(ps + m) -= sy * hy;
+                *sm.add(pr + m) = rx * (wx - hx + px);
+                *sm.add(ps + m) = sy * (wy - hy + py);
             }
         }
         thread::sync_threads();
@@ -1082,31 +1104,50 @@ pub fn poisson_apply(
     Ok(out_dev.to_host_vec(&stream)?)
 }
 
-/// SBM mesh arrays: like [`flatten_mesh`], but every interior face touching an INACTIVE element is
-/// retagged `NEU` (the natural-Neumann surrogate — no operator term), and an `active_elem` mask
-/// (1 = active, 0 = inactive) is returned alongside so the `sbm_operator` kernel can write identity
-/// on the inactive block. The metrics/mass/face-weights/penalty are unchanged (same uniform mesh).
+/// SBM mesh arrays: like [`flatten_mesh`], plus the SBM overlay. Every interior face touching an
+/// INACTIVE element is the surrogate boundary; with `surrogate_dirichlet` it is retagged `SURR`
+/// (the kernel applies the Nitsche term on `S_h u = u+∇u·d`, with the per-node shift `sdx`/`sdy`
+/// filled from the `ShiftedBoundary`; zero shift if `!taylor`), otherwise `NEU` (natural-Neumann
+/// pressure — no term). Returns the arrays, the `active_elem` mask, and the `sdx`/`sdy` shift
+/// fields (length `ne·4·n1`, zero off the surrogate faces).
 fn sbm_flatten_mesh(
-    mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32], active: &[bool],
-) -> (MeshArrays, Vec<u32>) {
+    mesh: &Mesh2d, alpha: f64, neumann_tags: &[u32], sb: &ShiftedBoundary,
+    surrogate_dirichlet: bool, taylor: bool,
+) -> (MeshArrays, Vec<u32>, Vec<f64>, Vec<f64>) {
     let mut ma = flatten_mesh(mesh, alpha, neumann_tags);
     let nn = ma.nn;
     let n1u = ma.n1 as usize;
+    let active = &sb.active;
+    let mut sdx = vec![0.0f64; ma.ne * 4 * n1u];
+    let mut sdy = vec![0.0f64; ma.ne * 4 * n1u];
+    // Active→inactive (and any inactive element's) interior faces are the surrogate boundary.
     for (e, el) in mesh.elements.iter().enumerate() {
         for (t, edge) in Edge::ALL.iter().enumerate() {
             if let Neighbor::Interior { elem: re, .. } = &el.neighbors[*edge as usize] {
-                // Active→inactive (and any inactive element's) interior face ⇒ natural-Neumann.
                 if !active[e] || !active[*re] {
                     for a in 0..n1u {
-                        ma.fnbr[(e * 4 + t) * n1u + a] = NEU;
+                        ma.fnbr[(e * 4 + t) * n1u + a] = if surrogate_dirichlet { SURR } else { NEU };
                     }
                 }
             }
         }
     }
+    // For the Dirichlet surrogate, fill the per-node shift vectors from the ShiftedBoundary faces
+    // (matched to the kernel's along-edge index — sf.nodes[a] ↔ face position a). Zero if !taylor.
+    if surrogate_dirichlet && taylor {
+        for sf in &sb.faces {
+            let e = sf.elem;
+            let t = sf.edge as usize;
+            for (a, sn) in sf.nodes.iter().enumerate() {
+                let idx = (e * 4 + t) * n1u + a;
+                sdx[idx] = sn.dx;
+                sdy[idx] = sn.dy;
+            }
+        }
+    }
     let _ = nn;
     let active_elem: Vec<u32> = (0..mesh.n_elements()).map(|e| active[e] as u32).collect();
-    (ma, active_elem)
+    (ma, active_elem, sdx, sdy)
 }
 
 /// Apply the matrix-free **SBM** operator `A·u` once on the GPU (natural-Neumann surrogate):
@@ -1116,13 +1157,16 @@ fn sbm_flatten_mesh(
 /// `gale::dg::ShiftedPoisson::with_bc(mesh, alpha, reaction, neumann_tags, sb).surrogate_neumann().apply`.
 pub fn sbm_poisson_apply(
     mesh: &Mesh2d,
-    active: &[bool],
+    sb: &ShiftedBoundary,
     u: &[f64],
     alpha: f64,
     reaction: f64,
     neumann_tags: &[u32],
+    surrogate_dirichlet: bool,
+    taylor: bool,
 ) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-    let (ma, active_elem) = sbm_flatten_mesh(mesh, alpha, neumann_tags, active);
+    let (ma, active_elem, sdx, sdy) =
+        sbm_flatten_mesh(mesh, alpha, neumann_tags, sb, surrogate_dirichlet, taylor);
     assert_eq!(u.len(), ma.ndof, "state length must be n_elements·n_nodes");
 
     let ctx = CudaContext::new(0)?;
@@ -1136,6 +1180,8 @@ pub fn sbm_poisson_apply(
     let fswx_dev = up(&ma.fswx)?;
     let fswy_dev = up(&ma.fswy)?;
     let fnbr_dev = upu(&ma.fnbr)?;
+    let sdx_dev = up(&sdx)?;
+    let sdy_dev = up(&sdy)?;
     let act_dev = upu(&active_elem)?;
     let mut gx_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
     let mut gy_dev = DeviceBuffer::<f64>::zeroed(&stream, ma.ndof)?;
@@ -1147,7 +1193,7 @@ pub fn sbm_poisson_apply(
     module.gradient::<f64, f64>(&stream, gcfg, &d_dev, &u_dev, ma.rx, ma.sy, ma.n1, nev, &mut gx_dev, &mut gy_dev)?;
     module.sbm_operator::<f64, f64>(
         &stream, ocfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &mass_dev, &fswx_dev, &fswy_dev, ma.n1, nev,
-        ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, reaction, &act_dev, &mut out_dev,
+        ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, reaction, &sdx_dev, &sdy_dev, &act_dev, &mut out_dev,
     )?;
     Ok(out_dev.to_host_vec(&stream)?)
 }
@@ -1454,10 +1500,18 @@ struct MgConst {
     ninv0: f64,
     ninv_c: f64,
     clast: usize,
-    /// **SBM** only: per-level active-element mask (1 = active surrogate-fluid, 0 = inactive solid).
-    /// `Some` ⇒ the matvec/smoother macros call `sbm_operator`/`sbm_operator_jacobi` (identity on the
-    /// inactive block, active→inactive faces already `NEU` in `fnbr`); `None` ⇒ the plain Poisson path.
-    active: Option<Vec<DeviceBuffer<u32>>>,
+    /// **SBM** per-level device data: `Some` ⇒ the matvec/smoother macros call
+    /// `sbm_operator`/`sbm_operator_jacobi`; `None` ⇒ the plain Poisson path.
+    sbm: Option<SbmData>,
+}
+
+/// Per-level SBM device arrays (one entry per multigrid level): the active-element mask
+/// (1 = active, 0 = inactive) and the surrogate-face shift vectors `sdx`/`sdy` (length `ne·4·n1`,
+/// nonzero only on `SURR` faces; all-zero for the natural-Neumann pressure).
+struct SbmData {
+    act: Vec<DeviceBuffer<u32>>,
+    sdx: Vec<DeviceBuffer<f64>>,
+    sdy: Vec<DeviceBuffer<f64>>,
 }
 
 impl MgConst {
@@ -1561,7 +1615,7 @@ impl MgConst {
             ninv0: 1.0 / n0 as f64,
             ninv_c,
             clast,
-            active: None,
+            sbm: None,
         })
     }
 
@@ -1578,16 +1632,18 @@ impl MgConst {
         let up = |v: &[f64]| DeviceBuffer::from_host(stream, v);
         let upu = |v: &[u32]| DeviceBuffer::from_host(stream, v);
 
-        let active_mask = smg.active(); // element-based, identical across p-levels
         let neumann_tags = smg.neumann_tags();
+        let (sur_d, tay) = (smg.surrogate_dirichlet(), smg.taylor());
         let (mut n1v, mut nev, mut ndofv) = (vec![], vec![], vec![]);
         let (mut dl, mut massl, mut invd) = (vec![], vec![], vec![]);
         let (mut rxs, mut sys, mut jacs): (Vec<f64>, Vec<f64>, Vec<f64>) = (vec![], vec![], vec![]);
         let (mut fnbr, mut fswx, mut fswy, mut taus, mut omega) = (vec![], vec![], vec![], vec![], vec![]);
-        let mut active = Vec::new();
+        let (mut act_dev, mut sdx_dev, mut sdy_dev) = (vec![], vec![], vec![]);
         for l in 0..nlev {
             let m = smg.mesh(l);
-            let (ma, act) = sbm_flatten_mesh(m, smg.alpha(), neumann_tags, active_mask);
+            // Per-level ShiftedBoundary (shift vectors live at this order's face nodes).
+            let (ma, act, sdx, sdy) =
+                sbm_flatten_mesh(m, smg.alpha(), neumann_tags, smg.shifted_boundary(l), sur_d, tay);
             n1v.push(ma.n1);
             nev.push(ma.ne as u32);
             ndofv.push(ma.ndof);
@@ -1602,7 +1658,9 @@ impl MgConst {
             fswy.push(up(&ma.fswy)?);
             taus.push(ma.tau);
             omega.push(smg.jacobi_omega(l));
-            active.push(upu(&act)?);
+            act_dev.push(upu(&act)?);
+            sdx_dev.push(up(&sdx)?);
+            sdy_dev.push(up(&sdy)?);
         }
         // p-only coarsening: every transition carries a tensor interp matrix; no h-transfers.
         let mut interp = Vec::new();
@@ -1655,7 +1713,7 @@ impl MgConst {
             ninv0: 1.0 / n0 as f64,
             ninv_c,
             clast,
-            active: Some(active),
+            sbm: Some(SbmData { act: act_dev, sdx: sdx_dev, sdy: sdy_dev }),
         })
     }
 }
@@ -1763,7 +1821,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ninv0,
         ninv_c,
         clast,
-        ref active,
+        ref sbm,
     } = *dev;
     // Per-level packed matvec launch configs (gradient_cfg, operator_cfg) — derived from the
     // element count + order at each level; the transfer/vector kernels keep `cfg`/`vcfg`.
@@ -1867,10 +1925,10 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
             module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
-            if let Some(act) = active {
+            if let Some(s) = sbm {
                 module.sbm_operator::<f64, G>(
                     &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
-                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &act[l], $dst,
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &s.sdx[l], &s.sdy[l], &s.act[l], $dst,
                 )?;
             } else {
                 module.operator::<f64, G>(
@@ -1889,10 +1947,10 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ($l:expr) => {{
             let l = $l;
             module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], &xb[l], rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
-            if let Some(act) = active {
+            if let Some(s) = sbm {
                 module.sbm_operator_jacobi::<f64, G>(
                     &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
-                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l], omega[l], &act[l], &mut sm[l],
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l], omega[l], &s.sdx[l], &s.sdy[l], &s.act[l], &mut sm[l],
                 )?;
             } else {
                 module.operator_jacobi::<f64, G>(
@@ -1918,10 +1976,10 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     macro_rules! matvec0 {
         ($src:expr, $dst:expr) => {{
             module.gradient::<f64, f64>(&stream, mvcfg[0].0, &dl[0], $src, rxs[0], sys[0], n1v[0], nev[0], &mut gx0, &mut gy0)?;
-            if let Some(act) = active {
+            if let Some(s) = sbm {
                 module.sbm_operator::<f64, f64>(
                     &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], &fswx[0], &fswy[0], n1v[0], nev[0],
-                    rxs[0], sys[0], jacs[0], &fnbr[0], taus[0], reaction, &act[0], $dst,
+                    rxs[0], sys[0], jacs[0], &fnbr[0], taus[0], reaction, &s.sdx[0], &s.sdy[0], &s.act[0], $dst,
                 )?;
             } else {
                 module.operator::<f64, f64>(
@@ -1935,10 +1993,10 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
             module.gradient::<f64, f64>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxc, &mut gyc)?;
-            if let Some(act) = active {
+            if let Some(s) = sbm {
                 module.sbm_operator::<f64, f64>(
                     &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
-                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &act[l], $dst,
+                    rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &s.sdx[l], &s.sdy[l], &s.act[l], $dst,
                 )?;
             } else {
                 module.operator::<f64, f64>(
