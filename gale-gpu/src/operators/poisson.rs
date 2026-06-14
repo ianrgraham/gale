@@ -1743,7 +1743,7 @@ pub fn poisson_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build(&stream, mg)?;
-    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, tol, maxit, false)
+    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false)
 }
 
 /// Solve the **SBM** system `A·u = rhs` by SBM-aware p-multigrid-preconditioned CG, fully on
@@ -1761,7 +1761,7 @@ pub fn sbm_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build_sbm(&stream, smg)?;
-    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, tol, maxit, false)
+    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false)
 }
 
 /// The p-MG-PCG loop given an already-created stream + loaded module + uploaded
@@ -1774,6 +1774,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     module: &kernels::LoadedModule,
     dev: &MgConst,
     rhs: &[f64],
+    x0: Option<&[f64]>,
     tol: f64,
     maxit: usize,
     use_graph: bool,
@@ -2122,8 +2123,19 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // Preconditioned CG on the device. α/β and the deflation mean stay on-device; only the
     // outer residual norm is polled — once per outer iter, which is cheap (PCG converges in
     // ~tens of iters), unlike the coarse solve's hundreds.
-    module.scal(&stream, vcfg[0], &mut psol, 0.0)?;
-    deflate0!(&mut pres); // project the initial residual (=RHS) onto the range
+    // Initial guess: warm-start from `x0` (psol ← x0, residual ← rhs − A·x0) when provided —
+    // for a time loop the previous step's solution collapses the iteration count. Otherwise the
+    // cold start (psol ← 0, residual = rhs). `pres` is currently `rhs` (uploaded at allocation).
+    if let Some(x0v) = x0 {
+        assert_eq!(x0v.len(), n0, "x0 length must match the finest level");
+        let x0_dev = DeviceBuffer::from_host(stream, x0v)?;
+        dcopy!(&psol, &x0_dev, n0); // psol ← x0
+        matvec0!(&psol, &mut pap); // pap ← A·x0  (FP64)
+        module.sub(&stream, vcfg[0], &mut pres, &rhs_dev, &pap)?; // pres ← rhs − A·x0
+    } else {
+        module.scal(&stream, vcfg[0], &mut psol, 0.0)?;
+    }
+    deflate0!(&mut pres); // project the initial residual onto the range
     dcopy!(&bb[0], &pres, n0);
     run_vcycle!();
     dcopy!(&pz, &xb[0], n0);
@@ -2248,13 +2260,29 @@ impl GpuPoissonMg {
         self.dev.reaction
     }
 
-    /// Solve `A·x = rhs` (the hierarchy's operator) by p-MG-PCG; singular pure-Neumann
-    /// systems are auto-deflated. `rhs` is the finest-level RHS.
+    /// Solve `A·x = rhs` (the hierarchy's operator) by p-MG-PCG from a zero initial guess;
+    /// singular pure-Neumann systems are auto-deflated. `rhs` is the finest-level RHS.
     pub fn solve(&self, rhs: &[f64], tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+        self.solve_impl(rhs, None, tol, maxit)
+    }
+
+    /// Like [`solve`](Self::solve) but **warm-started** from `x0` (the residual is initialized to
+    /// `rhs − A·x0`). In a time loop, passing the previous step's solution collapses the iteration
+    /// count as the flow approaches steady state — the device analogue of
+    /// `ShiftedPoisson::solve_pcg_from`'s warm start. `x0` must have length [`ndof`](Self::ndof).
+    pub fn solve_from(
+        &self, rhs: &[f64], x0: &[f64], tol: f64, maxit: usize,
+    ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+        self.solve_impl(rhs, Some(x0), tol, maxit)
+    }
+
+    fn solve_impl(
+        &self, rhs: &[f64], x0: Option<&[f64]>, tol: f64, maxit: usize,
+    ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
         if self.mixed {
-            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, tol, maxit, self.graph)
+            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph)
         } else {
-            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, tol, maxit, self.graph)
+            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph)
         }
     }
 }

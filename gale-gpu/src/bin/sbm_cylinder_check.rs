@@ -132,12 +132,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let div: Vec<f64> = grad(&uhx, 0).iter().zip(grad(&uhy, 1).iter()).map(|(a, b)| a + b).collect();
         let fp: Vec<f64> = div.iter().map(|x| -x / dt).collect();
         let bp = pres.rhs(&fp, g_p);
-        let pit;
-        (pp, pit) = if let Some(gp) = &gpu_pres {
-            gp.solve(&bp, ptol, maxit)?
+        let (newp, pit) = if let Some(gp) = &gpu_pres {
+            gp.solve_from(&bp, &pp, ptol, maxit)? // GPU, warm-started from the previous step
         } else {
             pres.solve_pcg_from(&bp, pp.clone(), |r| pres_mg.precondition(r), ptol, maxit)
         };
+        pp = newp;
         // Stage 2b: u* = û − Δt ∇p.
         let (px, py) = (grad(&pp, 0), grad(&pp, 1));
         for i in 0..ndof {
@@ -148,12 +148,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
         let (uxn, vitx) = if let Some(gv) = &gpu_vel {
-            gv.solve(&vel.rhs(&fxv, g_u), vtol, maxit)?
+            gv.solve_from(&vel.rhs(&fxv, g_u), &ux, vtol, maxit)?
         } else {
             vel.solve_pcg_from(&vel.rhs(&fxv, g_u), ux.clone(), |r| vel_mg.precondition(r), vtol, maxit)
         };
         let (uyn, vity) = if let Some(gv) = &gpu_vel {
-            gv.solve(&vel.rhs(&fyv, g_v), vtol, maxit)?
+            gv.solve_from(&vel.rhs(&fyv, g_v), &uy, vtol, maxit)?
         } else {
             vel.solve_pcg_from(&vel.rhs(&fyv, g_v), uy.clone(), |r| vel_mg.precondition(r), vtol, maxit)
         };
