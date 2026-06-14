@@ -406,6 +406,10 @@ path = "src/bin/device_resident_flow_check.rs"
 name = "sbm-cylinder-resident-check"
 path = "src/bin/sbm_cylinder_resident_check.rs"
 
+[[bin]]
+name = "while-graph-pcg-check"
+path = "src/bin/while_graph_pcg_check.rs"
+
 # Validates p-MG PCG for the singular pure-Neumann pressure-Poisson (deflated) vs CG.
 [[bin]]
 name = "pcg-pressure-check"

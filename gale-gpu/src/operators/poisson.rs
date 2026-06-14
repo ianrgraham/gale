@@ -17,7 +17,7 @@
 //! Libdevice-free ⇒ the embedded path works on sm_70.
 
 use cuda_core::{CaptureMode, CudaContext, CudaGraphExec, CudaStream, DeviceBuffer, DeviceCopy, DriverError, LaunchConfig};
-use cuda_device::{kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
+use cuda_device::{graph::set_conditional, kernel, thread, DisjointSlice, DynamicSharedArray, SharedArray};
 use std::sync::Arc;
 use cuda_host::cuda_module;
 use gale::dg::{Edge, Mesh2d, Neighbor, PMultigrid, ShiftedBoundary, ShiftedMultigrid};
@@ -663,6 +663,25 @@ mod kernels {
         let i = idx.get();
         if let Some(o) = b.get_mut(idx) {
             *o = scale * jw[i] * f[i] + lift[i];
+        }
+    }
+
+    /// Outer-PCG convergence test, evaluated ON DEVICE so the solve loop can run as a CUDA graph
+    /// WHILE conditional node with NO per-iteration host residual readback. Single-thread launch.
+    /// Increments the iteration counter `it`, forms the squared relative residual `rr/bn2`
+    /// (`rr = ‖r‖²`, `bn2 = ‖b‖²`), and sets the conditional predicate to continue while it exceeds
+    /// `tol2 = tol²` and the cap `maxit` is not yet reached. A non-finite ratio ⇒ stop (matches the
+    /// host loop's `!rel.is_finite()` bail). `handle` is the graph conditional handle (as `u64`).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn pcg_cond(rr: &[f64], bn2: &[f64], tol2: f64, mut it: DisjointSlice<u32>, maxit: u32, handle: u64) {
+        let idx = thread::index_1d();
+        if let Some(c) = it.get_mut(idx) {
+            let n = *c + 1;
+            *c = n;
+            let b = bn2[0];
+            let rel2 = if b > 0.0 { rr[0] / b } else { 0.0 };
+            set_conditional(handle, rel2 >= tol2 && n < maxit);
         }
     }
 
@@ -1772,7 +1791,7 @@ pub fn poisson_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build(&stream, mg)?;
-    pcg_solve_host::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false)
+    pcg_solve_host::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false, false)
 }
 
 /// Solve the **SBM** system `A·u = rhs` by SBM-aware p-multigrid-preconditioned CG, fully on
@@ -1790,7 +1809,7 @@ pub fn sbm_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build_sbm(&stream, smg)?;
-    pcg_solve_host::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false)
+    pcg_solve_host::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false, false)
 }
 
 /// The p-MG-PCG loop given an already-created stream + loaded module + uploaded
@@ -1812,6 +1831,7 @@ fn pcg_solve_host<G: Scalar + DeviceCopy>(
     tol: f64,
     maxit: usize,
     use_graph: bool,
+    while_graph: bool,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
     let rhs_dev = DeviceBuffer::from_host(stream, rhs)?;
     let x0_dev = match x0 {
@@ -1819,7 +1839,7 @@ fn pcg_solve_host<G: Scalar + DeviceCopy>(
         None => None,
     };
     let mut out = DeviceBuffer::<f64>::zeroed(stream, dev.n0)?;
-    let iters = pcg_solve_with::<G>(stream, module, dev, &rhs_dev, x0_dev.as_ref(), &mut out, tol, maxit, use_graph)?;
+    let iters = pcg_solve_with::<G>(stream, module, dev, &rhs_dev, x0_dev.as_ref(), &mut out, tol, maxit, use_graph, while_graph)?;
     Ok((out.to_host_vec(stream)?, iters))
 }
 
@@ -1838,7 +1858,12 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     tol: f64,
     maxit: usize,
     use_graph: bool,
+    while_graph: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    // `while_graph`: run the ENTIRE outer PCG loop as ONE device-side CUDA graph WHILE conditional
+    // node — the convergence test (`pcg_cond`) sets the loop predicate on the device, so there is
+    // NO per-iteration host residual readback at all (the whole solve is one `cuGraphLaunch`).
+    // Requires a non-legacy stream and the host-branch-free coarse CG (shared with `use_graph`).
     // `use_graph`: capture the V-cycle launch sequence into a CUDA graph once and replay it each
     // outer PCG iteration, instead of re-issuing its ~500 tiny kernel launches. The solve is
     // launch-bound (cuLaunchKernel ≈ 83% of host time), so this is the dominant lever. Requires
@@ -1928,6 +1953,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     let mut d_nalpha_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
     let mut d_beta_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
     let mut d_rr = DeviceBuffer::<f64>::zeroed(stream, 1)?; // outer residual ‖r‖²
+    let mut d_bn2 = DeviceBuffer::<f64>::zeroed(stream, 1)?; // ‖b‖² (device, for the WHILE-graph convergence test)
+    let mut d_it = DeviceBuffer::<u32>::zeroed(stream, 1)?; // device iteration counter (WHILE-graph path)
     let mut d_nmean_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
     let mut d_rs = DeviceBuffer::<f64>::zeroed(stream, 1)?; // coarse: r·r (CG)
     let mut d_rsnew = DeviceBuffer::<f64>::zeroed(stream, 1)?;
@@ -2077,11 +2104,15 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // and the outer PCG absorbs the inexactness.
     let coarse_small = ndofv[clast] <= 1024;
     let coarse_tol = if coarse_small { 1e-9 } else { 1e-2 };
-    // Adaptive (non-graph) iteration cap. Under `use_graph` the coarse CG instead runs a small
-    // FIXED count: the h-coarsened coarsest grid is tiny (CG converges in ≤ ndof iters), so a
+    // The coarse CG must be host-branch-free (fixed iteration count, no residual polling) whenever
+    // the V-cycle is captured into a graph — both the per-V-cycle `use_graph` path and the
+    // whole-loop `while_graph` path.
+    let fixed_coarse = use_graph || while_graph;
+    // Adaptive (non-graph) iteration cap. Under a fixed-coarse path the coarse CG instead runs a
+    // small FIXED count: the h-coarsened coarsest grid is tiny (CG converges in ≤ ndof iters), so a
     // handful suffices, and a long fixed chain would bloat the captured graph (cuGraphInstantiate
     // cost scales with node count — a 100-iter coarse chain is ~1300 extra nodes).
-    let coarse_cap = if use_graph {
+    let coarse_cap = if fixed_coarse {
         (ndofv[clast] + 4).min(if coarse_small { 100 } else { 40 })
     } else if coarse_small {
         100
@@ -2104,7 +2135,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             // `coarse_cap` iterations with no readback (a tiny h-coarsened grid converges well
             // within the cap; the extra iters are cheap and, captured into the graph, add ~zero
             // launch cost). Otherwise it polls every COARSE_CHECK iters and breaks at `coarse_tol`.
-            let bn = if use_graph { 1.0 } else { d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300) };
+            let bn = if fixed_coarse { 1.0 } else { d_rs.to_host_vec(&stream)?[0].sqrt().max(1e-300) };
             const COARSE_CHECK: usize = 10;
             for it in 0..coarse_cap {
                 matvec_c!(l, &tmpb[l], &mut apb[l]); // coarse A·p — FP64 (deflated CG needs exactness)
@@ -2114,7 +2145,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
                 module.axpy_s(&stream, vcfg[l], &mut rb[l], &apb[l], &d_nalpha_c)?; // r −= α ap
                 deflate_c!(&mut rb[l]); // keep the coarse residual in the range each iter
                 dot_to!(&rb[l], &rb[l], n, &mut d_rsnew);
-                if !use_graph && ((it + 1) % COARSE_CHECK == 0 || it + 1 == coarse_cap) {
+                if !fixed_coarse && ((it + 1) % COARSE_CHECK == 0 || it + 1 == coarse_cap) {
                     if d_rsnew.to_host_vec(&stream)?[0].sqrt() / bn < coarse_tol {
                         break;
                     }
@@ -2164,7 +2195,10 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // single `cuGraphLaunch`. Requires the host-branch-free coarse CG (above, under `use_graph`)
     // and a non-legacy stream (the handle supplies one in graph mode). `run_vcycle!` dispatches
     // to the replay or the direct launches.
-    let vcycle_graph: Option<CudaGraphExec> = if use_graph {
+    // Under `while_graph` the whole outer loop (V-cycle included) is captured into the WHILE node,
+    // so the V-cycle is inlined (not a nested graph launch, which is not capture-safe). The
+    // per-V-cycle `use_graph` path keeps the nested graph for its launch-replay loop.
+    let vcycle_graph: Option<CudaGraphExec> = if use_graph && !while_graph {
         Some(stream.capture(CaptureMode::ThreadLocal, || {
             vcycle!();
             Ok(())
@@ -2200,9 +2234,47 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     run_vcycle!();
     dcopy!(&pz, &xb[0], n0);
     dcopy!(&pp, &pz, n0);
-    dot_to!(rhs_dev, rhs_dev, n0, &mut d_rr);
-    let bn = d_rr.to_host_vec(&stream)?[0].sqrt().max(1e-300);
+    dot_to!(rhs_dev, rhs_dev, n0, &mut d_bn2); // ‖b‖² kept on device for the convergence test
     dot_to!(&pres, &pz, n0, &mut d_rz);
+
+    // WHILE-graph path: capture the ENTIRE outer PCG loop body into a CUDA graph WHILE conditional
+    // node and launch it ONCE. `pcg_cond` evaluates the relative residual and sets the loop
+    // predicate on the device, so the whole adaptive solve runs with NO per-iteration host readback
+    // (the device residual is never copied back). The captured body is exactly one host-iteration of
+    // the loop below, with the `if rel<tol break` host branch replaced by the device `pcg_cond`. The
+    // last (converging) iteration does one extra V-cycle whose result is unused — `psol` is updated
+    // before the test, so the solution is identical. `d_it` (zeroed) counts iterations device-side.
+    if while_graph {
+        let tol2 = tol * tol;
+        let exec = stream.capture_while(CaptureMode::ThreadLocal, 1, |handle, _s| {
+            matvec0!(&pp, &mut pap); // A·p
+            dot_to!(&pp, &pap, n0, &mut d_pap_o);
+            module.cg_alpha(&stream, one, &d_rz, &d_pap_o, &mut d_alpha_o, &mut d_nalpha_o)?;
+            module.axpy_s(&stream, vcfg[0], &mut psol, &pp, &d_alpha_o)?; // x += α p
+            module.axpy_s(&stream, vcfg[0], &mut pres, &pap, &d_nalpha_o)?; // r −= α Ap
+            deflate0!(&mut pres);
+            dot_to!(&pres, &pres, n0, &mut d_rr); // ‖r‖²
+            dcopy!(&bb[0], &pres, n0);
+            run_vcycle!(); // preconditioner (inlined; vcycle_graph is None under while_graph)
+            dcopy!(&pz, &xb[0], n0);
+            dot_to!(&pres, &pz, n0, &mut d_rznew);
+            module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β; rz←rznew
+            module.xpby_s(&stream, vcfg[0], &mut pp, &pz, &d_beta_o)?; // p = z + β p
+            // Device-side convergence: increment the counter + set the WHILE predicate. No readback.
+            module.pcg_cond(&stream, one, &d_rr, &d_bn2, tol2, &mut d_it, maxit as u32, handle.value())?;
+            Ok(())
+        })?;
+        exec.launch(stream)?;
+        stream.synchronize()?;
+        let iters = d_it.to_host_vec(&stream)?[0] as usize;
+        let converged = iters < maxit;
+        let kind = if deflate { "singular-Neumann pressure" } else { "Helmholtz" };
+        warn_unconverged(&format!("p-MG-PCG WHILE-graph ({kind})"), converged, iters, maxit, if converged { 0.0 } else { 1.0 }, tol);
+        dcopy!(out, &psol, n0); // solution → caller's device buffer
+        return Ok(iters);
+    }
+
+    let bn = d_bn2.to_host_vec(&stream)?[0].sqrt().max(1e-300);
     let mut iters = 0;
     let mut converged = false;
     let mut rel = 1.0;
@@ -2263,6 +2335,11 @@ pub struct GpuPoissonMg {
     /// iteration count (the captured V-cycle must be host-branch-free). The replayed launches are
     /// identical to the direct ones, so the result matches the non-graph path to solver tolerance.
     graph: bool,
+    /// Run the entire outer PCG loop as ONE device-side graph WHILE conditional node (the
+    /// convergence test sets the loop predicate on the device — no per-iteration host readback).
+    /// Opt-in via [`with_while_graph`](Self::with_while_graph); needs a non-legacy stream. Takes
+    /// precedence over `graph` (the V-cycle is inlined into the captured loop).
+    while_graph: bool,
 }
 
 impl GpuPoissonMg {
@@ -2274,7 +2351,7 @@ impl GpuPoissonMg {
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
         let dev = MgConst::build(&stream, &mg)?;
-        Ok(Self { stream, module, dev, mixed: false, graph: false })
+        Ok(Self { stream, module, dev, mixed: false, graph: false, while_graph: false })
     }
 
     /// Build the persistent handle for an **SBM** hierarchy (`ShiftedMultigrid`): uploads every
@@ -2286,7 +2363,7 @@ impl GpuPoissonMg {
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
         let dev = MgConst::build_sbm(&stream, &smg)?;
-        Ok(Self { stream, module, dev, mixed: false, graph: false })
+        Ok(Self { stream, module, dev, mixed: false, graph: false, while_graph: false })
     }
 
     /// Re-upload the SBM hierarchy from `smg` onto this handle's **existing context/stream/module**
@@ -2315,6 +2392,20 @@ impl GpuPoissonMg {
         self.graph = graph;
         if graph && self.stream.cu_stream().is_null() {
             // Stream capture cannot be initiated on CU_STREAM_LEGACY (the null default stream).
+            self.stream = self.stream.context().new_stream()?;
+        }
+        Ok(self)
+    }
+
+    /// Run the entire outer PCG loop as a device-side graph **WHILE conditional node** (see the
+    /// `while_graph` field): the convergence test runs on the device and the whole adaptive solve is
+    /// a single `cuGraphLaunch` with NO per-iteration host residual readback. Opt-in; swaps in a
+    /// non-legacy stream (capture is illegal on the legacy stream). Best paired with
+    /// [`solve_dev`](Self::solve_dev) so the field also stays device-resident. Requires the
+    /// cuda-oxide conditional-graph support (CUDA ≥ 12.4). Fallible — may create a stream.
+    pub fn with_while_graph(mut self, while_graph: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        self.while_graph = while_graph;
+        if while_graph && self.stream.cu_stream().is_null() {
             self.stream = self.stream.context().new_stream()?;
         }
         Ok(self)
@@ -2351,9 +2442,9 @@ impl GpuPoissonMg {
         &self, rhs: &[f64], x0: Option<&[f64]>, tol: f64, maxit: usize,
     ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
         if self.mixed {
-            pcg_solve_host::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph)
+            pcg_solve_host::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph, self.while_graph)
         } else {
-            pcg_solve_host::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph)
+            pcg_solve_host::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph, self.while_graph)
         }
     }
 
@@ -2383,9 +2474,9 @@ impl GpuPoissonMg {
         maxit: usize,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         if self.mixed {
-            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph)
+            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph, self.while_graph)
         } else {
-            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph)
+            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph, self.while_graph)
         }
     }
 
