@@ -65,6 +65,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Velocity Helmholtz is also ill-conditioned (the surrogate Nitsche penalty), so precondition
     // it too with a matching SBM-MG (reaction λ, Dirichlet surrogate, Taylor; outflow Neumann).
     let vel_mg = ShiftedMultigrid::new(p, nx, ny, [0.0, 2.2], [0.0, h], alpha, lambda, vec![1], &ls, true, true);
+    // SBM_GPU: run the per-step pressure + velocity elliptic solves fully on the GPU (persistent
+    // SBM-MG handles, built once). Same operators as the CPU path, validated bit-for-bit
+    // (sbm-poisson/pcg/velocity-check); the GPU solve starts from zero (no warm-start) so it does
+    // more iters/step but each is far cheaper. Falls back to the CPU MG-PCG when unset.
+    let use_gpu = std::env::var("SBM_GPU").is_ok();
+    let (gpu_pres, gpu_vel) = if use_gpu {
+        let gp = gale_gpu::operators::poisson::GpuPoissonMg::new_sbm(ShiftedMultigrid::new(
+            p, nx, ny, [0.0, 2.2], [0.0, h], alpha, 0.0, vec![3, 0, 2], &ls, false, false,
+        ))?;
+        let gv = gale_gpu::operators::poisson::GpuPoissonMg::new_sbm(ShiftedMultigrid::new(
+            p, nx, ny, [0.0, 2.2], [0.0, h], alpha, lambda, vec![1], &ls, true, true,
+        ))?;
+        (Some(gp), Some(gv))
+    } else {
+        (None, None)
+    };
 
     // BC data (Dirichlet value at a point); surrogate (cylinder) evaluates these at the true
     // surface point ⇒ no-slip 0 there since the cylinder is interior (x≈0.2, not the inflow).
@@ -117,7 +133,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let fp: Vec<f64> = div.iter().map(|x| -x / dt).collect();
         let bp = pres.rhs(&fp, g_p);
         let pit;
-        (pp, pit) = pres.solve_pcg_from(&bp, pp.clone(), |r| pres_mg.precondition(r), ptol, maxit);
+        (pp, pit) = if let Some(gp) = &gpu_pres {
+            gp.solve(&bp, ptol, maxit)?
+        } else {
+            pres.solve_pcg_from(&bp, pp.clone(), |r| pres_mg.precondition(r), ptol, maxit)
+        };
         // Stage 2b: u* = û − Δt ∇p.
         let (px, py) = (grad(&pp, 0), grad(&pp, 1));
         for i in 0..ndof {
@@ -127,8 +147,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Stage 3: viscous Helmholtz (λM + A) uⁿ⁺¹ = λM u* with SBM no-slip.
         let fxv: Vec<f64> = uhx.iter().map(|v| lambda * v).collect();
         let fyv: Vec<f64> = uhy.iter().map(|v| lambda * v).collect();
-        let (uxn, vitx) = vel.solve_pcg_from(&vel.rhs(&fxv, g_u), ux.clone(), |r| vel_mg.precondition(r), vtol, maxit);
-        let (uyn, vity) = vel.solve_pcg_from(&vel.rhs(&fyv, g_v), uy.clone(), |r| vel_mg.precondition(r), vtol, maxit);
+        let (uxn, vitx) = if let Some(gv) = &gpu_vel {
+            gv.solve(&vel.rhs(&fxv, g_u), vtol, maxit)?
+        } else {
+            vel.solve_pcg_from(&vel.rhs(&fxv, g_u), ux.clone(), |r| vel_mg.precondition(r), vtol, maxit)
+        };
+        let (uyn, vity) = if let Some(gv) = &gpu_vel {
+            gv.solve(&vel.rhs(&fyv, g_v), vtol, maxit)?
+        } else {
+            vel.solve_pcg_from(&vel.rhs(&fyv, g_v), uy.clone(), |r| vel_mg.precondition(r), vtol, maxit)
+        };
         ux = uxn;
         uy = uyn;
         if std::env::var("SBM_VERBOSE").is_ok() {

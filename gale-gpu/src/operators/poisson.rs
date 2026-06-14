@@ -2204,6 +2204,18 @@ impl GpuPoissonMg {
         Ok(Self { stream, module, dev, mixed: false, graph: false })
     }
 
+    /// Build the persistent handle for an **SBM** hierarchy (`ShiftedMultigrid`): uploads every
+    /// level once (SBM `fnbr`/shift vectors/active masks), then [`solve`](Self::solve) drives the
+    /// SBM-aware V-cycle. The amortized analogue of the one-shot [`sbm_pcg_solve`], for time loops
+    /// that solve a fixed SBM operator many times (the cylinder pressure + velocity).
+    pub fn new_sbm(smg: ShiftedMultigrid) -> Result<Self, Box<dyn std::error::Error>> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let module = kernels::load(&ctx)?;
+        let dev = MgConst::build_sbm(&stream, &smg)?;
+        Ok(Self { stream, module, dev, mixed: false, graph: false })
+    }
+
     /// Enable the mixed-precision V-cycle (FP32 gradient intermediates). Opt-in; default is the
     /// bit-exact FP64 path. The final solution stays FP64-accurate (outer CG + reductions are FP64).
     pub fn with_mixed_precision(mut self, mixed: bool) -> Self {
