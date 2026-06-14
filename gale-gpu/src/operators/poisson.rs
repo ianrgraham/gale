@@ -1817,6 +1817,92 @@ pub fn sbm_pcg_solve(
 /// persistent [`GpuPoissonMg`] handle. The constant per-level device arrays live in
 /// `dev`; only the per-solve scratch (V-cycle work vectors + PCG vectors) is allocated
 /// here, and only `rhs` is uploaded.
+/// All per-solve scratch for [`pcg_solve_with`] — the V-cycle work vectors (struct-of-arrays per
+/// level), the PCG vectors, the on-device CG/PCG scalars, and the matvec gradient scratch. Pulled
+/// out of `pcg_solve_with` into an explicit struct so it can be **allocated once and reused across
+/// solves** (fixed device addresses), which is required to capture the WHILE-graph PCG body ONCE
+/// and relaunch it every solve (the captured graph references these buffers by address). A one-shot
+/// solve just builds a throwaway workspace. `G` is the gradient-intermediate precision (f64, or f32
+/// in the mixed-precision V-cycle).
+struct SolverWorkspace<G: Scalar + DeviceCopy> {
+    xb: Vec<DeviceBuffer<f64>>,
+    bb: Vec<DeviceBuffer<f64>>,
+    rb: Vec<DeviceBuffer<f64>>,
+    apb: Vec<DeviceBuffer<f64>>,
+    gxb: Vec<DeviceBuffer<G>>,
+    gyb: Vec<DeviceBuffer<G>>,
+    tmpb: Vec<DeviceBuffer<f64>>,
+    sm: Vec<DeviceBuffer<f64>>,
+    psol: DeviceBuffer<f64>,
+    pres: DeviceBuffer<f64>,
+    pp: DeviceBuffer<f64>,
+    pz: DeviceBuffer<f64>,
+    pap: DeviceBuffer<f64>,
+    partial: DeviceBuffer<f64>,
+    d_rz: DeviceBuffer<f64>,
+    d_rznew: DeviceBuffer<f64>,
+    d_pap_o: DeviceBuffer<f64>,
+    d_alpha_o: DeviceBuffer<f64>,
+    d_nalpha_o: DeviceBuffer<f64>,
+    d_beta_o: DeviceBuffer<f64>,
+    d_rr: DeviceBuffer<f64>,
+    d_bn2: DeviceBuffer<f64>,
+    d_it: DeviceBuffer<u32>,
+    d_nmean_o: DeviceBuffer<f64>,
+    d_rs: DeviceBuffer<f64>,
+    d_rsnew: DeviceBuffer<f64>,
+    d_pap_c: DeviceBuffer<f64>,
+    d_alpha_c: DeviceBuffer<f64>,
+    d_nalpha_c: DeviceBuffer<f64>,
+    d_beta_c: DeviceBuffer<f64>,
+    d_nmean_c: DeviceBuffer<f64>,
+    gx0: DeviceBuffer<f64>,
+    gy0: DeviceBuffer<f64>,
+    gxc: DeviceBuffer<f64>,
+    gyc: DeviceBuffer<f64>,
+}
+
+impl<G: Scalar + DeviceCopy> SolverWorkspace<G> {
+    /// Allocate (zeroed) all per-solve scratch for the hierarchy `dev` on `stream`.
+    fn new(stream: &CudaStream, dev: &MgConst) -> Result<Self, Box<dyn std::error::Error>> {
+        let nlev = dev.nlev;
+        let n0 = dev.n0;
+        let clast = dev.clast;
+        let (mut xb, mut bb, mut rb, mut apb, mut gxb, mut gyb, mut tmpb, mut sm) =
+            (vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+        for l in 0..nlev {
+            let nd = dev.ndofv[l];
+            xb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+            bb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+            rb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+            apb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+            gxb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
+            gyb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
+            tmpb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+            sm.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+        }
+        let z = || DeviceBuffer::<f64>::zeroed(stream, 1);
+        Ok(SolverWorkspace {
+            xb, bb, rb, apb, gxb, gyb, tmpb, sm,
+            psol: DeviceBuffer::<f64>::zeroed(stream, n0)?,
+            pres: DeviceBuffer::<f64>::zeroed(stream, n0)?,
+            pp: DeviceBuffer::<f64>::zeroed(stream, n0)?,
+            pz: DeviceBuffer::<f64>::zeroed(stream, n0)?,
+            pap: DeviceBuffer::<f64>::zeroed(stream, n0)?,
+            partial: DeviceBuffer::<f64>::zeroed(stream, dot_blocks(n0))?,
+            d_rz: z()?, d_rznew: z()?, d_pap_o: z()?, d_alpha_o: z()?, d_nalpha_o: z()?,
+            d_beta_o: z()?, d_rr: z()?, d_bn2: z()?,
+            d_it: DeviceBuffer::<u32>::zeroed(stream, 1)?,
+            d_nmean_o: z()?, d_rs: z()?, d_rsnew: z()?, d_pap_c: z()?, d_alpha_c: z()?,
+            d_nalpha_c: z()?, d_beta_c: z()?, d_nmean_c: z()?,
+            gx0: DeviceBuffer::<f64>::zeroed(stream, n0)?,
+            gy0: DeviceBuffer::<f64>::zeroed(stream, n0)?,
+            gxc: DeviceBuffer::<f64>::zeroed(stream, dev.ndofv[clast])?,
+            gyc: DeviceBuffer::<f64>::zeroed(stream, dev.ndofv[clast])?,
+        })
+    }
+}
+
 /// Host-slice convenience wrapper around the device-native [`pcg_solve_with`]: uploads
 /// `rhs`/`x0`, runs the solve, downloads the solution. Used by the one-shot solvers and the
 /// host-facing [`GpuPoissonMg::solve`]. To keep a field **resident on device** across a whole
@@ -1839,7 +1925,9 @@ fn pcg_solve_host<G: Scalar + DeviceCopy>(
         None => None,
     };
     let mut out = DeviceBuffer::<f64>::zeroed(stream, dev.n0)?;
-    let iters = pcg_solve_with::<G>(stream, module, dev, &rhs_dev, x0_dev.as_ref(), &mut out, tol, maxit, use_graph, while_graph)?;
+    let mut ws = SolverWorkspace::<G>::new(stream, dev)?;
+    let mut graph_cache: Option<CudaGraphExec> = None;
+    let iters = pcg_solve_with::<G>(stream, module, dev, &rhs_dev, x0_dev.as_ref(), &mut out, tol, maxit, use_graph, while_graph, &mut ws, &mut graph_cache)?;
     Ok((out.to_host_vec(stream)?, iters))
 }
 
@@ -1859,6 +1947,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     maxit: usize,
     use_graph: bool,
     while_graph: bool,
+    ws: &mut SolverWorkspace<G>,
+    graph_cache: &mut Option<CudaGraphExec>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // `while_graph`: run the ENTIRE outer PCG loop as ONE device-side CUDA graph WHILE conditional
     // node — the convergence test (`pcg_cond`) sets the loop predicate on the device, so there is
@@ -1915,54 +2005,44 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         (0..nlev).map(|l| matvec_cfgs(nev[l] as usize, n1v[l])).collect();
     debug_assert_eq!(out.len(), n0, "out length must match the finest level");
 
-    // Per-solve scratch: V-cycle work vectors (struct-of-arrays per level) — allocated
-    // fresh each solve (cheap device zeroed-malloc; the expensive uploads live in `dev`).
-    let (mut xb, mut bb, mut rb, mut apb, mut gxb, mut gyb, mut tmpb, mut sm) =
-        (vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
-    for l in 0..nlev {
-        let nd = ndofv[l];
-        xb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
-        bb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
-        rb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
-        apb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
-        gxb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
-        gyb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
-        tmpb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
-        sm.push(DeviceBuffer::<f64>::zeroed(stream, nd)?); // damped-Jacobi smoother pong buffer
-    }
-
-    // PCG vectors (finest level, separate from V-cycle scratch). `pres` (the residual) is
-    // initialized to `rhs` further down (after the `dcopy!` macro is in scope); `rhs_dev` is the
-    // caller's device buffer, used read-only (warm-start `rhs − A·x0` and the ‖rhs‖ normaliser).
-    let mut psol = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    let mut pres = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    let mut pp = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    let pz = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    let mut pap = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    // Multi-block reduction partials, sized for the finest level (the largest dot).
-    let mut partial = DeviceBuffer::<f64>::zeroed(stream, dot_blocks(n0))?;
-    // CG/PCG scalars kept **on device** (length-1 buffers) so neither the outer PCG nor the
-    // coarse-grid CG issues a host sync per iteration — the dominant cost of the previous
-    // host-readback `dot` (a V-cycle's coarse solve runs hundreds of iters, each formerly a
-    // `to_host_vec`). The OUTER pool must survive a V-cycle (rz spans the preconditioner
-    // call), so it is disjoint from the COARSE pool the V-cycle clobbers.
-    let mut d_rz = DeviceBuffer::<f64>::zeroed(stream, 1)?; // outer: r·z (PCG)
-    let mut d_rznew = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_pap_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_alpha_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_nalpha_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_beta_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_rr = DeviceBuffer::<f64>::zeroed(stream, 1)?; // outer residual ‖r‖²
-    let mut d_bn2 = DeviceBuffer::<f64>::zeroed(stream, 1)?; // ‖b‖² (device, for the WHILE-graph convergence test)
-    let mut d_it = DeviceBuffer::<u32>::zeroed(stream, 1)?; // device iteration counter (WHILE-graph path)
-    let mut d_nmean_o = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_rs = DeviceBuffer::<f64>::zeroed(stream, 1)?; // coarse: r·r (CG)
-    let mut d_rsnew = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_pap_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_alpha_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_nalpha_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_beta_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
-    let mut d_nmean_c = DeviceBuffer::<f64>::zeroed(stream, 1)?;
+    // Per-solve scratch comes from the (persistent or throwaway) `ws`. Destructuring `&mut ws`
+    // binds every field as a `&mut` (match ergonomics); the macros below use them exactly as the
+    // old owned locals did — deref coercion turns `&mut pres`/`&pres` into the `&mut`/`&` the kernel
+    // wrappers expect. Reusing one `ws` across solves keeps buffer ADDRESSES fixed, which is what
+    // lets the WHILE-graph body be captured once and relaunched (the graph references these by ptr).
+    // Disjoint `&mut` borrows of each field — `mut` bindings so the macros' `&mut x` (and `&x`)
+    // patterns work via deref coercion exactly as with the old owned locals.
+    let (xb, bb, rb, apb, gxb, gyb, tmpb, sm) = (
+        &mut ws.xb, &mut ws.bb, &mut ws.rb, &mut ws.apb,
+        &mut ws.gxb, &mut ws.gyb, &mut ws.tmpb, &mut ws.sm,
+    );
+    let mut psol = &mut ws.psol;
+    let mut pres = &mut ws.pres;
+    let mut pp = &mut ws.pp;
+    let pz = &mut ws.pz;
+    let mut pap = &mut ws.pap;
+    let mut partial = &mut ws.partial;
+    let mut d_rz = &mut ws.d_rz;
+    let mut d_rznew = &mut ws.d_rznew;
+    let mut d_pap_o = &mut ws.d_pap_o;
+    let mut d_alpha_o = &mut ws.d_alpha_o;
+    let mut d_nalpha_o = &mut ws.d_nalpha_o;
+    let mut d_beta_o = &mut ws.d_beta_o;
+    let mut d_rr = &mut ws.d_rr;
+    let mut d_bn2 = &mut ws.d_bn2;
+    let mut d_it = &mut ws.d_it;
+    let mut d_nmean_o = &mut ws.d_nmean_o;
+    let mut d_rs = &mut ws.d_rs;
+    let mut d_rsnew = &mut ws.d_rsnew;
+    let mut d_pap_c = &mut ws.d_pap_c;
+    let mut d_alpha_c = &mut ws.d_alpha_c;
+    let mut d_nalpha_c = &mut ws.d_nalpha_c;
+    let mut d_beta_c = &mut ws.d_beta_c;
+    let mut d_nmean_c = &mut ws.d_nmean_c;
+    let mut gx0 = &mut ws.gx0;
+    let mut gy0 = &mut ws.gy0;
+    let mut gxc = &mut ws.gxc;
+    let mut gyc = &mut ws.gyc;
     let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
 
     // Fully on-device dot a·b → device scalar `$out` (dot_partial → reduce_scalar), no sync.
@@ -2059,10 +2139,6 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     //    a CG too and likewise breaks (→ NaN) on an FP32-perturbed, non-symmetric operator. The
     //    coarse grid is tiny (h-coarsened), so FP64 there is free.
     // Only the V-cycle *smoother* matvecs (a robust stationary Jacobi) carry the FP32 intermediates.
-    let mut gx0 = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    let mut gy0 = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    let mut gxc = DeviceBuffer::<f64>::zeroed(stream, ndofv[clast])?;
-    let mut gyc = DeviceBuffer::<f64>::zeroed(stream, ndofv[clast])?;
     macro_rules! matvec0 {
         ($src:expr, $dst:expr) => {{
             module.gradient::<f64, f64>(&stream, mvcfg[0].0, &dl[0], $src, rxs[0], sys[0], n1v[0], nev[0], &mut gx0, &mut gy0)?;
@@ -2113,7 +2189,16 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // handful suffices, and a long fixed chain would bloat the captured graph (cuGraphInstantiate
     // cost scales with node count — a 100-iter coarse chain is ~1300 extra nodes).
     let coarse_cap = if fixed_coarse {
-        (ndofv[clast] + 4).min(if coarse_small { 100 } else { 40 })
+        // Fixed-count coarse CG (no early exit) — must approximate the early-exit count, else the
+        // captured V-cycle does far more coarse work than the readback path (which polls + exits
+        // ~10 iters). Tunable for sweeps; default a modest fixed count (the outer PCG absorbs the
+        // inexactness — the coarse solve is just a preconditioner component).
+        // 8 is the measured sweet spot (bit-exact, no outer-iter inflation): Helmholtz/singular
+        // 1.3× and the SBM cylinder 1.41× faster than the readback path. The full fixed count makes
+        // the captured V-cycle do ~5–10× the coarse work the early-exiting readback path does, which
+        // is what made naive while-graph slower. Env-overridable for tuning.
+        let cap = std::env::var("WHILE_COARSE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        (ndofv[clast] + 4).min(cap)
     } else if coarse_small {
         100
     } else {
@@ -2246,25 +2331,38 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // before the test, so the solution is identical. `d_it` (zeroed) counts iterations device-side.
     if while_graph {
         let tol2 = tol * tol;
-        let exec = stream.capture_while(CaptureMode::ThreadLocal, 1, |handle, _s| {
-            matvec0!(&pp, &mut pap); // A·p
-            dot_to!(&pp, &pap, n0, &mut d_pap_o);
-            module.cg_alpha(&stream, one, &d_rz, &d_pap_o, &mut d_alpha_o, &mut d_nalpha_o)?;
-            module.axpy_s(&stream, vcfg[0], &mut psol, &pp, &d_alpha_o)?; // x += α p
-            module.axpy_s(&stream, vcfg[0], &mut pres, &pap, &d_nalpha_o)?; // r −= α Ap
-            deflate0!(&mut pres);
-            dot_to!(&pres, &pres, n0, &mut d_rr); // ‖r‖²
-            dcopy!(&bb[0], &pres, n0);
-            run_vcycle!(); // preconditioner (inlined; vcycle_graph is None under while_graph)
-            dcopy!(&pz, &xb[0], n0);
-            dot_to!(&pres, &pz, n0, &mut d_rznew);
-            module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β; rz←rznew
-            module.xpby_s(&stream, vcfg[0], &mut pp, &pz, &d_beta_o)?; // p = z + β p
-            // Device-side convergence: increment the counter + set the WHILE predicate. No readback.
-            module.pcg_cond(&stream, one, &d_rr, &d_bn2, tol2, &mut d_it, maxit as u32, handle.value())?;
-            Ok(())
-        })?;
-        exec.launch(stream)?;
+        // Reset the device iteration counter (the workspace persists across solves, so it still
+        // holds the previous solve's count). `zero_u32` outlives the async copy (block ends after
+        // the sync below). The pre-loop above already reloaded residual / ‖b‖² / pz / rz live.
+        let zero_u32 = [0u32];
+        unsafe {
+            cuda_core::memory::memcpy_htod_async(d_it.cu_deviceptr(), zero_u32.as_ptr(), 4, stream.cu_stream())?;
+        }
+        // Capture the outer-loop body into a WHILE conditional node ONCE; relaunch every solve
+        // (the captured graph references the persistent workspace buffers by address). This is the
+        // amortization that turns the device-side loop into a net win — `cuGraphInstantiate` runs
+        // once, not per solve.
+        if graph_cache.is_none() {
+            *graph_cache = Some(stream.capture_while(CaptureMode::ThreadLocal, 1, |handle, _s| {
+                matvec0!(&pp, &mut pap); // A·p
+                dot_to!(&pp, &pap, n0, &mut d_pap_o);
+                module.cg_alpha(&stream, one, &d_rz, &d_pap_o, &mut d_alpha_o, &mut d_nalpha_o)?;
+                module.axpy_s(&stream, vcfg[0], &mut psol, &pp, &d_alpha_o)?; // x += α p
+                module.axpy_s(&stream, vcfg[0], &mut pres, &pap, &d_nalpha_o)?; // r −= α Ap
+                deflate0!(&mut pres);
+                dot_to!(&pres, &pres, n0, &mut d_rr); // ‖r‖²
+                dcopy!(&bb[0], &pres, n0);
+                run_vcycle!(); // preconditioner (inlined; vcycle_graph is None under while_graph)
+                dcopy!(&pz, &xb[0], n0);
+                dot_to!(&pres, &pz, n0, &mut d_rznew);
+                module.cg_beta(&stream, one, &d_rznew, &mut d_rz, &mut d_beta_o)?; // β; rz←rznew
+                module.xpby_s(&stream, vcfg[0], &mut pp, &pz, &d_beta_o)?; // p = z + β p
+                // Device-side convergence: increment the counter + set the WHILE predicate. No readback.
+                module.pcg_cond(&stream, one, &d_rr, &d_bn2, tol2, &mut d_it, maxit as u32, handle.value())?;
+                Ok(())
+            })?);
+        }
+        graph_cache.as_ref().unwrap().launch(stream)?;
         stream.synchronize()?;
         let iters = d_it.to_host_vec(&stream)?[0] as usize;
         let converged = iters < maxit;
@@ -2340,6 +2438,12 @@ pub struct GpuPoissonMg {
     /// Opt-in via [`with_while_graph`](Self::with_while_graph); needs a non-legacy stream. Takes
     /// precedence over `graph` (the V-cycle is inlined into the captured loop).
     while_graph: bool,
+    /// Amortization cache for the WHILE-graph path: the persistent per-solve workspace (so buffer
+    /// addresses stay fixed across solves) and the captured-once `CudaGraphExec`. `RefCell` for
+    /// interior mutability — [`solve_dev`](Self::solve_dev)/[`solve`](Self::solve) take `&self`.
+    /// Invalidated by [`rebuild_sbm`](Self::rebuild_sbm) (the operator/buffers change).
+    ws: std::cell::RefCell<Option<SolverWorkspace<f64>>>,
+    while_exec: std::cell::RefCell<Option<CudaGraphExec>>,
 }
 
 impl GpuPoissonMg {
@@ -2351,7 +2455,7 @@ impl GpuPoissonMg {
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
         let dev = MgConst::build(&stream, &mg)?;
-        Ok(Self { stream, module, dev, mixed: false, graph: false, while_graph: false })
+        Ok(Self { stream, module, dev, mixed: false, graph: false, while_graph: false, ws: std::cell::RefCell::new(None), while_exec: std::cell::RefCell::new(None) })
     }
 
     /// Build the persistent handle for an **SBM** hierarchy (`ShiftedMultigrid`): uploads every
@@ -2363,7 +2467,7 @@ impl GpuPoissonMg {
         let stream = ctx.default_stream();
         let module = kernels::load(&ctx)?;
         let dev = MgConst::build_sbm(&stream, &smg)?;
-        Ok(Self { stream, module, dev, mixed: false, graph: false, while_graph: false })
+        Ok(Self { stream, module, dev, mixed: false, graph: false, while_graph: false, ws: std::cell::RefCell::new(None), while_exec: std::cell::RefCell::new(None) })
     }
 
     /// Re-upload the SBM hierarchy from `smg` onto this handle's **existing context/stream/module**
@@ -2373,6 +2477,9 @@ impl GpuPoissonMg {
     /// creation are amortized; only the per-level arrays are re-copied.
     pub fn rebuild_sbm(&mut self, smg: &ShiftedMultigrid) -> Result<(), Box<dyn std::error::Error>> {
         self.dev = MgConst::build_sbm(&self.stream, smg)?;
+        // The operator/level sizes changed ⇒ the cached workspace + captured WHILE graph are stale.
+        *self.ws.get_mut() = None;
+        *self.while_exec.get_mut() = None;
         Ok(())
     }
 
@@ -2411,6 +2518,18 @@ impl GpuPoissonMg {
         Ok(self)
     }
 
+    /// Make this handle issue on `other`'s CUDA stream (Arc-shared). For a device-resident stepper
+    /// with multiple operators (e.g. cylinder pressure + velocity) that share device buffers: they
+    /// must run on ONE stream for the cross-handle ops to be ordered. With `with_while_graph` each
+    /// handle gets its own non-legacy stream, which would break that — call this (before the first
+    /// solve, while the caches are empty) to collapse them onto one. Both still share the device
+    /// primary context, so buffers interoperate.
+    pub fn share_stream_with(&mut self, other: &GpuPoissonMg) {
+        self.stream = other.stream.clone();
+        *self.ws.get_mut() = None;
+        *self.while_exec.get_mut() = None;
+    }
+
     /// Degrees of freedom on the finest level (`n_elements · n_nodes`).
     pub fn ndof(&self) -> usize {
         self.dev.n0
@@ -2441,7 +2560,24 @@ impl GpuPoissonMg {
     fn solve_impl(
         &self, rhs: &[f64], x0: Option<&[f64]>, tol: f64, maxit: usize,
     ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
-        if self.mixed {
+        // The amortized WHILE-graph path needs the cached workspace + exec (host upload/download
+        // around the device-resident solve); the other paths use a throwaway workspace.
+        if !self.mixed && self.while_graph {
+            let rhs_dev = DeviceBuffer::from_host(&self.stream, rhs)?;
+            let x0_dev = match x0 {
+                Some(x) => Some(DeviceBuffer::from_host(&self.stream, x)?),
+                None => None,
+            };
+            let mut out = DeviceBuffer::<f64>::zeroed(&self.stream, self.dev.n0)?;
+            let mut ws_opt = self.ws.borrow_mut();
+            if ws_opt.is_none() {
+                *ws_opt = Some(SolverWorkspace::<f64>::new(&self.stream, &self.dev)?);
+            }
+            let ws = ws_opt.as_mut().unwrap();
+            let mut gc = self.while_exec.borrow_mut();
+            let iters = pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, &rhs_dev, x0_dev.as_ref(), &mut out, tol, maxit, self.graph, true, ws, &mut gc)?;
+            Ok((out.to_host_vec(&self.stream)?, iters))
+        } else if self.mixed {
             pcg_solve_host::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph, self.while_graph)
         } else {
             pcg_solve_host::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph, self.while_graph)
@@ -2474,9 +2610,25 @@ impl GpuPoissonMg {
         maxit: usize,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         if self.mixed {
-            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph, self.while_graph)
+            // Mixed precision: throwaway workspace (the amortization cache is f64; mixed is rare).
+            let mut ws = SolverWorkspace::<f32>::new(&self.stream, &self.dev)?;
+            let mut gc = None;
+            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph, self.while_graph, &mut ws, &mut gc)
+        } else if self.while_graph {
+            // Amortized WHILE-graph: reuse the cached workspace (fixed buffer addresses) and the
+            // captured-once exec across solves — the launch+readback collapse that the 43.8%-util
+            // reprofile targets. The pre-loop reloads residual/‖b‖²/iter-counter each call.
+            let mut ws_opt = self.ws.borrow_mut();
+            if ws_opt.is_none() {
+                *ws_opt = Some(SolverWorkspace::<f64>::new(&self.stream, &self.dev)?);
+            }
+            let ws = ws_opt.as_mut().unwrap();
+            let mut gc = self.while_exec.borrow_mut();
+            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph, true, ws, &mut gc)
         } else {
-            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph, self.while_graph)
+            let mut ws = SolverWorkspace::<f64>::new(&self.stream, &self.dev)?;
+            let mut gc = None;
+            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph, false, &mut ws, &mut gc)
         }
     }
 

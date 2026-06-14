@@ -55,12 +55,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let g_p = |_x: f64, _y: f64| 0.0;
 
     // GPU SBM handles (shared primary context + null stream ⇒ buffers interoperate).
+    // SBM_WHILE: run each solve's convergence loop as a device-side WHILE conditional graph
+    // (no per-iteration host residual readback). with_while_graph puts each handle on its own
+    // non-legacy stream, so share one stream (hv ← hp) to keep the cross-handle stage/solve ops
+    // on shared buffers ordered.
+    let use_while = std::env::var("SBM_WHILE").is_ok();
     let hp = GpuPoissonMg::new_sbm(ShiftedMultigrid::new(
         p, nx, ny, xr, yr, alpha, 0.0, vec![3, 0, 2], &ls, false, false,
-    ))?;
-    let hv = GpuPoissonMg::new_sbm(ShiftedMultigrid::new(
+    ))?
+    .with_while_graph(use_while)?;
+    let mut hv = GpuPoissonMg::new_sbm(ShiftedMultigrid::new(
         p, nx, ny, xr, yr, alpha, lambda, vec![1], &ls, true, true,
-    ))?;
+    ))?
+    .with_while_graph(use_while)?;
+    if use_while {
+        hv.share_stream_with(&hp); // both operators on one stream for ordered cross-handle ops
+    }
+    let hv = hv;
 
     // Constants (precomputed once via the validated host SBM rhs): diagonal mass (active) + lifts.
     //   jw      = rhs(1, 0)  — mass diagonal on active elements (0 on inactive)
