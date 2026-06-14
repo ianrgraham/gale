@@ -103,7 +103,7 @@ pub use hex::Reference3dHex;
 pub use hyperbolic3d::{ConservationLaw3d, Hyperbolic3d, LinearAdvection3d};
 pub use mesh3d::{HexElement, Mesh3d, Neighbor3};
 pub use immersed::{Disk, FreeBody, ImmersedSolid, RigidBody, Shape, Suspension, VolumePenalization};
-pub use shifted::{CircleLevelSet, LevelSet, ShiftedBoundary, SurrogateFace, SurrogateNode};
+pub use shifted::{sbm_force_torque, CircleLevelSet, LevelSet, ShiftedBoundary, SurrogateFace, SurrogateNode};
 pub use immersed3d::{Ellipsoid, ImmersedSolid3d, Sphere, VolumePenalization3d};
 pub use hyperbolic::{
     Burgers, ConservationLaw, Euler, Hyperbolic, IncompressibleConvection, LinearAdvection,

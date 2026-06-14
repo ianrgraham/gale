@@ -403,12 +403,15 @@ impl ShiftedMultigrid {
     /// Stand-alone preconditioned CG (non-singular SBM operator). Returns `(solution, iters)`.
     pub fn pcg(&self, b: &[f64], tol: f64, maxit: usize) -> (Vec<f64>, usize) {
         let n = b.len();
+        let bn = norm(b);
+        if bn < 1e-300 {
+            return (vec![0.0; n], 0); // trivial RHS ⇒ zero solution (avoids the 0/0 in α)
+        }
         let mut x = vec![0.0; n];
         let mut r = b.to_vec();
         let mut z = self.precondition(&r);
         let mut p = z.clone();
         let mut rz = dot(&r, &z);
-        let bn = norm(b).max(1e-300);
         let mut iters = 0;
         for it in 0..maxit {
             let ap = self.apply(&p);
@@ -422,6 +425,52 @@ impl ShiftedMultigrid {
                 break;
             }
             z = self.precondition(&r);
+            let rz_new = dot(&r, &z);
+            let beta = rz_new / rz;
+            for i in 0..n {
+                p[i] = z[i] + beta * p[i];
+            }
+            rz = rz_new;
+        }
+        (x, iters)
+    }
+
+    /// Preconditioned CG for the **singular** SBM operator (closed-box pressure — pure-Neumann
+    /// outer walls + natural-Neumann surrogate ⇒ constant nullspace). Deflates the constant from
+    /// the residual and the preconditioned residual each iteration; the coarse solve already
+    /// deflates internally. Solution is determined up to an additive constant. `(solution, iters)`.
+    pub fn pcg_deflated(&self, b: &[f64], tol: f64, maxit: usize) -> (Vec<f64>, usize) {
+        let n = b.len();
+        let deflate = |v: &mut [f64]| {
+            let mean = v.iter().sum::<f64>() / n as f64;
+            v.iter_mut().for_each(|x| *x -= mean);
+        };
+        let mut x = vec![0.0; n];
+        let mut r = b.to_vec();
+        deflate(&mut r);
+        let bn = norm(&r);
+        if bn < 1e-300 {
+            return (vec![0.0; n], 0); // trivial (range-projected) RHS ⇒ zero solution
+        }
+        let mut z = self.precondition(&r);
+        deflate(&mut z);
+        let mut p = z.clone();
+        let mut rz = dot(&r, &z);
+        let mut iters = 0;
+        for it in 0..maxit {
+            let ap = self.apply(&p);
+            let alpha = rz / dot(&p, &ap);
+            for i in 0..n {
+                x[i] += alpha * p[i];
+                r[i] -= alpha * ap[i];
+            }
+            deflate(&mut r);
+            iters = it + 1;
+            if norm(&r) / bn < tol {
+                break;
+            }
+            z = self.precondition(&r);
+            deflate(&mut z);
             let rz_new = dot(&r, &z);
             let beta = rz_new / rz;
             for i in 0..n {

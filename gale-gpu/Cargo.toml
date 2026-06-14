@@ -423,3 +423,8 @@ path = "src/bin/sbm_pcg_check.rs"
 [[bin]]
 name = "sbm-velocity-check"
 path = "src/bin/sbm_velocity_check.rs"
+
+# Freely-moving SBM disk (settling under gravity, Newton-Euler + surface force recovery).
+[[bin]]
+name = "sbm-moving-disk-check"
+path = "src/bin/sbm_moving_disk_check.rs"

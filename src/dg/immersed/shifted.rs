@@ -180,6 +180,82 @@ impl ShiftedBoundary {
     }
 }
 
+/// **SBM hydrodynamic force & torque** on a circular body, recovered by integrating the traction
+/// `σ·n = −p n + ν(∇u+∇uᵀ)·n` over the TRUE circle (radius `r`, center `(cx,cy)`). The fields are
+/// HIGH-ORDER Taylor-extrapolated from each surrogate node to its true-boundary point (pressure
+/// `p + ∇p·d`, and each velocity-gradient component via its own gradient — the Hessian), `n` is the
+/// true-boundary outward normal `(tnx,tny)`, and the integral uses the exact arc measure `r dθ`
+/// (trapezoidal in the polar angle about the center). Returns `(Fx, Fy, T)` — the force the fluid
+/// exerts on the body and the torque about its center (z-component `r×t`). This is the moving-body
+/// generalization of the fixed-cylinder `drag_x` recovery (which validated to +1.0% C_D).
+#[allow(clippy::too_many_arguments)]
+pub fn sbm_force_torque(
+    mesh: &Mesh2d,
+    sb: &ShiftedBoundary,
+    ux: &[f64],
+    uy: &[f64],
+    pp: &[f64],
+    nu: f64,
+    cx: f64,
+    cy: f64,
+    r: f64,
+) -> (f64, f64, f64) {
+    let nn = mesh.refq.n_nodes();
+    // Element-local physical gradient of a nodal field (component 0 = ∂/∂x, 1 = ∂/∂y).
+    let grad = |f: &[f64], comp: usize| -> Vec<f64> {
+        let mut g = vec![0.0; mesh.n_elements() * nn];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            let sl = &f[e * nn..(e + 1) * nn];
+            let gv = if comp == 0 { el.geom.grad_x(&mesh.refq, sl) } else { el.geom.grad_y(&mesh.refq, sl) };
+            g[e * nn..(e + 1) * nn].copy_from_slice(&gv);
+        }
+        g
+    };
+    let (uxx, uxy) = (grad(ux, 0), grad(ux, 1)); // ∂u/∂x, ∂u/∂y
+    let (uyx, uyy) = (grad(uy, 0), grad(uy, 1)); // ∂v/∂x, ∂v/∂y
+    let (pgx, pgy) = (grad(pp, 0), grad(pp, 1));
+    // Velocity Hessian (∇ of each gradient) for the high-order extrapolation of ∇u to the true point.
+    let (uxx_x, uxx_y) = (grad(&uxx, 0), grad(&uxx, 1));
+    let (uxy_x, uxy_y) = (grad(&uxy, 0), grad(&uxy, 1));
+    let (uyx_x, uyx_y) = (grad(&uyx, 0), grad(&uyx, 1));
+    let (uyy_x, uyy_y) = (grad(&uyy, 0), grad(&uyy, 1));
+    // Per surrogate node: (polar angle about center, tx, ty, moment) at the TRUE-boundary point.
+    let mut pts: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for sf in &sb.faces {
+        let e = sf.elem;
+        let fd = &mesh.elements[e].faces[sf.edge as usize];
+        for (a, sn) in sf.nodes.iter().enumerate() {
+            let v = fd.nodes[a];
+            let i = e * nn + v;
+            let (dx, dy) = (sn.dx, sn.dy);
+            let p_t = pp[i] + pgx[i] * dx + pgy[i] * dy;
+            let dudx = uxx[i] + uxx_x[i] * dx + uxx_y[i] * dy;
+            let dudy = uxy[i] + uxy_x[i] * dx + uxy_y[i] * dy;
+            let dvdx = uyx[i] + uyx_x[i] * dx + uyx_y[i] * dy;
+            let dvdy = uyy[i] + uyy_x[i] * dx + uyy_y[i] * dy;
+            let (nx, ny) = (sn.tnx, sn.tny); // true-boundary outward (into fluid) normal
+            let tx = -p_t * nx + nu * (2.0 * dudx * nx + (dudy + dvdx) * ny);
+            let ty = -p_t * ny + nu * ((dudy + dvdx) * nx + 2.0 * dvdy * ny);
+            let (xt, yt) = (sn.x + dx, sn.y + dy); // true-boundary point
+            let theta = (yt - cy).atan2(xt - cx);
+            let moment = (xt - cx) * ty - (yt - cy) * tx; // z of r × t
+            pts.push((theta, tx, ty, moment));
+        }
+    }
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let n = pts.len();
+    let (mut fx, mut fy, mut t) = (0.0, 0.0, 0.0);
+    for k in 0..n {
+        let thm = if k == 0 { pts[n - 1].0 - 2.0 * std::f64::consts::PI } else { pts[k - 1].0 };
+        let thp = if k == n - 1 { pts[0].0 + 2.0 * std::f64::consts::PI } else { pts[k + 1].0 };
+        let w = r * 0.5 * (thp - thm); // node's arc span on the true circle
+        fx += pts[k].1 * w;
+        fy += pts[k].2 * w;
+        t += pts[k].3 * w;
+    }
+    (fx, fy, t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
