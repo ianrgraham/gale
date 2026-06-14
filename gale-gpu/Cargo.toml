@@ -394,6 +394,18 @@ path = "src/bin/cg_iter_probe.rs"
 name = "pcg-helmholtz-check"
 path = "src/bin/pcg_helmholtz_check.rs"
 
+[[bin]]
+name = "rhs-assemble-check"
+path = "src/bin/rhs_assemble_check.rs"
+
+[[bin]]
+name = "device-resident-flow-check"
+path = "src/bin/device_resident_flow_check.rs"
+
+[[bin]]
+name = "sbm-cylinder-resident-check"
+path = "src/bin/sbm_cylinder_resident_check.rs"
+
 # Validates p-MG PCG for the singular pure-Neumann pressure-Poisson (deflated) vs CG.
 [[bin]]
 name = "pcg-pressure-check"

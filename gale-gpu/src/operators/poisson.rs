@@ -650,6 +650,35 @@ mod kernels {
         }
     }
 
+    /// Diagonal-mass RHS assembly: `b[i] = scale·jw[i]·f[i] + lift[i]`. The DG-SEM mass is
+    /// diagonal (`jw` = Jacobian·GLL weights) and the boundary (Nitsche/Neumann) lift depends
+    /// only on the BC data + geometry — constant for fixed-in-time BCs. So the full host RHS
+    /// assembly (`Poisson::rhs` = M·f + boundary lift) collapses to ONE fused multiply-add,
+    /// keeping the source `f` and the result resident on device (no HtoD/DtoH). `scale` folds the
+    /// Helmholtz reaction λ (velocity) or 1 (pressure). `jw`/`lift` are precomputed once on the
+    /// host (`lift = rhs(0, g)`, `jw = rhs(1, 0)`) and uploaded.
+    #[kernel]
+    pub fn rhs_madd(mut b: DisjointSlice<f64>, jw: &[f64], f: &[f64], lift: &[f64], scale: f64) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = b.get_mut(idx) {
+            *o = scale * jw[i] * f[i] + lift[i];
+        }
+    }
+
+    /// Two-product fused multiply-add `out[i] = a[i]·b[i] + c[i]·d[i]` (Hadamard). The
+    /// device-resident convection primitive: `(u·∇)u`-component `= u·∂ₓu + v·∂ᵧu` from the
+    /// element-local gradients, with the field kept on device.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fma2(mut out: DisjointSlice<f64>, a: &[f64], b: &[f64], c: &[f64], d: &[f64]) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = a[i] * b[i] + c[i] * d[i];
+        }
+    }
+
     /// Packed gather `out[i] = src[idx[i]]` — packs scattered partition-boundary trace nodes
     /// into a contiguous send buffer so a multi-GPU halo exchange moves in ONE P2P copy per
     /// field/direction instead of one tiny copy per node. Used by `multigpu_poisson_matvec_2d`.
@@ -1743,7 +1772,7 @@ pub fn poisson_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build(&stream, mg)?;
-    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false)
+    pcg_solve_host::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false)
 }
 
 /// Solve the **SBM** system `A·u = rhs` by SBM-aware p-multigrid-preconditioned CG, fully on
@@ -1761,7 +1790,7 @@ pub fn sbm_pcg_solve(
     let stream = ctx.default_stream();
     let module = kernels::load(&ctx)?;
     let dev = MgConst::build_sbm(&stream, smg)?;
-    pcg_solve_with::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false)
+    pcg_solve_host::<f64>(&stream, &module, &dev, rhs, None, tol, maxit, false)
 }
 
 /// The p-MG-PCG loop given an already-created stream + loaded module + uploaded
@@ -1769,7 +1798,12 @@ pub fn sbm_pcg_solve(
 /// persistent [`GpuPoissonMg`] handle. The constant per-level device arrays live in
 /// `dev`; only the per-solve scratch (V-cycle work vectors + PCG vectors) is allocated
 /// here, and only `rhs` is uploaded.
-fn pcg_solve_with<G: Scalar + DeviceCopy>(
+/// Host-slice convenience wrapper around the device-native [`pcg_solve_with`]: uploads
+/// `rhs`/`x0`, runs the solve, downloads the solution. Used by the one-shot solvers and the
+/// host-facing [`GpuPoissonMg::solve`]. To keep a field **resident on device** across a whole
+/// time step (no per-stage HtoD/DtoH), call [`pcg_solve_with`] directly with device buffers
+/// (see [`GpuPoissonMg::solve_dev`]).
+fn pcg_solve_host<G: Scalar + DeviceCopy>(
     stream: &CudaStream,
     module: &kernels::LoadedModule,
     dev: &MgConst,
@@ -1779,6 +1813,32 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     maxit: usize,
     use_graph: bool,
 ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    let rhs_dev = DeviceBuffer::from_host(stream, rhs)?;
+    let x0_dev = match x0 {
+        Some(x) => Some(DeviceBuffer::from_host(stream, x)?),
+        None => None,
+    };
+    let mut out = DeviceBuffer::<f64>::zeroed(stream, dev.n0)?;
+    let iters = pcg_solve_with::<G>(stream, module, dev, &rhs_dev, x0_dev.as_ref(), &mut out, tol, maxit, use_graph)?;
+    Ok((out.to_host_vec(stream)?, iters))
+}
+
+/// Device-native p-MG-PCG: reads `rhs_dev` (already on device), optionally warm-starts from
+/// `x0_dev`, writes the solution into `out` — **no host transfers**. Returns the iteration count.
+/// This is the entry point for device-resident time-stepping; [`pcg_solve_host`] wraps it for
+/// host-slice callers. `out` must be length `dev.n0` (the finest level).
+#[allow(clippy::too_many_arguments)]
+fn pcg_solve_with<G: Scalar + DeviceCopy>(
+    stream: &CudaStream,
+    module: &kernels::LoadedModule,
+    dev: &MgConst,
+    rhs_dev: &DeviceBuffer<f64>,
+    x0: Option<&DeviceBuffer<f64>>,
+    out: &mut DeviceBuffer<f64>,
+    tol: f64,
+    maxit: usize,
+    use_graph: bool,
+) -> Result<usize, Box<dyn std::error::Error>> {
     // `use_graph`: capture the V-cycle launch sequence into a CUDA graph once and replay it each
     // outer PCG iteration, instead of re-issuing its ~500 tiny kernel launches. The solve is
     // launch-bound (cuLaunchKernel ≈ 83% of host time), so this is the dominant lever. Requires
@@ -1828,7 +1888,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // element count + order at each level; the transfer/vector kernels keep `cfg`/`vcfg`.
     let mvcfg: Vec<(LaunchConfig, LaunchConfig)> =
         (0..nlev).map(|l| matvec_cfgs(nev[l] as usize, n1v[l])).collect();
-    assert_eq!(rhs.len(), n0, "rhs length must match the finest level");
+    debug_assert_eq!(out.len(), n0, "out length must match the finest level");
 
     // Per-solve scratch: V-cycle work vectors (struct-of-arrays per level) — allocated
     // fresh each solve (cheap device zeroed-malloc; the expensive uploads live in `dev`).
@@ -1846,13 +1906,14 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         sm.push(DeviceBuffer::<f64>::zeroed(stream, nd)?); // damped-Jacobi smoother pong buffer
     }
 
-    // PCG vectors (finest level, separate from V-cycle scratch).
+    // PCG vectors (finest level, separate from V-cycle scratch). `pres` (the residual) is
+    // initialized to `rhs` further down (after the `dcopy!` macro is in scope); `rhs_dev` is the
+    // caller's device buffer, used read-only (warm-start `rhs − A·x0` and the ‖rhs‖ normaliser).
     let mut psol = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    let mut pres = DeviceBuffer::from_host(stream, rhs)?;
+    let mut pres = DeviceBuffer::<f64>::zeroed(stream, n0)?;
     let mut pp = DeviceBuffer::<f64>::zeroed(stream, n0)?;
     let pz = DeviceBuffer::<f64>::zeroed(stream, n0)?;
     let mut pap = DeviceBuffer::<f64>::zeroed(stream, n0)?;
-    let rhs_dev = DeviceBuffer::from_host(stream, rhs)?;
     // Multi-block reduction partials, sized for the finest level (the largest dot).
     let mut partial = DeviceBuffer::<f64>::zeroed(stream, dot_blocks(n0))?;
     // CG/PCG scalars kept **on device** (length-1 buffers) so neither the outer PCG nor the
@@ -1894,6 +1955,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             }
         }};
     }
+    dcopy!(&pres, rhs_dev, n0); // residual ← rhs (the cold-start initial residual)
     // Singular pure-Neumann pressure operator (constant nullspace) ⇒ deflate: project the
     // residual onto the range (subtract its mean) in the OUTER PCG and in the COARSEST solve;
     // the SPD V-cycle preconditioner itself is unmodified (see docs/research-pressure-multigrid.md).
@@ -2126,12 +2188,10 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // Initial guess: warm-start from `x0` (psol ← x0, residual ← rhs − A·x0) when provided —
     // for a time loop the previous step's solution collapses the iteration count. Otherwise the
     // cold start (psol ← 0, residual = rhs). `pres` is currently `rhs` (uploaded at allocation).
-    if let Some(x0v) = x0 {
-        assert_eq!(x0v.len(), n0, "x0 length must match the finest level");
-        let x0_dev = DeviceBuffer::from_host(stream, x0v)?;
-        dcopy!(&psol, &x0_dev, n0); // psol ← x0
+    if let Some(x0_dev) = x0 {
+        dcopy!(&psol, x0_dev, n0); // psol ← x0
         matvec0!(&psol, &mut pap); // pap ← A·x0  (FP64)
-        module.sub(&stream, vcfg[0], &mut pres, &rhs_dev, &pap)?; // pres ← rhs − A·x0
+        module.sub(&stream, vcfg[0], &mut pres, rhs_dev, &pap)?; // pres ← rhs − A·x0
     } else {
         module.scal(&stream, vcfg[0], &mut psol, 0.0)?;
     }
@@ -2140,7 +2200,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     run_vcycle!();
     dcopy!(&pz, &xb[0], n0);
     dcopy!(&pp, &pz, n0);
-    dot_to!(&rhs_dev, &rhs_dev, n0, &mut d_rr);
+    dot_to!(rhs_dev, rhs_dev, n0, &mut d_rr);
     let bn = d_rr.to_host_vec(&stream)?[0].sqrt().max(1e-300);
     dot_to!(&pres, &pz, n0, &mut d_rz);
     let mut iters = 0;
@@ -2176,7 +2236,8 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     let kind = if deflate { "singular-Neumann pressure" } else { "Helmholtz" };
     warn_unconverged(&format!("p-MG-PCG ({kind})"), converged, iters, maxit, rel, tol);
 
-    Ok((psol.to_host_vec(&stream)?, iters))
+    dcopy!(out, &psol, n0); // solution → caller's device buffer (no host transfer)
+    Ok(iters)
 }
 
 /// Persistent p-multigrid-PCG handle: owns the CUDA context, the loaded device module, and
@@ -2290,10 +2351,108 @@ impl GpuPoissonMg {
         &self, rhs: &[f64], x0: Option<&[f64]>, tol: f64, maxit: usize,
     ) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
         if self.mixed {
-            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph)
+            pcg_solve_host::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph)
         } else {
-            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph)
+            pcg_solve_host::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, tol, maxit, self.graph)
         }
+    }
+
+    /// The handle's CUDA stream — so a device-resident caller can allocate its field/scratch
+    /// buffers on the same stream/context that [`solve_dev`](Self::solve_dev) runs on.
+    pub fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+
+    /// Allocate a zeroed finest-level device buffer (`ndof` f64) on this handle's stream — a
+    /// convenience for device-resident steppers that keep fields on the GPU across time steps.
+    pub fn alloc_field(&self) -> Result<DeviceBuffer<f64>, Box<dyn std::error::Error>> {
+        Ok(DeviceBuffer::<f64>::zeroed(&self.stream, self.dev.n0)?)
+    }
+
+    /// **Device-native** solve: `rhs` is already on the device, the solution is written into
+    /// `out` (length [`ndof`](Self::ndof)), optionally warm-started from `x0` — **no HtoD/DtoH**.
+    /// Returns the iteration count. This is the entry point for device-resident time-stepping
+    /// (keep `ux`/`uy`/`p` resident on the GPU and chain solves with the assembly kernels);
+    /// [`solve`](Self::solve)/[`solve_from`](Self::solve_from) are the host-slice wrappers.
+    pub fn solve_dev(
+        &self,
+        rhs: &DeviceBuffer<f64>,
+        x0: Option<&DeviceBuffer<f64>>,
+        out: &mut DeviceBuffer<f64>,
+        tol: f64,
+        maxit: usize,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        if self.mixed {
+            pcg_solve_with::<f32>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph)
+        } else {
+            pcg_solve_with::<f64>(&self.stream, &self.module, &self.dev, rhs, x0, out, tol, maxit, self.graph)
+        }
+    }
+
+    // ===== Device-resident stage primitives ======================================
+    // Pointwise/gradient ops on resident device fields, so a dual-splitting step can chain
+    // convection → projection → diffusion entirely on the GPU (no per-stage HtoD/DtoH). All
+    // operate on finest-level buffers (length [`ndof`](Self::ndof)).
+
+    /// Element-local physical gradient: `gx = ∂src/∂x`, `gy = ∂src/∂y` (DG-SEM, discontinuous
+    /// across faces — the same gradient the matvec uses, so it matches the host `grad_x`/`grad_y`).
+    pub fn gradient_dev(
+        &self, src: &DeviceBuffer<f64>, gx: &mut DeviceBuffer<f64>, gy: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (gcfg, _) = matvec_cfgs(self.dev.nev[0] as usize, self.dev.n1v[0]);
+        self.module.gradient::<f64, f64>(
+            &self.stream, gcfg, &self.dev.dl[0], src, self.dev.rxs[0], self.dev.sys[0],
+            self.dev.n1v[0], self.dev.nev[0], gx, gy,
+        )?;
+        Ok(())
+    }
+
+    /// `y ← y + a·x` (device fields).
+    pub fn axpy_dev(&self, y: &mut DeviceBuffer<f64>, x: &DeviceBuffer<f64>, a: f64) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.axpy(&self.stream, self.dev.vcfg[0], y, x, a)?;
+        Ok(())
+    }
+
+    /// `y ← c·y` (device field, in place).
+    pub fn scal_dev(&self, y: &mut DeviceBuffer<f64>, c: f64) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.scal(&self.stream, self.dev.vcfg[0], y, c)?;
+        Ok(())
+    }
+
+    /// `dst ← src` (device-to-device copy of a finest-level field).
+    pub fn copy_dev(&self, dst: &mut DeviceBuffer<f64>, src: &DeviceBuffer<f64>) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            cuda_core::memory::memcpy_dtod_async(dst.cu_deviceptr(), src.cu_deviceptr(), self.dev.n0 * 8, self.stream.cu_stream())?;
+        }
+        Ok(())
+    }
+
+    /// `out ← a⊙b + c⊙d` (Hadamard FMA) — the convection primitive `u·∂ₓu + v·∂ᵧu`.
+    pub fn fma2_dev(
+        &self, out: &mut DeviceBuffer<f64>, a: &DeviceBuffer<f64>, b: &DeviceBuffer<f64>, c: &DeviceBuffer<f64>, d: &DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.fma2(&self.stream, self.dev.vcfg[0], out, a, b, c, d)?;
+        Ok(())
+    }
+
+    /// Diagonal-mass RHS assembly `b ← scale·jw⊙f + lift` (see [`kernels::rhs_madd`]).
+    pub fn rhs_madd_dev(
+        &self, b: &mut DeviceBuffer<f64>, jw: &DeviceBuffer<f64>, f: &DeviceBuffer<f64>, lift: &DeviceBuffer<f64>, scale: f64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.rhs_madd(&self.stream, self.dev.vcfg[0], b, jw, f, lift, scale)?;
+        Ok(())
+    }
+
+    /// Upload a host field to a fresh finest-level device buffer (one-time setup of constants
+    /// like the diagonal mass `jw` and the boundary lift, or the initial condition).
+    pub fn upload_field(&self, v: &[f64]) -> Result<DeviceBuffer<f64>, Box<dyn std::error::Error>> {
+        Ok(DeviceBuffer::from_host(&self.stream, v)?)
+    }
+
+    /// Download a finest-level device field to host (for diagnostics / force recovery — the only
+    /// transfer a device-resident loop needs, and only when a host-side quantity is required).
+    pub fn download_field(&self, v: &DeviceBuffer<f64>) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+        Ok(v.to_host_vec(&self.stream)?)
     }
 }
 
