@@ -22,7 +22,7 @@ pub mod stagehook;
 pub mod state;
 pub mod term;
 
-pub use amr::AmrUpdater;
+pub use amr::{AmrUpdater, AmrUpdater3d};
 pub use device::{Device, DomainDecomposition, Partition};
 pub use dynamics::{
     BaseRhs, BodyForce, BodyForce3d, DualSplitting, DualSplitting3d, FieldVec, FnStateTerm, Mol,

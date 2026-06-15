@@ -90,7 +90,10 @@ pub use amr::{
     adapt_scalar, remap_component_flat, remap_scalar, smoothness_per_cell, RefineQuad,
     SmoothnessIndicator,
 };
-pub use amr3d::{RefineHex, SmoothnessIndicator3d};
+pub use amr3d::{
+    child_smoothness_max_3d, remap_component_flat_3d, smoothness_per_cell_3d, RefineHex,
+    SmoothnessIndicator3d,
+};
 pub use bc::{BoundaryConditions, BoundaryConditions3d, FlowBc, FlowBc3d};
 pub use dgmesh::DgMesh;
 pub use distributed::{distributed_advection_rhs, halo_exchange, partition_blocks};

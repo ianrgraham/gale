@@ -10,6 +10,7 @@
 use super::amr::lagrange_basis;
 use super::filter::mat_inverse;
 use super::reference::{legendre_all, Reference1d};
+use std::collections::{HashMap, HashSet};
 
 /// `h`-refinement transfer operators for an order-`p` hex element. Children are
 /// indexed `c = cx + 2cy + 4cz`, `cx,cy,cz ∈ {0,1}`.
@@ -294,11 +295,186 @@ impl SmoothnessIndicator3d {
     }
 }
 
+// ===== Octree AMR remap + indicator (the 3D analogues of the `amr` 2D helpers) ==================
+
+/// Octree base-cell → element-index map. Mirrors `cartesian_refined`'s ordering: row-major
+/// `(cz, cy, cx)`, a refined cell occupying 8 consecutive indices (child `c = cx + 2cy + 4cz`).
+fn cell_element_map_3d(
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    set: &HashSet<(usize, usize, usize)>,
+) -> HashMap<(usize, usize, usize), Vec<usize>> {
+    let mut map = HashMap::new();
+    let mut idx = 0;
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                if set.contains(&(cx, cy, cz)) {
+                    map.insert((cx, cy, cz), (0..8).map(|c| idx + c).collect());
+                    idx += 8;
+                } else {
+                    map.insert((cx, cy, cz), vec![idx]);
+                    idx += 1;
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Octree 2:1 scalar transfer for one refinement transition (newly-refined cells prolonged to 8
+/// children, newly-coarsened cells conservatively restricted, unchanged cells copied). The 3D
+/// analogue of `amr::remap_scalar_data`.
+fn remap_scalar_data_3d(
+    rh: &RefineHex,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    old_set: &HashSet<(usize, usize, usize)>,
+    new_set: &HashSet<(usize, usize, usize)>,
+    u_old: &[Vec<f64>],
+) -> Vec<Vec<f64>> {
+    let old_map = cell_element_map_3d(nx, ny, nz, old_set);
+    let mut u_new = Vec::new();
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let oe = &old_map[&(cx, cy, cz)];
+                match (old_set.contains(&(cx, cy, cz)), new_set.contains(&(cx, cy, cz))) {
+                    (false, false) => u_new.push(u_old[oe[0]].clone()),
+                    (false, true) => {
+                        for c in 0..8 {
+                            u_new.push(rh.prolong(&u_old[oe[0]], c % 2, (c / 2) % 2, c / 4));
+                        }
+                    }
+                    (true, false) => {
+                        let children: [Vec<f64>; 8] = std::array::from_fn(|c| u_old[oe[c]].clone());
+                        u_new.push(rh.restrict(&children));
+                    }
+                    (true, true) => {
+                        for c in 0..8 {
+                            u_new.push(u_old[oe[c]].clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    u_new
+}
+
+/// Remap a flat scalar component (`[n_elem · n_nodes]`, element-ordered) between octree refinement
+/// states — the 3D analogue of [`remap_component_flat`](super::amr::remap_component_flat).
+pub fn remap_component_flat_3d(
+    order: usize,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    old_set: &[(usize, usize, usize)],
+    comp_old: &[f64],
+    new_set: &[(usize, usize, usize)],
+) -> Vec<f64> {
+    let rh = RefineHex::new(order);
+    let nn = (order + 1).pow(3);
+    let old_h: HashSet<_> = old_set.iter().copied().collect();
+    let new_h: HashSet<_> = new_set.iter().copied().collect();
+    let u_old: Vec<Vec<f64>> = comp_old.chunks(nn).map(|c| c.to_vec()).collect();
+    remap_scalar_data_3d(&rh, nx, ny, nz, &old_h, &new_h, &u_old).concat()
+}
+
+/// Per base-cell smoothness on the current (possibly-refined) octree mesh — level-aware (a refined
+/// cell is restricted to base before indicating). The 3D analogue of
+/// [`smoothness_per_cell`](super::amr::smoothness_per_cell); returns `nx·ny·nz` values in
+/// `cx + cy·nx + cz·nx·ny` order. Used as the REFINE criterion on unrefined cells.
+pub fn smoothness_per_cell_3d(
+    order: usize,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    old_set: &[(usize, usize, usize)],
+    indic_comp: &[f64],
+) -> Vec<f64> {
+    let si = SmoothnessIndicator3d::new(order);
+    let rh = RefineHex::new(order);
+    let nn = (order + 1).pow(3);
+    let old_h: HashSet<_> = old_set.iter().copied().collect();
+    let old_map = cell_element_map_3d(nx, ny, nz, &old_h);
+    let u: Vec<Vec<f64>> = indic_comp.chunks(nn).map(|c| c.to_vec()).collect();
+    let mut out = vec![0.0; nx * ny * nz];
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let oe = &old_map[&(cx, cy, cz)];
+                let cell = if old_h.contains(&(cx, cy, cz)) {
+                    let children: [Vec<f64>; 8] = std::array::from_fn(|c| u[oe[c]].clone());
+                    rh.restrict(&children)
+                } else {
+                    u[oe[0]].clone()
+                };
+                out[cx + cy * nx + cz * nx * ny] = si.indicator(&cell);
+            }
+        }
+    }
+    out
+}
+
+/// For each refined cell, the MAX [`SmoothnessIndicator3d`] over its 8 children — the child-based
+/// COARSEN criterion (judges the children directly, avoiding restrict-then-indicate oscillation).
+/// The 3D analogue of [`child_smoothness_max`](super::amr::child_smoothness_max).
+pub fn child_smoothness_max_3d(
+    order: usize,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    refined: &[(usize, usize, usize)],
+    indic_comp: &[f64],
+) -> HashMap<(usize, usize, usize), f64> {
+    let si = SmoothnessIndicator3d::new(order);
+    let nn = (order + 1).pow(3);
+    let set: HashSet<_> = refined.iter().copied().collect();
+    let map = cell_element_map_3d(nx, ny, nz, &set);
+    let mut out = HashMap::new();
+    for &cell in refined {
+        let mut mx = 0.0f64;
+        for &e in &map[&cell] {
+            mx = mx.max(si.indicator(&indic_comp[e * nn..(e + 1) * nn]));
+        }
+        out.insert(cell, mx);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dg::Mesh3d;
 
     const P: usize = 3;
+
+    /// Refine→coarsen round-trip recovers a degree-≤p field exactly (prolong is exact interpolation,
+    /// restrict is the conservative L2 projection — exact for polynomials in the space). Also checks
+    /// a partial (genuine 2:1) refinement remap is consistent.
+    #[test]
+    fn remap_3d_refine_then_coarsen_recovers() {
+        let (order, nx, ny, nz) = (P, 2, 2, 2);
+        let nn = (order + 1).pow(3);
+        let base = Mesh3d::rectangular(order, nx, ny, nz, [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]);
+        let f = |x: f64, y: f64, z: f64| 1.0 + x - 2.0 * y + 0.5 * z + x * y * z + x * x - y * z;
+        let mut comp_base = vec![0.0; base.n_elements() * nn];
+        for (e, el) in base.elements.iter().enumerate() {
+            for k in 0..nn {
+                comp_base[e * nn + k] = f(el.geom.x[k], el.geom.y[k], el.geom.z[k]);
+            }
+        }
+        let all: Vec<(usize, usize, usize)> =
+            (0..nz).flat_map(|cz| (0..ny).flat_map(move |cy| (0..nx).map(move |cx| (cx, cy, cz)))).collect();
+        let refined = remap_component_flat_3d(order, nx, ny, nz, &[], &comp_base, &all);
+        let back = remap_component_flat_3d(order, nx, ny, nz, &all, &refined, &[]);
+        assert_eq!(back.len(), comp_base.len());
+        let err = back.iter().zip(&comp_base).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        assert!(err < 1e-10, "refine→coarsen round-trip not exact: {err:.3e}");
+    }
 
     #[test]
     fn face_mortar_is_exact_and_adjoint() {
