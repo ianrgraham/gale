@@ -26,6 +26,12 @@ work has moved on to the physics frontier; this is a checkpoint, not a finished 
   bound-preserving SSP-RK3). Dumps `u` and the polymer-stretch diagnostic `tr C`. Knobs:
   `VE_BETA`, `VE_LAMBDA` (De), `VE_NU0` (Re), `VE_EPS`/`VE_BMAX` (SPD limiter).
 - `traj-lid`, `traj-suspension` — lid-driven cavity, many-body suspension.
+- **`traj-amr`** — dynamically adaptive 2D flow (`GpuDualSplitting` + `AmrUpdater`, refine+coarsen
+  on a diffusing vortex): re-emits a NEW topology whenever the mesh changes, so the trajectory
+  carries a per-frame mesh.
+- **`traj-amr-dipole`** — the AMR showcase: a self-advecting counter-rotating vortex pair whose
+  refined region TRACKS the moving cores and coarsens the wake (env: `AMR_N/NU/DT/AMP/S2/SEP/
+  REFINE/COARSEN`). View with `gale-view … --grid`.
 - Common env knobs: `SBM_NY`, `SBM_DT`, `TRAJ_STEPS`, `TRAJ_EVERY`, `TRAJ_MAX_MB`.
 
 ### Viewers

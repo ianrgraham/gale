@@ -64,6 +64,11 @@ path = "src/bin/traj_amr.rs"
 required-features = ["traj"]
 
 [[bin]]
+name = "traj-amr-dipole"
+path = "src/bin/traj_amr_dipole.rs"
+required-features = ["traj"]
+
+[[bin]]
 name = "traj-ve-cylinder"
 path = "src/bin/traj_ve_cylinder.rs"
 required-features = ["traj"]
