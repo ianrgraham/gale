@@ -58,6 +58,11 @@ name = "traj-lid"
 path = "src/bin/traj_lid.rs"
 required-features = ["traj"]
 
+[[bin]]
+name = "traj-ve-cylinder"
+path = "src/bin/traj_ve_cylinder.rs"
+required-features = ["traj"]
+
 # Cross-crate validation: a consumer binary that calls the library kernel and
 # checks it against gale's CPU oracle (exercises the dependency-rlib link path).
 # Run: cargo oxide run --bin advection-check

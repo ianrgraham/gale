@@ -63,10 +63,12 @@ struct Args {
     window: bool,
     watch: bool,
     fps: u32,
+    vmin: Option<f32>,
+    vmax: Option<f32>,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { path: String::new(), field: "u".into(), comp: "0".into(), frame: None, all: false, out: None, height: 600, window: false, watch: false, fps: 20 };
+    let mut a = Args { path: String::new(), field: "u".into(), comp: "0".into(), frame: None, all: false, out: None, height: 600, window: false, watch: false, fps: 20, vmin: None, vmax: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -79,11 +81,13 @@ fn parse_args() -> Args {
             "--window" => a.window = true,
             "--watch" => a.watch = true,
             "--fps" => a.fps = it.next().unwrap().parse().unwrap(),
+            "--vmin" => a.vmin = Some(it.next().unwrap().parse().unwrap()),
+            "--vmax" => a.vmax = Some(it.next().unwrap().parse().unwrap()),
             _ => a.path = arg,
         }
     }
     if a.path.is_empty() {
-        eprintln!("usage: gale-view <traj.h5> [--field u] [--comp 0|mag] [--frame N|--all] [--out P] [--height H] [--window] [--watch] [--fps F]");
+        eprintln!("usage: gale-view <traj.h5> [--field u] [--comp 0|mag] [--frame N|--all] [--out P] [--height H] [--vmin V] [--vmax V] [--window] [--watch] [--fps F]");
         std::process::exit(2);
     }
     a
@@ -380,7 +384,9 @@ fn run_offscreen(args: &Args) {
 
     let to_render: Vec<usize> = if args.all { (0..nfr).collect() } else { vec![args.frame.unwrap_or(nfr - 1)] };
     let render_frames: Vec<(usize, String)> = to_render.iter().map(|&i| frames[i].clone()).collect();
-    let (vmin, vmax) = color_range(&handles, &render_frames, &args.field, &args.comp);
+    let (mut vmin, mut vmax) = color_range(&handles, &render_frames, &args.field, &args.comp);
+    if let Some(v) = args.vmin { vmin = v; }
+    if let Some(v) = args.vmax { vmax = v; }
     println!("value range [{vmin:.4}, {vmax:.4}]");
     for &i in &to_render {
         let (hi, key) = &frames[i];
@@ -409,13 +415,16 @@ struct FrameBuffers {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_frame(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, handles: &[hdf5::File], frames: &[(usize, String)], i: usize, radii: &[f64], field: &str, comp: &str, vmin: &mut f32, vmax: &mut f32) -> FrameBuffers {
+fn build_frame(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, handles: &[hdf5::File], frames: &[(usize, String)], i: usize, radii: &[f64], field: &str, comp: &str, vmin: &mut f32, vmax: &mut f32, ovmin: Option<f32>, ovmax: Option<f32>) -> FrameBuffers {
     use wgpu::util::DeviceExt;
     let (hi, key) = &frames[i];
     let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, field);
     let t = tessellate(&nodes, &fld, ne, nn, nc, comp, 2);
     for &v in &t.raw { if v.is_finite() { *vmin = vmin.min(v); *vmax = vmax.max(v); } }
     if !(*vmin < *vmax) { *vmin = 0.0; *vmax = 1.0; }
+    // Manual --vmin/--vmax override the auto-range (fixed colour window across frames).
+    if let Some(v) = ovmin { *vmin = v; }
+    if let Some(v) = ovmax { *vmax = v; }
     let verts = vertices(&t, *vmin, *vmax);
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&t.indices), usage: wgpu::BufferUsages::INDEX });
@@ -454,6 +463,7 @@ fn run_window(args: Args) {
     let watch = args.watch;
     let path = args.path;
     let initial = args.frame;
+    let (ovmin, ovmax) = (args.vmin, args.vmax);
     let frame_dt = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
 
     let mut paths = list_set(&path).0;
@@ -488,7 +498,7 @@ fn run_window(args: Args) {
     let (mut vmin, mut vmax) = (f32::MAX, f32::MIN);
     let follow = watch;
     let mut cur: Option<usize> = (!frames.is_empty()).then(|| initial.unwrap_or(frames.len() - 1).min(frames.len() - 1));
-    let mut fb: Option<FrameBuffers> = cur.map(|c| build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax));
+    let mut fb: Option<FrameBuffers> = cur.map(|c| build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax));
     let mut playing = false;
     let mut last_advance = Instant::now();
     let mut last_scan = Instant::now();
@@ -516,7 +526,7 @@ fn run_window(args: Args) {
                     _ => return,
                 }
                 cur = Some(c);
-                fb = Some(build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax));
+                fb = Some(build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax));
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -559,7 +569,7 @@ fn run_window(args: Args) {
                 dirty = true;
             }
             if dirty {
-                if let Some(c) = cur { fb = Some(build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax)); }
+                if let Some(c) = cur { fb = Some(build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax)); }
                 window.request_redraw();
             } else if cur.is_none() {
                 window.request_redraw();

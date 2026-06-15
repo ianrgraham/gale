@@ -291,8 +291,19 @@ pub fn sbm_reconstruct(mesh: &Mesh2d, sb: &ShiftedBoundary, ls: &impl LevelSet, 
             src.push([sn.x, sn.y, field[i], gx[i], gy[i], gxx[i], 0.5 * (gxy[i] + gyx[i]), gyy[i]]);
         }
     }
+    // Envelope of the real near-boundary (surrogate) data. The Taylor extrapolation can overshoot
+    // wildly for a sharply-varying field (e.g. a stress concentration), so we bound the result to
+    // within one data-span of this envelope: enough headroom for a genuine local peak or for the
+    // value to fall to a no-slip 0, but it suppresses the 10–100× pure-extrapolation blow-ups.
+    let (mut smin, mut smax) = (f64::INFINITY, f64::NEG_INFINITY);
+    for s in &src {
+        smin = smin.min(s[2]);
+        smax = smax.max(s[2]);
+    }
+    let span = (smax - smin).max(f64::MIN_POSITIVE);
+    let (clamp_lo, clamp_hi) = (smin - span, smax + span);
     let eval = |x: f64, y: f64| -> f64 {
-        // 2nd-order Taylor (value + ∇ + Hessian) from the nearest surrogate node.
+        // 2nd-order Taylor (value + ∇ + Hessian) from the nearest surrogate node, envelope-limited.
         let mut best = f64::INFINITY;
         let mut val = f64::NAN;
         for s in &src {
@@ -303,7 +314,7 @@ pub fn sbm_reconstruct(mesh: &Mesh2d, sb: &ShiftedBoundary, ls: &impl LevelSet, 
                 val = s[2] + s[3] * dx + s[4] * dy + 0.5 * (s[5] * dx * dx + 2.0 * s[6] * dx * dy + s[7] * dy * dy);
             }
         }
-        val
+        val.clamp(clamp_lo, clamp_hi)
     };
     let mut out = field.to_vec();
     for (e, el) in mesh.elements.iter().enumerate() {
