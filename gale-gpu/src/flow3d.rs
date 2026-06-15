@@ -9,19 +9,34 @@
 use crate::operators::poisson3d::{
     helmholtz3d_cg_solve, helmholtz3d_cg_solve_tags, pressure3d_cg_solve, GpuPoisson3d,
 };
-use gale::dg::{BoundaryConditions3d, Mesh3d, Poisson3d};
+use crate::operators::poisson3d_nc::{helmholtz3d_nc_cg_solve_tags, pressure3d_nc_cg_solve};
+use gale::dg::{BoundaryConditions3d, Mesh3d, Neighbor3, Poisson3d};
 use std::cell::RefCell;
 
 type StepResult = Result<(Vec<f64>, Vec<f64>, Vec<f64>), Box<dyn std::error::Error>>;
 
+/// Whether the hex mesh has any 2:1 non-conforming (octree AMR) interface — if so the GPU elliptic
+/// solves route through the non-conforming path (`poisson3d_nc`) instead of the conforming one.
+fn mesh_is_nonconforming(mesh: &Mesh3d) -> bool {
+    mesh.elements.iter().any(|el| {
+        el.neighbors
+            .iter()
+            .any(|n| matches!(n, Neighbor3::CoarseToFine { .. } | Neighbor3::FineToCoarse { .. }))
+    })
+}
+
 /// Lazily (re)build the persistent [`GpuPoisson3d`] handle in `slot` for `mesh`, so an
 /// integrator's `step(&self, …)` can hold ONE handle across timesteps (P4) — the 3D
-/// analogue of [`crate::flow::ensure_poisson_handle`]. `Mesh3d` is conforming-only, so
-/// there is no non-conforming fallback; the handle is rebuilt only when the dof count
-/// changes (e.g. after a remesh), so a static mesh pays the ~0.3 s setup exactly once.
+/// analogue of [`crate::flow::ensure_poisson_handle`]. The conforming handle is cleared for a
+/// non-conforming mesh (the step then uses the one-shot `poisson3d_nc` solves); rebuilt when the
+/// dof count changes (e.g. after an AMR remesh), so a static mesh pays the ~0.3 s setup once.
 fn ensure_poisson3d_handle(slot: &RefCell<Option<GpuPoisson3d>>, mesh: &Mesh3d, alpha: f64) {
-    let ndof = mesh.n_elements() * mesh.refh.n_nodes();
     let mut cur = slot.borrow_mut();
+    if mesh_is_nonconforming(mesh) {
+        *cur = None;
+        return;
+    }
+    let ndof = mesh.n_elements() * mesh.refh.n_nodes();
     if cur.as_ref().map_or(true, |h| h.ndof() != ndof) {
         *cur = Some(GpuPoisson3d::new(mesh, alpha).expect("gale-gpu: GpuPoisson3d handle build failed"));
     }
@@ -257,7 +272,10 @@ impl<'m, 'p> GpuStokes3d<'m, 'p> {
         let div = self.divergence(&uhx, &uhy, &uhz);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _, _| 0.0, |_, _, _| 0.0);
-        let (p, _it) = if let Some(h) = self.poisson {
+        let nc = mesh_is_nonconforming(mesh);
+        let (p, _it) = if nc {
+            pressure3d_nc_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+        } else if let Some(h) = self.poisson {
             // Pure-Neumann pressure, deflated (closed box ⇒ all tags Neumann, no outflow).
             h.solve(&bp, 0.0, &self.pres_neumann_tags, true, self.tol, self.maxit)?
         } else {
@@ -284,7 +302,9 @@ impl<'m, 'p> GpuStokes3d<'m, 'p> {
         let bz = self.velocity_z.rhs(&fzv, |x, y, z| bc_w(x, y, z, t));
         // All-Dirichlet velocity Helmholtz (closed box ⇒ empty Neumann-tag sets).
         let solve_vel = |b: &[f64]| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-            Ok(if let Some(h) = self.poisson {
+            Ok(if nc {
+                helmholtz3d_nc_cg_solve_tags(mesh, b, self.alpha, lambda, &self.velx_neumann, self.tol, self.maxit)?.0
+            } else if let Some(h) = self.poisson {
                 h.solve(b, lambda, &self.velx_neumann, false, self.tol, self.maxit)?.0
             } else {
                 helmholtz3d_cg_solve(mesh, b, self.alpha, lambda, self.tol, self.maxit)?.0
@@ -347,7 +367,15 @@ impl<'m, 'p> GpuStokes3d<'m, 'p> {
         let div = self.divergence(&uhx, &uhy, &uhz);
         let fp: Vec<f64> = div.iter().map(|d| -d / dt).collect();
         let bp = self.pressure.rhs_mixed(&fp, |_, _, _| 0.0, |_, _, _| 0.0);
-        let (p, _it) = if let Some(h) = self.poisson {
+        let nc = mesh_is_nonconforming(mesh);
+        let (p, _it) = if nc {
+            // Outflow ⇒ pressure pinned (non-deflated tag-CG); no outflow ⇒ singular ⇒ deflated.
+            if self.has_outflow {
+                helmholtz3d_nc_cg_solve_tags(mesh, &bp, self.alpha, 0.0, &self.pres_neumann_tags, self.tol, self.maxit)?
+            } else {
+                pressure3d_nc_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
+            }
+        } else if let Some(h) = self.poisson {
             // Outflow ⇒ pressure pinned (non-deflated); no outflow ⇒ singular ⇒ deflated.
             h.solve(&bp, 0.0, &self.pres_neumann_tags, !self.has_outflow, self.tol, self.maxit)?
         } else if self.has_outflow {
@@ -375,7 +403,9 @@ impl<'m, 'p> GpuStokes3d<'m, 'p> {
         let by = self.velocity_y.rhs_tagged(&fyv, |tag, x, y, z| vel_dir(tag, x, y, z).1, |_, _, _, _| 0.0);
         let bz = self.velocity_z.rhs_tagged(&fzv, |tag, x, y, z| vel_dir(tag, x, y, z).2, |_, _, _, _| 0.0);
         let solve_vel = |b: &[f64], neu: &[u32]| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
-            Ok(if let Some(h) = self.poisson {
+            Ok(if nc {
+                helmholtz3d_nc_cg_solve_tags(mesh, b, self.alpha, lambda, neu, self.tol, self.maxit)?.0
+            } else if let Some(h) = self.poisson {
                 h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
             } else {
                 helmholtz3d_cg_solve_tags(mesh, b, self.alpha, lambda, neu, self.tol, self.maxit)?.0

@@ -15,6 +15,7 @@ use cuda_host::cuda_module;
 use gale::dg::{Face, Mesh3d, Neighbor3, RefineQuad};
 
 const NN_MAX: usize = 125; // (order 4 + 1)³ — raise for higher p (watch static shared budget)
+const RED: usize = 256; // reduction block size for the CG dot product
 
 const K_CONF: u32 = 0; // conforming Interior / Dirichlet(BND) / Neumann(NEU)
 const K_FINE_TO_COARSE: u32 = 1; // this hex is FINE; one coarse neighbour (coarse trace)
@@ -296,6 +297,57 @@ mod kernels {
             *o = acc + rfm + lambda * jw[b] * u[b];
         }
     }
+
+    /// y ← y + a·x  (CG vector op; `_3dnc` suffix for crate-wide kernel-name uniqueness)
+    #[kernel]
+    pub fn axpy_3dnc(mut y: DisjointSlice<f64>, x: &[f64], a: f64) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = y.get_mut(idx) {
+            *o += a * x[i];
+        }
+    }
+
+    /// y ← x + b·y
+    #[kernel]
+    pub fn xpby_3dnc(mut y: DisjointSlice<f64>, x: &[f64], b: f64) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = y.get_mut(idx) {
+            *o = x[i] + b * *o;
+        }
+    }
+
+    /// Multi-block grid-stride dot product (one partial per block; host sums them).
+    #[kernel]
+    pub fn dot_3dnc_partial(a: &[f64], b: &[f64], n: u64, mut partial: DisjointSlice<f64>) {
+        static mut SH: SharedArray<f64, RED> = SharedArray::UNINIT;
+        let tid = thread::threadIdx_x() as usize;
+        let gstride = (thread::gridDim_x() * thread::blockDim_x()) as usize;
+        let mut acc = 0.0f64;
+        let mut i = (thread::blockIdx_x() * thread::blockDim_x()) as usize + tid;
+        while i < n as usize {
+            acc += a[i] * b[i];
+            i += gstride;
+        }
+        unsafe { SH[tid] = acc; }
+        thread::sync_threads();
+        let mut s = thread::blockDim_x() as usize / 2;
+        while s > 0 {
+            if tid < s {
+                unsafe { SH[tid] = SH[tid] + SH[tid + s]; }
+            }
+            thread::sync_threads();
+            s /= 2;
+        }
+        if tid == 0 {
+            unsafe { *partial.get_unchecked_mut(thread::blockIdx_x() as usize) = SH[0]; }
+        }
+    }
+}
+
+fn dot_blocks(ndof: usize) -> usize {
+    ndof.div_ceil(RED).clamp(1, 1024)
 }
 
 /// Hex-face trace nodes in (a,b) tensor order — sorted by the two tangential coords (b major, a
@@ -563,4 +615,150 @@ pub fn poisson3d_nc_apply(
         &self_sw, &coarse_sorted, &finef_sorted, &finef_sw, &p0, &p1, reaction, &mut out,
     )?;
     Ok(out.to_host_vec(&stream)?)
+}
+
+/// Device-resident conjugate gradient for `(reaction·M + A)·x = b` on a 3D **2:1 non-conforming**
+/// hex mesh, using the NC operator (`gradient_3dnc` → `operator_3dnc`) with the mortar coupling.
+/// `deflate` removes the constant nullspace each iteration (singular pure-Neumann pressure). The
+/// mesh is uploaded once; only CG vectors move per iteration (dot scalars read back per the
+/// multi-block reduction). Mirrors `cg3d_impl` (conforming) and the 2D `poisson_nc` CG path.
+#[allow(clippy::too_many_arguments)]
+fn cg3d_nc_impl(
+    mesh: &Mesh3d,
+    b: &[f64],
+    alpha: f64,
+    reaction: f64,
+    neumann_tags: &[u32],
+    deflate: bool,
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    let ma = flatten3d_nc(mesh, alpha, reaction, neumann_tags);
+    let ndof = ma.ndof;
+    assert_eq!(b.len(), ndof, "rhs length must be n_elements·n_nodes");
+    let ctx = CudaContext::new(0)?;
+    let stream = ctx.default_stream();
+    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
+    let upu = |v: &[u32]| DeviceBuffer::from_host(&stream, v);
+
+    // Constant NC mesh arrays (uploaded once).
+    let d_dev = up(&ma.diff)?;
+    let met_dev = up(&ma.met)?;
+    let jw_dev = up(&ma.jw)?;
+    let face_vl = upu(&ma.face_vl)?;
+    let face_nx = up(&ma.face_nx)?;
+    let face_ny = up(&ma.face_ny)?;
+    let face_nz = up(&ma.face_nz)?;
+    let face_sw = up(&ma.face_sw)?;
+    let face_nbr = upu(&ma.face_nbr)?;
+    let fkind = upu(&ma.fkind)?;
+    let enx = up(&ma.enx)?;
+    let eny = up(&ma.eny)?;
+    let enz = up(&ma.enz)?;
+    let etau = up(&ma.etau)?;
+    let quad0 = upu(&ma.quad0)?;
+    let self_sorted = upu(&ma.self_sorted)?;
+    let self_sw = up(&ma.self_sw)?;
+    let coarse_sorted = upu(&ma.coarse_sorted)?;
+    let finef_sorted = upu(&ma.finef_sorted)?;
+    let finef_sw = up(&ma.finef_sw)?;
+    let p0 = up(&ma.p0)?;
+    let p1 = up(&ma.p1)?;
+
+    // CG vectors.
+    let mut x = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut r = up(b)?;
+    let mut p = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut ap = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let mut gz = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    let nb = dot_blocks(ndof);
+    let mut partial = DeviceBuffer::<f64>::zeroed(&stream, nb)?;
+    let ones = up(&vec![1.0f64; ndof])?;
+
+    let module = kernels::load(&ctx)?;
+    let nev = ma.ne as u32;
+    let nnu = ma.nn as u32;
+    let gcfg = LaunchConfig { grid_dim: (nev, 1, 1), block_dim: (nnu, 1, 1), shared_mem_bytes: 0 };
+    let ocfg = LaunchConfig { grid_dim: (nev, 1, 1), block_dim: (nnu, 1, 1), shared_mem_bytes: 0 };
+    let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+    let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
+    let n64 = ndof as u64;
+    let ninv = 1.0 / ndof as f64;
+
+    macro_rules! dot {
+        ($a:expr, $b:expr) => {{
+            module.dot_3dnc_partial(&stream, red, $a, $b, n64, &mut partial)?;
+            partial.to_host_vec(&stream)?.iter().sum::<f64>()
+        }};
+    }
+    macro_rules! deflate {
+        ($v:expr) => {{
+            if deflate {
+                let mean = dot!($v, &ones) * ninv;
+                module.axpy_3dnc(&stream, vec_cfg, $v, &ones, -mean)?;
+            }
+        }};
+    }
+    macro_rules! apply {
+        ($field:expr, $dst:expr) => {{
+            module.gradient_3dnc(&stream, gcfg, &d_dev, $field, &met_dev, ma.n1, &mut gx, &mut gy, &mut gz)?;
+            module.operator_3dnc(
+                &stream, ocfg, &d_dev, $field, &gx, &gy, &gz, &met_dev, &jw_dev, ma.n1, &face_vl,
+                &face_nx, &face_ny, &face_nz, &face_sw, &face_nbr, &fkind, &enx, &eny, &enz, &etau,
+                &quad0, &self_sorted, &self_sw, &coarse_sorted, &finef_sorted, &finef_sw, &p0, &p1,
+                reaction, $dst,
+            )?;
+        }};
+    }
+
+    deflate!(&mut r);
+    module.xpby_3dnc(&stream, vec_cfg, &mut p, &r, 0.0)?; // p = r
+    let bn = dot!(&r, &r).sqrt().max(1e-300);
+    let mut rs = dot!(&r, &r);
+    let mut iters = 0;
+    for it in 0..maxit {
+        apply!(&p, &mut ap);
+        let pap = dot!(&p, &ap);
+        let alpha_cg = rs / pap;
+        module.axpy_3dnc(&stream, vec_cfg, &mut x, &p, alpha_cg)?;
+        module.axpy_3dnc(&stream, vec_cfg, &mut r, &ap, -alpha_cg)?;
+        deflate!(&mut r);
+        let rs_new = dot!(&r, &r);
+        iters = it + 1;
+        if rs_new.sqrt() / bn < tol {
+            break;
+        }
+        let beta = rs_new / rs;
+        module.xpby_3dnc(&stream, vec_cfg, &mut p, &r, beta)?;
+        rs = rs_new;
+    }
+    Ok((x.to_host_vec(&stream)?, iters))
+}
+
+/// Tag-aware 3D NC CG for `(reaction·M + A)·x = b` (Dirichlet except `neumann_tags`; non-deflated) —
+/// the velocity-Helmholtz / outflow-pinned-pressure path on a non-conforming hex mesh.
+pub fn helmholtz3d_nc_cg_solve_tags(
+    mesh: &Mesh3d,
+    b: &[f64],
+    alpha: f64,
+    reaction: f64,
+    neumann_tags: &[u32],
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg3d_nc_impl(mesh, b, alpha, reaction, neumann_tags, false, tol, maxit)
+}
+
+/// Deflated 3D NC CG for the singular pure-Neumann pressure-Poisson `A·x = b` on a non-conforming
+/// hex mesh (constant nullspace removed each iteration).
+pub fn pressure3d_nc_cg_solve(
+    mesh: &Mesh3d,
+    b: &[f64],
+    alpha: f64,
+    tol: f64,
+    maxit: usize,
+) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+    cg3d_nc_impl(mesh, b, alpha, 0.0, &mesh.boundary_tags(), true, tol, maxit)
 }
