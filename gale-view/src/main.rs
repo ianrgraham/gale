@@ -294,10 +294,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 fn vs_line(@location(0) pos: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(pos, 0.0, 1.0); }
 @fragment
 fn fs_outline() -> @location(0) vec4<f32> { return vec4<f32>(0.1, 0.1, 0.1, 1.0); }
+@fragment
+fn fs_grid() -> @location(0) vec4<f32> { return vec4<f32>(0.85, 0.85, 0.85, 1.0); }
 "#;
 
-/// Returns (field pipeline, body-outline pipeline, field bind-group layout for the Circles uniform).
-fn make_pipelines(device: &wgpu::Device, format: wgpu::TextureFormat) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+/// Returns (field pipeline, body-outline pipeline, mesh-grid pipeline, field bind-group layout).
+/// The grid pipeline is identical to the outline one but draws a light grey (visible on both the
+/// dark background and the coloured field, unlike the dark body outline).
+fn make_pipelines(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroupLayout) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)) });
     let target = wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL };
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -319,14 +326,27 @@ fn make_pipelines(device: &wgpu::Device, format: wgpu::TextureFormat) -> (wgpu::
         primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
     });
     let line_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[], push_constant_ranges: &[] });
-    let outline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("body-outline"), layout: Some(&line_layout),
-        vertex: wgpu::VertexState { module: &shader, entry_point: "vs_line", buffers: &[wgpu::VertexBufferLayout { array_stride: 8, step_mode: wgpu::VertexStepMode::Vertex, attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }] }], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_outline", targets: &[Some(target)], compilation_options: Default::default() }),
-        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
-        depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
-    });
-    (field, outline, bgl)
+    let line_vbuf = wgpu::VertexBufferLayout {
+        array_stride: 8,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }],
+    };
+    let line_pipeline = |label: &str, fs: &str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&line_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: "vs_line", buffers: std::slice::from_ref(&line_vbuf), compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: fs, targets: &[Some(target.clone())], compilation_options: Default::default() }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
+    };
+    let outline = line_pipeline("body-outline", "fs_outline");
+    let grid = line_pipeline("mesh-grid", "fs_grid");
+    (field, outline, grid, bgl)
 }
 
 fn fit_viewport(win_w: f32, win_h: f32, dx: f32, dy: f32) -> (f32, f32, f32, f32) {
@@ -348,11 +368,12 @@ fn circles_bind_group(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, poses:
 // ---- offscreen (PNG) ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn render_png(device: &wgpu::Device, queue: &wgpu::Queue, field_pl: &wgpu::RenderPipeline, outline_pl: &wgpu::RenderPipeline, bind_group: &wgpu::BindGroup, verts: &[Vertex], indices: &[u32], lines: &[LineVertex], w: u32, h: u32, out: &str) {
+fn render_png(device: &wgpu::Device, queue: &wgpu::Queue, field_pl: &wgpu::RenderPipeline, outline_pl: &wgpu::RenderPipeline, grid_pl: &wgpu::RenderPipeline, bind_group: &wgpu::BindGroup, verts: &[Vertex], indices: &[u32], lines: &[LineVertex], grid: &[LineVertex], w: u32, h: u32, out: &str) {
     use wgpu::util::DeviceExt;
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(indices), usage: wgpu::BufferUsages::INDEX });
     let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(lines), usage: wgpu::BufferUsages::VERTEX }));
+    let gbuf = (!grid.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(grid), usage: wgpu::BufferUsages::VERTEX }));
     let tex = device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
     let view = tex.create_view(&Default::default());
     let unpadded = w * 4;
@@ -366,6 +387,7 @@ fn render_png(device: &wgpu::Device, queue: &wgpu::Queue, field_pl: &wgpu::Rende
         rp.set_vertex_buffer(0, vbuf.slice(..));
         rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
         rp.draw_indexed(0..indices.len() as u32, 0, 0..1);
+        if let Some(gbuf) = &gbuf { rp.set_pipeline(grid_pl); rp.set_vertex_buffer(0, gbuf.slice(..)); rp.draw(0..grid.len() as u32, 0..1); }
         if let Some(lbuf) = &lbuf { rp.set_pipeline(outline_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..lines.len() as u32, 0..1); }
     }
     enc.copy_texture_to_buffer(wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, wgpu::ImageCopyBuffer { buffer: &readback, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } }, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
@@ -404,7 +426,7 @@ fn run_offscreen(args: &Args) {
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: None, force_fallback_adapter: false })).expect("no wgpu adapter");
     println!("renderer: {} [{:?}]", adapter.get_info().name, adapter.get_info().backend);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: adapter.limits(), memory_hints: Default::default() }, None)).unwrap();
-    let (field_pl, outline_pl, bgl) = make_pipelines(&device, wgpu::TextureFormat::Rgba8Unorm);
+    let (field_pl, outline_pl, grid_pl, bgl) = make_pipelines(&device, wgpu::TextureFormat::Rgba8Unorm);
 
     let to_render: Vec<usize> = if args.all { (0..nfr).collect() } else { vec![args.frame.unwrap_or(nfr - 1)] };
     let render_frames: Vec<(usize, String)> = to_render.iter().map(|&i| frames[i].clone()).collect();
@@ -417,14 +439,12 @@ fn run_offscreen(args: &Args) {
         let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, &args.field);
         let t = tessellate(&nodes, &fld, ne, nn, nc, &args.comp, args.height);
         let has_bodies = !poses.is_empty() && !radii.is_empty();
-        let mut lines = if has_bodies { body_lines(&poses, &radii, t.bounds) } else { Vec::new() };
-        if args.grid {
-            lines.extend(grid_lines(&t.pos_ndc, ne, nn));
-        }
+        let lines = if has_bodies { body_lines(&poses, &radii, t.bounds) } else { Vec::new() };
+        let grid = if args.grid { grid_lines(&t.pos_ndc, ne, nn) } else { Vec::new() };
         let bg = circles_bind_group(&device, &bgl, &poses, &radii);
         let verts = vertices(&t, vmin, vmax);
         let out = if args.all { format!("{prefix}_{:06}.png", i) } else { format!("{prefix}_wgpu.png") };
-        render_png(&device, &queue, &field_pl, &outline_pl, &bg, &verts, &t.indices, &lines, t.width, t.height, &out);
+        render_png(&device, &queue, &field_pl, &outline_pl, &grid_pl, &bg, &verts, &t.indices, &lines, &grid, t.width, t.height, &out);
         println!("wrote {out}  ({}×{})", t.width, t.height);
     }
 }
@@ -438,6 +458,8 @@ struct FrameBuffers {
     bind_group: wgpu::BindGroup,
     lbuf: Option<wgpu::Buffer>,
     nline: u32,
+    gbuf: Option<wgpu::Buffer>,
+    ngrid: u32,
     bounds: [f32; 4],
 }
 
@@ -456,13 +478,12 @@ fn build_frame(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, handles: &[hd
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&t.indices), usage: wgpu::BufferUsages::INDEX });
     let has_bodies = !poses.is_empty() && !radii.is_empty();
-    let mut lines = if has_bodies { body_lines(&poses, radii, t.bounds) } else { Vec::new() };
-    if grid {
-        lines.extend(grid_lines(&t.pos_ndc, ne, nn));
-    }
+    let lines = if has_bodies { body_lines(&poses, radii, t.bounds) } else { Vec::new() };
+    let gridv = if grid { grid_lines(&t.pos_ndc, ne, nn) } else { Vec::new() };
     let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&lines), usage: wgpu::BufferUsages::VERTEX }));
+    let gbuf = (!gridv.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&gridv), usage: wgpu::BufferUsages::VERTEX }));
     let bind_group = circles_bind_group(device, bgl, &poses, radii);
-    FrameBuffers { vbuf, ibuf, nidx: t.indices.len() as u32, bind_group, lbuf, nline: lines.len() as u32, bounds: t.bounds }
+    FrameBuffers { vbuf, ibuf, nidx: t.indices.len() as u32, bind_group, lbuf, nline: lines.len() as u32, gbuf, ngrid: gridv.len() as u32, bounds: t.bounds }
 }
 
 fn consume_files(paths: &[String], handles: &mut Vec<hdf5::File>, frames: &mut Vec<(usize, String)>, consumed: &mut usize, radii: &mut Vec<f64>) -> bool {
@@ -524,7 +545,7 @@ fn run_window(args: Args) {
     let size = window.inner_size();
     let mut config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: size.width.clamp(1, max_dim), height: size.height.clamp(1, max_dim), present_mode: wgpu::PresentMode::Fifo, desired_maximum_frame_latency: 2, alpha_mode: caps.alpha_modes[0], view_formats: vec![] };
     surface.configure(&device, &config);
-    let (field_pl, outline_pl, bgl) = make_pipelines(&device, format);
+    let (field_pl, outline_pl, grid_pl, bgl) = make_pipelines(&device, format);
 
     let (mut vmin, mut vmax) = (f32::MAX, f32::MIN);
     let follow = watch;
@@ -574,6 +595,7 @@ fn run_window(args: Args) {
                         rp.set_vertex_buffer(0, fb.vbuf.slice(..));
                         rp.set_index_buffer(fb.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                         rp.draw_indexed(0..fb.nidx, 0, 0..1);
+                        if let Some(gbuf) = &fb.gbuf { rp.set_pipeline(&grid_pl); rp.set_vertex_buffer(0, gbuf.slice(..)); rp.draw(0..fb.ngrid, 0..1); }
                         if let Some(lbuf) = &fb.lbuf { rp.set_pipeline(&outline_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..fb.nline, 0..1); }
                     }
                 }
