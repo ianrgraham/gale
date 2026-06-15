@@ -1,6 +1,25 @@
 # AMR-with-GPU-flow: GPU non-conforming SIPG operator — implementation plan
 
-**Status:** in progress (scoping + design complete 2026-06-04). The GPU SIPG operators
+**Status:** ✅ **DONE for 2D** (increments 1–3 + wiring, all validated). Implemented in a
+SEPARATE `GpuPoissonNc` path (`gale-gpu/src/operators/poisson_nc.rs`: `gradient_nc` →
+`operator_nc`, mortar `P`/`Pᵀ`), NOT by extending the affine `GpuPoissonMg` operator (which
+intentionally stays uniform-only — it `unreachable!()`s on NC faces by design). The 2D flow
+integrators dispatch to `GpuPoissonNc` automatically when `mesh_is_nonconforming` (see
+`flow.rs`). Commits: 34387e5 (#1 operator), 25f6597 (#2 CG/Helmholtz/deflated-pressure),
+79f1833 (#3 GpuStokes on 2:1 meshes), 6b3eadb (per-region BCs), 10a7231 (persistent handle),
+5e66bd2 (wired through 2D flow), c88d262 (AMR/IBM audit). Check bins: `poisson-nc-check`,
+`poisson-nc-handle-check`, `stokes-nc-check`, `flow-nc-bc-check` (all PASS — operator vs CPU
+~7e-15, symmetry ~4e-16).
+
+**Remaining:** (4) **3D non-conforming** — `poisson3d.rs` has no NC/mortar handling yet
+(needs `Mesh3d` octree NC + hex mortar `P`/`Pᵀ`). (5) **Dynamic GPU adapt loop** — the NC
+path is static-mesh; nothing refines/coarsens DURING a GPU run. The CPU has `AmrUpdater` +
+remap (df4d035); wiring an indicator-driven refine/coarsen into a GPU flow integrator
+(rebuilding the `GpuPoissonNc` handle per remesh) is the end-to-end AMR-with-GPU-flow capstone.
+
+---
+
+_Original plan (2026-06-04), kept for reference:_ The GPU SIPG operators
 currently `unreachable!()` on `Neighbor::{CoarseToFine, FineToCoarse}` — i.e. GPU flow
 runs only on uniform conforming meshes. The CPU stack already solves on 2:1
 non-conforming (mortar) meshes (`Poisson`/`Stokes`, validated; see

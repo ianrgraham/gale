@@ -67,6 +67,10 @@ required-features = ["traj"]
 # checks it against gale's CPU oracle (exercises the dependency-rlib link path).
 # Run: cargo oxide run --bin advection-check
 [[bin]]
+name = "gpu-amr-flow-check"
+path = "src/bin/gpu_amr_flow_check.rs"
+
+[[bin]]
 name = "advection-check"
 path = "src/bin/advection_check.rs"
 
