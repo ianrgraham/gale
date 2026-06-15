@@ -158,6 +158,35 @@ pub fn smoothness_per_cell(
     out
 }
 
+/// For each **currently-refined** base cell, the MAXIMUM [`SmoothnessIndicator`] over its 4
+/// children — the child-based criterion for COARSENING (de-refinement). Unlike
+/// [`smoothness_per_cell`], which restricts a refined cell to its base and indicates (low-passing
+/// the field, which makes coarsen/refine oscillate), this judges the fine children directly: a cell
+/// is safe to coarsen when even its best-resolved child is well below threshold. Returns
+/// `(cx, cy) → max child indicator` for refined cells only (unrefined cells are absent).
+pub fn child_smoothness_max(
+    order: usize,
+    nx: usize,
+    ny: usize,
+    refined: &[(usize, usize)],
+    indic_comp: &[f64],
+) -> HashMap<(usize, usize), f64> {
+    let si = SmoothnessIndicator::new(order);
+    let nn = (order + 1) * (order + 1);
+    let set: HashSet<(usize, usize)> = refined.iter().copied().collect();
+    let map = cell_element_map(nx, ny, &set);
+    let mut out = HashMap::new();
+    for &(cx, cy) in refined {
+        let elems = &map[&(cx, cy)];
+        let mut mx = 0.0f64;
+        for &e in elems {
+            mx = mx.max(si.indicator(&indic_comp[e * nn..(e + 1) * nn]));
+        }
+        out.insert((cx, cy), mx);
+    }
+    out
+}
+
 /// One round of indicator-driven `h`-adaptation of a *scalar* field on a Cartesian
 /// base mesh: flag every cell whose [`SmoothnessIndicator`] exceeds `threshold`,
 /// build the refined [`Mesh2d`] ([`Mesh2d::cartesian_refined`]), and transfer the

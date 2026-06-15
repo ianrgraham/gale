@@ -8,18 +8,18 @@
 //! which handles multi-component flat fields and level-aware (restrict-then-judge)
 //! indication.
 //!
-//! Scope: single-level 2:1 `h`-refinement over a Cartesian base grid — the
-//! refinement the mesh (`Neighbor::CoarseToFine`/`FineToCoarse`) supports — and
-//! **refine-only** (monotone): cells flagged by the indicator are refined and
-//! stay refined. De-refinement (coarsening) is deferred: judging an already-
-//! refined cell by restricting it to the base and re-indicating low-passes the
-//! field and oscillates, so robust coarsening needs a child-based criterion. The
-//! updater stores the base-grid parameters (the mesh does not carry them) and the
-//! current refined set, so successive fires accumulate refinement incrementally.
+//! Scope: single-level 2:1 `h`-refinement over a Cartesian base grid — the refinement the mesh
+//! (`Neighbor::CoarseToFine`/`FineToCoarse`) supports. Refinement is indicator-driven; de-refinement
+//! (coarsening) is opt-in via [`AmrUpdater::with_coarsening`] and uses a **child-based** criterion
+//! (a refined cell coarsens when the max indicator over its children falls below the coarsen
+//! threshold) — judging the children directly rather than restricting the parent and re-indicating
+//! (which low-passes the field and oscillates), with the refine/coarsen threshold gap providing
+//! hysteresis. The updater stores the base-grid parameters (the mesh does not carry them) and the
+//! current refined set, so successive fires adapt the mesh incrementally in both directions.
 
 use super::simulation::Updater;
 use super::state::State;
-use crate::dg::amr::{remap_component_flat, smoothness_per_cell};
+use crate::dg::amr::{child_smoothness_max, remap_component_flat, smoothness_per_cell};
 use crate::dg::mesh::Mesh2d;
 
 /// Indicator-driven `h`-AMR updater over a Cartesian base grid.
@@ -35,6 +35,11 @@ pub struct AmrUpdater {
     indicator_comp: usize,
     /// Refine a base cell when its indicator exceeds this.
     threshold: f64,
+    /// Coarsen a refined cell when the MAX indicator over its children falls below this
+    /// (`None` ⇒ refine-only). For stable hysteresis use a value well below `threshold` so a
+    /// just-refined cell doesn't immediately coarsen; the child-based criterion (vs restricting
+    /// the parent) is what prevents oscillation.
+    coarsen_threshold: Option<f64>,
     /// Current set of refined base cells (starts empty: the base grid).
     refined: Vec<(usize, usize)>,
 }
@@ -61,6 +66,7 @@ impl AmrUpdater {
             indicator_field: indicator_field.into(),
             indicator_comp: 0,
             threshold,
+            coarsen_threshold: None,
             refined: Vec::new(),
         }
     }
@@ -68,6 +74,22 @@ impl AmrUpdater {
     /// Use a specific component of the indicator field.
     pub fn indicator_component(mut self, comp: usize) -> Self {
         self.indicator_comp = comp;
+        self
+    }
+
+    /// Enable de-refinement: a refined cell whose MAX child indicator drops below
+    /// `coarsen_threshold` is merged back (restrict 4 children → parent). Pick it well below the
+    /// refine `threshold` (hysteresis) so cells don't thrash refine↔coarsen. Refine-only by default.
+    pub fn with_coarsening(mut self, coarsen_threshold: f64) -> Self {
+        self.coarsen_threshold = Some(coarsen_threshold);
+        self
+    }
+
+    /// Seed the current refined set — use when the `State` starts on an ALREADY-refined mesh
+    /// (`Mesh2d::cartesian_refined(.., set)`) rather than the base grid, so the updater's bookkeeping
+    /// matches the actual mesh (otherwise it would misread the field layout and never coarsen).
+    pub fn with_initial_refined(mut self, refined: Vec<(usize, usize)>) -> Self {
+        self.refined = refined;
         self
     }
 
@@ -82,26 +104,43 @@ impl Updater for AmrUpdater {
         let old_set = self.refined.clone();
         let old_h: std::collections::HashSet<(usize, usize)> = old_set.iter().copied().collect();
 
-        // Indicator per base cell on the current mesh. Refine-only (monotone): a
-        // cell flagged once stays refined; already-refined cells are kept without
-        // re-judging. De-refinement (coarsening) needs a child-based criterion —
-        // "restrict-then-indicate" low-passes the field and oscillates — and is
-        // deferred. Monotonicity makes re-adaptation idempotent.
+        // REFINE: an unrefined base cell whose indicator exceeds `threshold`. (`smoothness_per_cell`
+        // is level-aware — it restricts a refined cell to base before indicating — but here we only
+        // act on its UNREFINED entries; refined cells are judged for coarsening separately below.)
+        let comp = self.indicator_comp;
         let cell_ind = {
             let f = state.field(&self.indicator_field);
-            smoothness_per_cell(self.order, self.nx, self.ny, &old_set, f.component(self.indicator_comp))
+            smoothness_per_cell(self.order, self.nx, self.ny, &old_set, f.component(comp))
         };
-        let mut new_set = old_set.clone();
+        let mut new_h = old_h.clone();
         for cy in 0..self.ny {
             for cx in 0..self.nx {
                 if !old_h.contains(&(cx, cy)) && cell_ind[cx + cy * self.nx] > self.threshold {
-                    new_set.push((cx, cy));
+                    new_h.insert((cx, cy));
+                }
+            }
+        }
+        // COARSEN (optional): a refined cell whose MAX child indicator falls below the coarsen
+        // threshold is merged back. Judging the children directly (not the restricted parent) is
+        // what keeps refine↔coarsen from oscillating; the threshold gap adds hysteresis.
+        if let Some(ct) = self.coarsen_threshold {
+            let child_max = {
+                let f = state.field(&self.indicator_field);
+                child_smoothness_max(self.order, self.nx, self.ny, &old_set, f.component(comp))
+            };
+            for (cell, mx) in child_max {
+                if mx < ct {
+                    new_h.remove(&cell);
                 }
             }
         }
 
-        // No new cells ⇒ nothing to remap.
-        if new_set.len() == old_set.len() {
+        // Compare as SETS (coarsen + refine can leave the count unchanged while the pattern moves).
+        let mut new_set: Vec<(usize, usize)> = new_h.iter().copied().collect();
+        new_set.sort_unstable();
+        let mut old_sorted = old_set.clone();
+        old_sorted.sort_unstable();
+        if new_set == old_sorted {
             return;
         }
 
@@ -218,6 +257,42 @@ mod tests {
         amr.update(&mut st, 1);
         assert_eq!(st.mesh.n_elements(), after_first, "second adaptation changed the mesh");
         assert_eq!(amr.refined_cells(), set_first.as_slice());
+    }
+
+    /// With coarsening enabled, a refined mesh de-refines once the field becomes smooth: refine on
+    /// a wiggly field, then overwrite with a (linear) smooth field ⇒ the next fire coarsens it back.
+    #[test]
+    fn coarsening_de_refines_when_smooth() {
+        let (order, nx, ny) = (4, 4, 4);
+        let xr = [0.0, 1.0];
+        let yr = [0.0, 1.0];
+        let mut st = State::new(Mesh2d::rectangular(order, nx, ny, xr, yr));
+        st.add_field_from("u", &[|x: f64, y: f64| (20.0 * PI * x).sin() * (20.0 * PI * y).sin()]);
+
+        let mut amr = AmrUpdater::new(order, nx, ny, xr, yr, "u", 1e-2).with_coarsening(1e-6);
+        amr.update(&mut st, 0);
+        let refined = amr.refined_cells().len();
+        assert!(refined > 0, "wiggly field should have refined some cells");
+
+        // Overwrite with a smooth (linear) field on the current refined mesh ⇒ near-zero indicator.
+        let nn = st.mesh.refq.n_nodes();
+        let mut smooth = vec![0.0; st.mesh.n_elements() * nn];
+        for (e, el) in st.mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                smooth[e * nn + k] = el.geom.x[k] + 2.0 * el.geom.y[k];
+            }
+        }
+        st.field_mut("u").replace_components(vec![smooth]);
+
+        amr.update(&mut st, 1);
+        assert!(
+            amr.refined_cells().is_empty(),
+            "smooth field should have coarsened everything back, {} cells left",
+            amr.refined_cells().len()
+        );
+        // The mesh and field are consistent after coarsening (ndof matches the base grid).
+        assert_eq!(st.mesh.n_elements(), nx * ny);
+        assert_eq!(st.field("u").component(0).len(), nx * ny * nn);
     }
 
     /// The updater works as a triggered operation inside a Simulation (no
