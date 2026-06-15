@@ -22,9 +22,9 @@ fn env_f64(k: &str, d: f64) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p = 3;
     let (h, um, nu) = (0.41, 0.3, 0.001);
-    let ny = env_usize("SBM_NY", 16);
+    let ny = env_usize("SBM_NY", 24); // finer than the validation default (16) for a smoother cylinder
     let nx = ((2.2 / h) * ny as f64).round() as usize;
-    let dt = env_f64("SBM_DT", 3e-3);
+    let dt = env_f64("SBM_DT", 2.5e-3);
     let steps = env_usize("TRAJ_STEPS", 800);
     let every = env_usize("TRAJ_EVERY", 10);
     let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/cylinder.h5".to_string());
@@ -90,25 +90,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => TrajectoryWriter::create(&out, p, 2)?,
     };
     let topo = tw.write_mesh2d(&mesh)?;
-    // Pack (ux,uy) → [ne,nn,2] f32, NaN on inactive (inside-cylinder) elements so they render blank.
+    // The cylinder is a fixed embedded boundary — record it as a body so the viewer draws a smooth
+    // filled disk over it (rather than the blocky element-staircase a masked hole would give).
+    tw.write_body_radii(&[r])?;
+    let pose = [[cx, cy, 0.0]];
+    // Pack (ux,uy) → [ne,nn,2] f32. Mask NODES inside the true cylinder (not whole elements) with
+    // NaN: the viewer drops sub-quads touching them, so the hole follows the circle at NODE
+    // resolution (dense at p=3) instead of the blocky element staircase. The smooth body disk drawn
+    // on top sits exactly on this near-circular hole.
     let pack = |hux: &[f64], huy: &[f64]| -> Vec<f32> {
         let mut v = vec![0f32; ndof * 2];
-        for e in 0..ne {
-            let active = sb.active[e];
+        for (e, el) in mesh.elements.iter().enumerate() {
             for k in 0..nn {
                 let g = e * nn + k;
-                if active {
-                    v[g * 2] = hux[g] as f32;
-                    v[g * 2 + 1] = huy[g] as f32;
-                } else {
+                let (px, py) = (el.geom.x[k] - cx, el.geom.y[k] - cy);
+                if px * px + py * py < r * r {
                     v[g * 2] = f32::NAN;
                     v[g * 2 + 1] = f32::NAN;
+                } else {
+                    v[g * 2] = hux[g] as f32;
+                    v[g * 2 + 1] = huy[g] as f32;
                 }
             }
         }
         v
     };
-    tw.write_frame(0.0, 0, topo, ne, nn, &[("u", pack(&hv.download_field(&ux)?, &hv.download_field(&uy)?), 2)], None)?;
+    tw.write_frame(0.0, 0, topo, ne, nn, &[("u", pack(&hv.download_field(&ux)?, &hv.download_field(&uy)?), 2)], Some(&pose))?;
 
     for step in 1..=steps {
         hv.gradient_dev(&ux, &mut ga, &mut gb)?;
@@ -139,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if step % every == 0 {
             let (hux, huy) = (hv.download_field(&ux)?, hv.download_field(&uy)?);
-            tw.write_frame(step as f64 * dt, step as u64, topo, ne, nn, &[("u", pack(&hux, &huy), 2)], None)?;
+            tw.write_frame(step as f64 * dt, step as u64, topo, ne, nn, &[("u", pack(&hux, &huy), 2)], Some(&pose))?;
         }
     }
     println!("wrote {} frames → {out}", tw.n_frames());

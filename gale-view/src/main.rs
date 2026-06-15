@@ -170,6 +170,29 @@ fn body_lines(poses: &[f64], radii: &[f64], bounds: [f32; 4]) -> Vec<LineVertex>
     v
 }
 
+/// Filled-disk triangles (TriangleList, NDC) for each body — a fan of (center, rim_s, rim_{s+1}).
+/// Drawn under the outline; covers the (meaningless) interior with a smooth round edge, replacing
+/// the element-staircase hole of a masked embedded boundary.
+fn body_fill(poses: &[f64], radii: &[f64], bounds: [f32; 4]) -> Vec<LineVertex> {
+    let [x0, y0, dx, dy] = bounds;
+    let to_ndc = |x: f64, y: f64| LineVertex { pos: [((x as f32 - x0) / dx) * 2.0 - 1.0, ((y as f32 - y0) / dy) * 2.0 - 1.0] };
+    let nb = poses.len() / 3;
+    const SEG: usize = 64;
+    let mut v = Vec::new();
+    for i in 0..nb {
+        let (cx, cy) = (poses[i * 3], poses[i * 3 + 1]);
+        let r = radii.get(i).copied().unwrap_or(*radii.first().unwrap_or(&0.0));
+        let c = to_ndc(cx, cy);
+        for s in 0..SEG {
+            let (t0, t1) = (std::f64::consts::TAU * s as f64 / SEG as f64, std::f64::consts::TAU * (s + 1) as f64 / SEG as f64);
+            v.push(c);
+            v.push(to_ndc(cx + r * t0.cos(), cy + r * t0.sin()));
+            v.push(to_ndc(cx + r * t1.cos(), cy + r * t1.sin()));
+        }
+    }
+    v
+}
+
 // ---- HDF5 read ---------------------------------------------------------------------------------
 
 fn read_radii(h: &hdf5::File) -> Vec<f64> {
@@ -234,13 +257,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 @vertex
 fn vs_line(@location(0) pos: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(pos, 0.0, 1.0); }
 @fragment
-fn fs_line() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }
+fn fs_white() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }   // body fill
+@fragment
+fn fs_outline() -> @location(0) vec4<f32> { return vec4<f32>(0.1, 0.1, 0.1, 1.0); }  // body outline
 "#;
 
-fn make_pipelines(device: &wgpu::Device, format: wgpu::TextureFormat) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+/// (field triangles, body fill triangles, body outline lines) pipelines for `format`.
+fn make_pipelines(device: &wgpu::Device, format: wgpu::TextureFormat) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::RenderPipeline) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)) });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[], push_constant_ranges: &[] });
     let target = wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL };
+    let pos2 = [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }];
     let field = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("field"), layout: Some(&layout),
         vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", buffers: &[wgpu::VertexBufferLayout {
@@ -250,17 +277,15 @@ fn make_pipelines(device: &wgpu::Device, format: wgpu::TextureFormat) -> (wgpu::
         fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", targets: &[Some(target.clone())], compilation_options: Default::default() }),
         primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
     });
-    let line = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("line"), layout: Some(&layout),
-        vertex: wgpu::VertexState { module: &shader, entry_point: "vs_line", buffers: &[wgpu::VertexBufferLayout {
-            array_stride: 8, step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }],
-        }], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_line", targets: &[Some(target)], compilation_options: Default::default() }),
-        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
-        depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
+    let mk = |label, entry, topo| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label), layout: Some(&layout),
+        vertex: wgpu::VertexState { module: &shader, entry_point: "vs_line", buffers: &[wgpu::VertexBufferLayout { array_stride: 8, step_mode: wgpu::VertexStepMode::Vertex, attributes: &pos2 }], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: entry, targets: &[Some(target.clone())], compilation_options: Default::default() }),
+        primitive: wgpu::PrimitiveState { topology: topo, ..Default::default() }, depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
     });
-    (field, line)
+    let fill = mk("body-fill", "fs_white", wgpu::PrimitiveTopology::TriangleList);
+    let outline = mk("body-outline", "fs_outline", wgpu::PrimitiveTopology::LineList);
+    (field, fill, outline)
 }
 
 /// Letterbox viewport (x, y, w, h) fitting domain aspect `dx/dy` inside a `win_w × win_h` frame.
@@ -281,10 +306,12 @@ fn vertices(t: &Tess, vmin: f32, vmax: f32) -> Vec<Vertex> {
 
 // ---- offscreen (PNG) ---------------------------------------------------------------------------
 
-fn render_png(device: &wgpu::Device, queue: &wgpu::Queue, field_pl: &wgpu::RenderPipeline, line_pl: &wgpu::RenderPipeline, verts: &[Vertex], indices: &[u32], lines: &[LineVertex], w: u32, h: u32, out: &str) {
+#[allow(clippy::too_many_arguments)]
+fn render_png(device: &wgpu::Device, queue: &wgpu::Queue, field_pl: &wgpu::RenderPipeline, fill_pl: &wgpu::RenderPipeline, outline_pl: &wgpu::RenderPipeline, verts: &[Vertex], indices: &[u32], fill: &[LineVertex], lines: &[LineVertex], w: u32, h: u32, out: &str) {
     use wgpu::util::DeviceExt;
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(indices), usage: wgpu::BufferUsages::INDEX });
+    let fbuf = (!fill.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(fill), usage: wgpu::BufferUsages::VERTEX }));
     let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(lines), usage: wgpu::BufferUsages::VERTEX }));
     let tex = device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
     let view = tex.create_view(&Default::default());
@@ -298,7 +325,8 @@ fn render_png(device: &wgpu::Device, queue: &wgpu::Queue, field_pl: &wgpu::Rende
         rp.set_vertex_buffer(0, vbuf.slice(..));
         rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
         rp.draw_indexed(0..indices.len() as u32, 0, 0..1);
-        if let Some(lbuf) = &lbuf { rp.set_pipeline(line_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..lines.len() as u32, 0..1); }
+        if let Some(fbuf) = &fbuf { rp.set_pipeline(fill_pl); rp.set_vertex_buffer(0, fbuf.slice(..)); rp.draw(0..fill.len() as u32, 0..1); }
+        if let Some(lbuf) = &lbuf { rp.set_pipeline(outline_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..lines.len() as u32, 0..1); }
     }
     enc.copy_texture_to_buffer(wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, wgpu::ImageCopyBuffer { buffer: &readback, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } }, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
     queue.submit([enc.finish()]);
@@ -342,8 +370,10 @@ fn run_offscreen(args: &Args) {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN | wgpu::Backends::GL, ..Default::default() });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: None, force_fallback_adapter: false })).expect("no wgpu adapter");
     println!("renderer: {} [{:?}]", adapter.get_info().name, adapter.get_info().backend);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: Default::default() }, None)).unwrap();
-    let (field_pl, line_pl) = make_pipelines(&device, wgpu::TextureFormat::Rgba8Unorm);
+    // Use the adapter's real limits (downlevel_defaults caps max_texture_dimension_2d at 2048,
+    // which rejects larger renders/surfaces).
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: adapter.limits(), memory_hints: Default::default() }, None)).unwrap();
+    let (field_pl, fill_pl, outline_pl) = make_pipelines(&device, wgpu::TextureFormat::Rgba8Unorm);
 
     let to_render: Vec<usize> = if args.all { (0..nfr).collect() } else { vec![args.frame.unwrap_or(nfr - 1)] };
     let render_frames: Vec<(usize, String)> = to_render.iter().map(|&i| frames[i].clone()).collect();
@@ -353,10 +383,12 @@ fn run_offscreen(args: &Args) {
         let (hi, key) = &frames[i];
         let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, &args.field);
         let t = tessellate(&nodes, &fld, ne, nn, nc, &args.comp, args.height);
-        let lines = if poses.is_empty() || radii.is_empty() { Vec::new() } else { body_lines(&poses, &radii, t.bounds) };
+        let has_bodies = !poses.is_empty() && !radii.is_empty();
+        let lines = if has_bodies { body_lines(&poses, &radii, t.bounds) } else { Vec::new() };
+        let fill = if has_bodies { body_fill(&poses, &radii, t.bounds) } else { Vec::new() };
         let verts = vertices(&t, vmin, vmax);
         let out = if args.all { format!("{prefix}_{:06}.png", i) } else { format!("{prefix}_wgpu.png") };
-        render_png(&device, &queue, &field_pl, &line_pl, &verts, &t.indices, &lines, t.width, t.height, &out);
+        render_png(&device, &queue, &field_pl, &fill_pl, &outline_pl, &verts, &t.indices, &fill, &lines, t.width, t.height, &out);
         println!("wrote {out}  ({}×{})", t.width, t.height);
     }
 }
@@ -368,6 +400,8 @@ struct FrameBuffers {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
     nidx: u32,
+    fillbuf: Option<wgpu::Buffer>,
+    nfill: u32,
     lbuf: Option<wgpu::Buffer>,
     nline: u32,
     bounds: [f32; 4],
@@ -387,9 +421,12 @@ fn build_frame(device: &wgpu::Device, handles: &[hdf5::File], frames: &[(usize, 
     let verts = vertices(&t, *vmin, *vmax);
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&t.indices), usage: wgpu::BufferUsages::INDEX });
-    let lines = if poses.is_empty() || radii.is_empty() { Vec::new() } else { body_lines(&poses, radii, t.bounds) };
+    let has_bodies = !poses.is_empty() && !radii.is_empty();
+    let lines = if has_bodies { body_lines(&poses, radii, t.bounds) } else { Vec::new() };
+    let fill = if has_bodies { body_fill(&poses, radii, t.bounds) } else { Vec::new() };
     let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&lines), usage: wgpu::BufferUsages::VERTEX }));
-    FrameBuffers { vbuf, ibuf, nidx: t.indices.len() as u32, lbuf, nline: lines.len() as u32, bounds: t.bounds }
+    let fillbuf = (!fill.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&fill), usage: wgpu::BufferUsages::VERTEX }));
+    FrameBuffers { vbuf, ibuf, nidx: t.indices.len() as u32, fillbuf, nfill: fill.len() as u32, lbuf, nline: lines.len() as u32, bounds: t.bounds }
 }
 
 /// Append frames from any files in `paths` not yet consumed, in order, stopping at the first that
@@ -449,13 +486,17 @@ fn run_window(args: Args) {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN | wgpu::Backends::GL, ..Default::default() });
     let surface = instance.create_surface(window.clone()).unwrap();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), force_fallback_adapter: false })).expect("no wgpu adapter");
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: Default::default() }, None)).unwrap();
+    let limits = adapter.limits();
+    let max_dim = limits.max_texture_dimension_2d;
+    println!("renderer: {} [{:?}], max surface {max_dim}px", adapter.get_info().name, adapter.get_info().backend);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: limits, memory_hints: Default::default() }, None)).unwrap();
     let caps = surface.get_capabilities(&adapter);
     let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
     let size = window.inner_size();
-    let mut config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: size.width.max(1), height: size.height.max(1), present_mode: wgpu::PresentMode::Fifo, desired_maximum_frame_latency: 2, alpha_mode: caps.alpha_modes[0], view_formats: vec![] };
+    // Clamp to the device's max texture size so a large/maximized window can't blow up configure().
+    let mut config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: size.width.clamp(1, max_dim), height: size.height.clamp(1, max_dim), present_mode: wgpu::PresentMode::Fifo, desired_maximum_frame_latency: 2, alpha_mode: caps.alpha_modes[0], view_formats: vec![] };
     surface.configure(&device, &config);
-    let (field_pl, line_pl) = make_pipelines(&device, format);
+    let (field_pl, fill_pl, outline_pl) = make_pipelines(&device, format);
 
     let (mut vmin, mut vmax) = (f32::MAX, f32::MIN);
     let follow = watch; // when watching, jump to newest as files arrive
@@ -469,8 +510,8 @@ fn run_window(args: Args) {
         Event::WindowEvent { event, .. } => match event {
             WindowEvent::CloseRequested => elwt.exit(),
             WindowEvent::Resized(s) => {
-                config.width = s.width.max(1);
-                config.height = s.height.max(1);
+                config.width = s.width.clamp(1, max_dim);
+                config.height = s.height.clamp(1, max_dim);
                 surface.configure(&device, &config);
                 window.request_redraw();
             }
@@ -510,7 +551,8 @@ fn run_window(args: Args) {
                         rp.set_vertex_buffer(0, fb.vbuf.slice(..));
                         rp.set_index_buffer(fb.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                         rp.draw_indexed(0..fb.nidx, 0, 0..1);
-                        if let Some(lbuf) = &fb.lbuf { rp.set_pipeline(&line_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..fb.nline, 0..1); }
+                        if let Some(fbuf) = &fb.fillbuf { rp.set_pipeline(&fill_pl); rp.set_vertex_buffer(0, fbuf.slice(..)); rp.draw(0..fb.nfill, 0..1); }
+                        if let Some(lbuf) = &fb.lbuf { rp.set_pipeline(&outline_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..fb.nline, 0..1); }
                     }
                 }
                 queue.submit([enc.finish()]);
@@ -556,6 +598,9 @@ fn run_window(args: Args) {
         }
         _ => {}
     });
+    // The event loop has exited. Dropping the wgpu device/surface here segfaults on some Mesa
+    // drivers (radv) during teardown; exit straight away and let the OS reclaim everything.
+    std::process::exit(0);
 }
 
 fn main() {
