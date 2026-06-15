@@ -191,14 +191,20 @@ fn read_frame(h: &hdf5::File, key: &str, field: &str) -> (Vec<f32>, Vec<f32>, us
     (nodes, fld, ne as usize, nn as usize, nc, poses)
 }
 
-/// Open the file paths and build the global ordered frame list (file_index, frame_key).
+/// Open file paths and build the global ordered frame list (file_index, frame_key). Files that fail
+/// to open (e.g. an actively-written split file held by the writer) are skipped — the caller's watch
+/// loop retries them once complete.
 fn open_frames(paths: &[String]) -> (Vec<hdf5::File>, Vec<(usize, String)>) {
-    let handles: Vec<hdf5::File> = paths.iter().map(|p| hdf5::File::open(p).expect("open h5")).collect();
+    let mut handles = Vec::new();
     let mut frames = Vec::new();
-    for (hi, h) in handles.iter().enumerate() {
-        let mut keys = h.group("frames").unwrap().member_names().unwrap();
+    for p in paths {
+        let Ok(h) = hdf5::File::open(p) else { continue };
+        let Ok(g) = h.group("frames") else { continue };
+        let Ok(mut keys) = g.member_names() else { continue };
         keys.sort();
+        let hi = handles.len();
         for k in keys { frames.push((hi, k)); }
+        handles.push(h);
     }
     (handles, frames)
 }
@@ -319,7 +325,15 @@ fn color_range(handles: &[hdf5::File], frames: &[(usize, String)], field: &str, 
 
 fn run_offscreen(args: &Args) {
     let (paths, stem) = list_set(&args.path);
+    if paths.is_empty() {
+        eprintln!("gale-view: no trajectory file found at {:?}", args.path);
+        std::process::exit(1);
+    }
     let (handles, frames) = open_frames(&paths);
+    if frames.is_empty() {
+        eprintln!("gale-view: {:?} has no frames yet (still being written?)", args.path);
+        std::process::exit(1);
+    }
     let radii = read_radii(&handles[0]);
     let nfr = frames.len();
     let prefix = args.out.clone().unwrap_or(stem);
@@ -359,18 +373,76 @@ struct FrameBuffers {
     bounds: [f32; 4],
 }
 
-fn run_window(args: Args) {
+/// Build the GPU buffers for frame `i`, expanding the running color range from this frame's values
+/// (so coloring is computed lazily from frames you actually view — important when the HDF5 lives on
+/// a network mount: only viewed frames are read).
+#[allow(clippy::too_many_arguments)]
+fn build_frame(device: &wgpu::Device, handles: &[hdf5::File], frames: &[(usize, String)], i: usize, radii: &[f64], field: &str, comp: &str, vmin: &mut f32, vmax: &mut f32) -> FrameBuffers {
     use wgpu::util::DeviceExt;
+    let (hi, key) = &frames[i];
+    let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, field);
+    let t = tessellate(&nodes, &fld, ne, nn, nc, comp, 2);
+    for &v in &t.raw { if v.is_finite() { *vmin = vmin.min(v); *vmax = vmax.max(v); } }
+    if !(*vmin < *vmax) { *vmin = 0.0; *vmax = 1.0; }
+    let verts = vertices(&t, *vmin, *vmax);
+    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
+    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&t.indices), usage: wgpu::BufferUsages::INDEX });
+    let lines = if poses.is_empty() || radii.is_empty() { Vec::new() } else { body_lines(&poses, radii, t.bounds) };
+    let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&lines), usage: wgpu::BufferUsages::VERTEX }));
+    FrameBuffers { vbuf, ibuf, nidx: t.indices.len() as u32, lbuf, nline: lines.len() as u32, bounds: t.bounds }
+}
+
+/// Append frames from any files in `paths` not yet consumed, in order, stopping at the first that
+/// can't be opened yet (the actively-written tail of a `--watch`ed split run — the writer holds it
+/// until it rolls/finishes). Returns true if any frames were added. Reads only metadata (frame group
+/// names), not field data.
+fn consume_files(paths: &[String], handles: &mut Vec<hdf5::File>, frames: &mut Vec<(usize, String)>, consumed: &mut usize, radii: &mut Vec<f64>) -> bool {
+    let mut changed = false;
+    while *consumed < paths.len() {
+        let Ok(h) = hdf5::File::open(&paths[*consumed]) else { break };
+        let Ok(g) = h.group("frames") else { break };
+        let Ok(mut keys) = g.member_names() else { break };
+        keys.sort();
+        let hi = handles.len();
+        for k in keys { frames.push((hi, k)); }
+        if radii.is_empty() { *radii = read_radii(&h); }
+        handles.push(h);
+        *consumed += 1;
+        changed = true;
+    }
+    changed
+}
+
+fn run_window(args: Args) {
     use winit::event::{ElementState, Event, WindowEvent};
     use winit::event_loop::{ControlFlow, EventLoop};
     use winit::keyboard::{KeyCode, PhysicalKey};
     use winit::window::WindowBuilder;
 
-    let (mut paths, _stem) = list_set(&args.path);
-    let (mut handles, mut frames) = open_frames(&paths);
-    let radii = read_radii(&handles[0]);
-    let (vmin, vmax) = color_range(&handles, &frames, &args.field, &args.comp);
-    println!("{} frames, value range [{vmin:.4}, {vmax:.4}]  (←/→ scrub, Space play, Home/End, Esc quit)", frames.len());
+    let field = args.field;
+    let comp = args.comp;
+    let watch = args.watch;
+    let path = args.path;
+    let initial = args.frame;
+    let frame_dt = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
+
+    // Initial scan — may be empty under --watch before the sim has written anything.
+    let mut paths = list_set(&path).0;
+    if paths.is_empty() && !watch {
+        eprintln!("gale-view: no trajectory file found at {path:?}\n  (pass --watch to open a window and wait for it to appear)");
+        std::process::exit(1);
+    }
+    let mut handles: Vec<hdf5::File> = Vec::new();
+    let mut frames: Vec<(usize, String)> = Vec::new();
+    let mut consumed = 0usize;
+    let mut radii: Vec<f64> = Vec::new();
+    consume_files(&paths, &mut handles, &mut frames, &mut consumed, &mut radii);
+    if frames.is_empty() {
+        println!("gale-view: waiting for frames at {path} …");
+    } else {
+        println!("{} frame(s) loaded", frames.len());
+    }
+    println!("controls: ←/→ scrub · Space play/pause · Home/End · Esc quit");
 
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(WindowBuilder::new().with_title("gale-view").build(&event_loop).unwrap());
@@ -385,27 +457,14 @@ fn run_window(args: Args) {
     surface.configure(&device, &config);
     let (field_pl, line_pl) = make_pipelines(&device, format);
 
-    let build_frame = |device: &wgpu::Device, handles: &[hdf5::File], frames: &[(usize, String)], i: usize| -> FrameBuffers {
-        let (hi, key) = &frames[i];
-        let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, &args.field);
-        let t = tessellate(&nodes, &fld, ne, nn, nc, &args.comp, 2);
-        let verts = vertices(&t, vmin, vmax);
-        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
-        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&t.indices), usage: wgpu::BufferUsages::INDEX });
-        let lines = if poses.is_empty() || radii.is_empty() { Vec::new() } else { body_lines(&poses, &radii, t.bounds) };
-        let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&lines), usage: wgpu::BufferUsages::VERTEX }));
-        FrameBuffers { vbuf, ibuf, nidx: t.indices.len() as u32, lbuf, nline: lines.len() as u32, bounds: t.bounds }
-    };
-
-    let mut cur = args.frame.unwrap_or(frames.len() - 1).min(frames.len() - 1);
-    let mut fb = build_frame(&device, &handles, &frames, cur);
+    let (mut vmin, mut vmax) = (f32::MAX, f32::MIN);
+    let follow = watch; // when watching, jump to newest as files arrive
+    let mut cur: Option<usize> = (!frames.is_empty()).then(|| initial.unwrap_or(frames.len() - 1).min(frames.len() - 1));
+    let mut fb: Option<FrameBuffers> = cur.map(|c| build_frame(&device, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax));
     let mut playing = false;
-    let follow = args.watch; // when watching, jump to newest as files arrive
-    let frame_dt = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
     let mut last_advance = Instant::now();
     let mut last_scan = Instant::now();
 
-    event_loop.set_control_flow(ControlFlow::Poll);
     let _ = event_loop.run(move |event, elwt| match event {
         Event::WindowEvent { event, .. } => match event {
             WindowEvent::CloseRequested => elwt.exit(),
@@ -417,16 +476,22 @@ fn run_window(args: Args) {
             }
             WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
                 let n = frames.len();
+                if let PhysicalKey::Code(KeyCode::Escape | KeyCode::KeyQ) = ke.physical_key {
+                    elwt.exit();
+                    return;
+                }
+                if n == 0 { return; } // nothing loaded yet (waiting)
+                let mut c = cur.unwrap_or(0);
                 match ke.physical_key {
-                    PhysicalKey::Code(KeyCode::ArrowRight) => { cur = (cur + 1).min(n - 1); }
-                    PhysicalKey::Code(KeyCode::ArrowLeft) => { cur = cur.saturating_sub(1); }
-                    PhysicalKey::Code(KeyCode::Home) => cur = 0,
-                    PhysicalKey::Code(KeyCode::End) => cur = n - 1,
-                    PhysicalKey::Code(KeyCode::Space) => playing = !playing,
-                    PhysicalKey::Code(KeyCode::Escape) | PhysicalKey::Code(KeyCode::KeyQ) => { elwt.exit(); return; }
+                    PhysicalKey::Code(KeyCode::ArrowRight) => c = (c + 1).min(n - 1),
+                    PhysicalKey::Code(KeyCode::ArrowLeft) => c = c.saturating_sub(1),
+                    PhysicalKey::Code(KeyCode::Home) => c = 0,
+                    PhysicalKey::Code(KeyCode::End) => c = n - 1,
+                    PhysicalKey::Code(KeyCode::Space) => { playing = !playing; return; }
                     _ => return,
                 }
-                fb = build_frame(&device, &handles, &frames, cur);
+                cur = Some(c);
+                fb = Some(build_frame(&device, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax));
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -435,16 +500,18 @@ fn run_window(args: Args) {
                     Err(_) => { surface.configure(&device, &config); return; }
                 };
                 let view = frame.texture.create_view(&Default::default());
-                let (vx, vy, vw, vh) = fit_viewport(config.width as f32, config.height as f32, fb.bounds[2], fb.bounds[3]);
                 let mut enc = device.create_command_encoder(&Default::default());
                 {
                     let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
-                    rp.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
-                    rp.set_pipeline(&field_pl);
-                    rp.set_vertex_buffer(0, fb.vbuf.slice(..));
-                    rp.set_index_buffer(fb.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    rp.draw_indexed(0..fb.nidx, 0, 0..1);
-                    if let Some(lbuf) = &fb.lbuf { rp.set_pipeline(&line_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..fb.nline, 0..1); }
+                    if let Some(fb) = &fb {
+                        let (vx, vy, vw, vh) = fit_viewport(config.width as f32, config.height as f32, fb.bounds[2], fb.bounds[3]);
+                        rp.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
+                        rp.set_pipeline(&field_pl);
+                        rp.set_vertex_buffer(0, fb.vbuf.slice(..));
+                        rp.set_index_buffer(fb.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.draw_indexed(0..fb.nidx, 0, 0..1);
+                        if let Some(lbuf) = &fb.lbuf { rp.set_pipeline(&line_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..fb.nline, 0..1); }
+                    }
                 }
                 queue.submit([enc.finish()]);
                 frame.present();
@@ -453,33 +520,39 @@ fn run_window(args: Args) {
         },
         Event::AboutToWait => {
             let mut dirty = false;
-            // watch: poll the split set for newly-completed files and append their frames.
-            if args.watch && last_scan.elapsed() > Duration::from_millis(500) {
+            // watch: re-glob and consume any newly-completed files (the writer's current file is held
+            // until it rolls, so we naturally stay just behind the live tip — use TRAJ_MAX_MB so files
+            // complete during the run).
+            if watch && last_scan.elapsed() > Duration::from_millis(500) {
                 last_scan = Instant::now();
-                let (new_paths, _) = list_set(&args.path);
-                if new_paths.len() > paths.len() {
-                    for p in &new_paths[paths.len()..] {
-                        if let Ok(h) = hdf5::File::open(p) {
-                            let hi = handles.len();
-                            let mut keys = h.group("frames").unwrap().member_names().unwrap();
-                            keys.sort();
-                            for k in keys { frames.push((hi, k)); }
-                            handles.push(h);
-                        }
+                let new_paths = list_set(&path).0;
+                if new_paths.len() > paths.len() { paths = new_paths; }
+                if consume_files(&paths, &mut handles, &mut frames, &mut consumed, &mut radii) {
+                    if cur.is_none() {
+                        cur = Some(if follow { frames.len() - 1 } else { 0 });
+                        dirty = true;
+                    } else if follow {
+                        cur = Some(frames.len() - 1);
+                        dirty = true;
                     }
-                    paths = new_paths;
-                    if follow { cur = frames.len() - 1; dirty = true; }
                 }
             }
-            if playing && last_advance.elapsed() >= frame_dt {
+            if playing && !frames.is_empty() && last_advance.elapsed() >= frame_dt {
                 last_advance = Instant::now();
-                cur = if cur + 1 < frames.len() { cur + 1 } else { 0 };
+                let c = cur.unwrap_or(0);
+                cur = Some(if c + 1 < frames.len() { c + 1 } else { 0 });
                 dirty = true;
             }
             if dirty {
-                fb = build_frame(&device, &handles, &frames, cur);
+                if let Some(c) = cur {
+                    fb = Some(build_frame(&device, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax));
+                }
                 window.request_redraw();
+            } else if cur.is_none() {
+                window.request_redraw(); // keep the (blank) window painted while waiting for frames
             }
+            // ~30 Hz wakeups: enough for play + watch polling without busy-spinning a core.
+            elwt.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(33)));
         }
         _ => {}
     });
