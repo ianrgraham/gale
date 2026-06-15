@@ -25,6 +25,14 @@ pub enum Neighbor3 {
     Interior { elem: usize, face: Face, perm: Vec<usize> },
     /// A domain boundary, tagged by the local face index (`Face as usize`).
     Boundary { tag: u32 },
+    /// **Coarse** side of a 2:1 octree interface: four finer neighbours, each `(elem, face)`,
+    /// in quarter order `q = ha + 2·hb` where `(ha, hb) ∈ {0,1}²` is the quarter's position
+    /// along the face's two tangential axes (the non-normal axes, in increasing index order).
+    CoarseToFine { fine: [(usize, Face); 4] },
+    /// **Fine** side of a 2:1 octree interface: this hex covers quarter `quad` (`= ha + 2·hb`)
+    /// of a coarser neighbour's face. The flux is assembled from the coarse side (mirroring the
+    /// 2D `Neighbor::FineToCoarse`), so operators skip this entry.
+    FineToCoarse { coarse: usize, face: Face, quad: usize },
 }
 
 /// One physical hex element.
@@ -253,11 +261,300 @@ impl Mesh3d {
     ) -> Self {
         Self::build(order, nx, ny, nz, xr, yr, zr, true)
     }
+
+    /// Cartesian box mesh with each base cell in `refine` split once into 8 octree children
+    /// (single-level 2:1 non-conforming AMR). The 3D analogue of [`Mesh2d::cartesian_refined`]:
+    /// a refined cell's six external faces become `CoarseToFine` (seen from a coarse neighbour)
+    /// or the neighbour sees `FineToCoarse`; sibling and fine-fine faces stay `Interior` (matched
+    /// by physical-coordinate proximity, like [`build`]). Only single-level refinement, so every
+    /// non-conforming interface is exactly 2:1.
+    pub fn cartesian_refined(
+        order: usize,
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        xr: [f64; 2],
+        yr: [f64; 2],
+        zr: [f64; 2],
+        refine: &[(usize, usize, usize)],
+    ) -> Self {
+        use std::collections::{HashMap, HashSet};
+        use Face::{Bottom, East, North, South, Top, West};
+        let refh = Reference3dHex::new(order);
+        let (hx, hy, hz) =
+            ((xr[1] - xr[0]) / nx as f64, (yr[1] - yr[0]) / ny as f64, (zr[1] - zr[0]) / nz as f64);
+        let refined: HashSet<(usize, usize, usize)> = refine.iter().copied().collect();
+        // Corners of an axis-aligned box [x0,x0+wx]×[y0,y0+wy]×[z0,z0+wz] in the canonical order
+        // corner c = (c&1 ? +x : ., c&2 ? +y : ., c&4 ? +z : .).
+        let box_corners = |x0: f64, y0: f64, z0: f64, wx: f64, wy: f64, wz: f64| -> [[f64; 3]; 8] {
+            let mut c = [[0.0; 3]; 8];
+            for (i, slot) in c.iter_mut().enumerate() {
+                *slot = [
+                    if i & 1 == 0 { x0 } else { x0 + wx },
+                    if i & 2 == 0 { y0 } else { y0 + wy },
+                    if i & 4 == 0 { z0 } else { z0 + wz },
+                ];
+            }
+            c
+        };
+
+        #[derive(Clone, Copy)]
+        enum Cell {
+            Single(usize),
+            Oct([usize; 8]), // child (sx,sy,sz) at index sx + 2sy + 4sz
+        }
+        let mut corners_all: Vec<[[f64; 3]; 8]> = Vec::new();
+        let mut geoms: Vec<HexGeometry> = Vec::new();
+        let mut cells: HashMap<(usize, usize, usize), Cell> = HashMap::new();
+        for cz in 0..nz {
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    let (px, py, pz) = (xr[0] + cx as f64 * hx, yr[0] + cy as f64 * hy, zr[0] + cz as f64 * hz);
+                    if refined.contains(&(cx, cy, cz)) {
+                        let mut ids = [0usize; 8];
+                        for sz in 0..2 {
+                            for sy in 0..2 {
+                                for sx in 0..2 {
+                                    let c = box_corners(
+                                        px + sx as f64 * 0.5 * hx,
+                                        py + sy as f64 * 0.5 * hy,
+                                        pz + sz as f64 * 0.5 * hz,
+                                        0.5 * hx,
+                                        0.5 * hy,
+                                        0.5 * hz,
+                                    );
+                                    ids[sx + 2 * sy + 4 * sz] = geoms.len();
+                                    geoms.push(HexGeometry::from_corners(&refh, c));
+                                    corners_all.push(c);
+                                }
+                            }
+                        }
+                        cells.insert((cx, cy, cz), Cell::Oct(ids));
+                    } else {
+                        let c = box_corners(px, py, pz, hx, hy, hz);
+                        cells.insert((cx, cy, cz), Cell::Single(geoms.len()));
+                        geoms.push(HexGeometry::from_corners(&refh, c));
+                        corners_all.push(c);
+                    }
+                }
+            }
+        }
+        let faces_all: Vec<[HexFaceData; 6]> = geoms.iter().map(|g| hex_faces(&refh, g)).collect();
+
+        // Interior-face perm by tangential-coordinate proximity (orientation-agnostic, as in `build`).
+        let tang = |g: &HexGeometry, fd: &HexFaceData| -> Vec<[f64; 2]> {
+            let ax = fd.face.normal_axis();
+            fd.nodes
+                .iter()
+                .map(|&k| {
+                    let xyz = [g.x[k], g.y[k], g.z[k]];
+                    match ax {
+                        0 => [xyz[1], xyz[2]],
+                        1 => [xyz[0], xyz[2]],
+                        _ => [xyz[0], xyz[1]],
+                    }
+                })
+                .collect()
+        };
+        let interior = |e: usize, lf: usize, ne: usize, nf: Face| -> Neighbor3 {
+            let mine = tang(&geoms[e], &faces_all[e][lf]);
+            let theirs = tang(&geoms[ne], &faces_all[ne][nf as usize]);
+            let perm = mine
+                .iter()
+                .map(|m| {
+                    let (mut best, mut bd) = (0usize, f64::INFINITY);
+                    for (b, t) in theirs.iter().enumerate() {
+                        let d = (m[0] - t[0]).powi(2) + (m[1] - t[1]).powi(2);
+                        if d < bd {
+                            bd = d;
+                            best = b;
+                        }
+                    }
+                    best
+                })
+                .collect();
+            Neighbor3::Interior { elem: ne, face: nf, perm }
+        };
+
+        // (local face, Δcx, Δcy, Δcz, neighbour's matching face)
+        let across = [
+            (Bottom, 0i64, 0, -1, Top),
+            (Top, 0, 0, 1, Bottom),
+            (South, 0, -1, 0, North),
+            (North, 0, 1, 0, South),
+            (West, -1, 0, 0, East),
+            (East, 1, 0, 0, West),
+        ];
+        let cell_at = |cx: i64, cy: i64, cz: i64| -> Option<Cell> {
+            if cx < 0 || cy < 0 || cz < 0 || cx as usize >= nx || cy as usize >= ny || cz as usize >= nz {
+                None
+            } else {
+                cells.get(&(cx as usize, cy as usize, cz as usize)).copied()
+            }
+        };
+        // The two tangential axes (non-normal), increasing index order.
+        let tang_axes = |n: usize| -> (usize, usize) {
+            match n {
+                0 => (1, 2),
+                1 => (0, 2),
+                _ => (0, 1),
+            }
+        };
+        let child_id = |oct: &[usize; 8], c: [usize; 3]| oct[c[0] + 2 * c[1] + 4 * c[2]];
+        // The 4 children of `oct` on its face `f` (the side facing the coarse neighbour), in
+        // quarter order q = ha + 2·hb. `f` is the neighbour-child's own local face.
+        let face_children = |oct: &[usize; 8], f: Face| -> [(usize, Face); 4] {
+            let n = f.normal_axis();
+            let side = if matches!(f, Top | North | East) { 1 } else { 0 };
+            let (a, b) = tang_axes(n);
+            let mut out = [(0usize, f); 4];
+            for hb in 0..2 {
+                for ha in 0..2 {
+                    let mut c = [0usize; 3];
+                    c[n] = side;
+                    c[a] = ha;
+                    c[b] = hb;
+                    out[ha + 2 * hb] = (child_id(oct, c), f);
+                }
+            }
+            out
+        };
+
+        let mut neighbors_all: Vec<[Neighbor3; 6]> =
+            (0..geoms.len()).map(|_| std::array::from_fn(|_| Neighbor3::Boundary { tag: 0 })).collect();
+        for cz in 0..nz {
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    let cell = cells[&(cx, cy, cz)];
+                    for (lf, (face, dcx, dcy, dcz, opp)) in across.into_iter().enumerate() {
+                        let nb = cell_at(cx as i64 + dcx, cy as i64 + dcy, cz as i64 + dcz);
+                        let n = face.normal_axis();
+                        let side = if matches!(face, Top | North | East) { 1 } else { 0 };
+                        let (a, b) = tang_axes(n);
+                        match cell {
+                            Cell::Single(id) => {
+                                neighbors_all[id][lf] = match nb {
+                                    None => Neighbor3::Boundary { tag: lf as u32 },
+                                    Some(Cell::Single(ne)) => interior(id, lf, ne, opp),
+                                    Some(Cell::Oct(nch)) => {
+                                        Neighbor3::CoarseToFine { fine: face_children(&nch, opp) }
+                                    }
+                                };
+                            }
+                            Cell::Oct(ch) => {
+                                for sz in 0..2 {
+                                    for sy in 0..2 {
+                                        for sx in 0..2 {
+                                            let c = [sx, sy, sz];
+                                            let id = child_id(&ch, c);
+                                            if c[n] != side {
+                                                // internal: sibling across this face within the oct
+                                                let mut sib = c;
+                                                sib[n] = side;
+                                                neighbors_all[id][lf] = interior(id, lf, child_id(&ch, sib), opp);
+                                            } else {
+                                                neighbors_all[id][lf] = match nb {
+                                                    None => Neighbor3::Boundary { tag: lf as u32 },
+                                                    Some(Cell::Oct(nch)) => {
+                                                        // matching neighbour child: same (a,b), opp side along n
+                                                        let mut nc = [0usize; 3];
+                                                        nc[n] = 1 - side;
+                                                        nc[a] = c[a];
+                                                        nc[b] = c[b];
+                                                        interior(id, lf, child_id(&nch, nc), opp)
+                                                    }
+                                                    Some(Cell::Single(ne)) => Neighbor3::FineToCoarse {
+                                                        coarse: ne,
+                                                        face: opp,
+                                                        quad: c[a] + 2 * c[b],
+                                                    },
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let elements = corners_all
+            .into_iter()
+            .zip(geoms)
+            .zip(faces_all)
+            .zip(neighbors_all)
+            .map(|(((corners, geom), faces), neighbors)| HexElement { corners, geom, faces, neighbors })
+            .collect();
+        Self { order, refh, elements }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn octree_nonconforming_connectivity() {
+        // Refine the corner cell of a 2×2×2 box: 7 unrefined + 8 children = 15 elements.
+        let m = Mesh3d::cartesian_refined(2, 2, 2, 2, [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], &[(0, 0, 0)]);
+        assert_eq!(m.n_elements(), 7 + 8);
+        let (mut ctf, mut ftc) = (0, 0);
+        for (e, el) in m.elements.iter().enumerate() {
+            for (lf, nb) in el.neighbors.iter().enumerate() {
+                match nb {
+                    Neighbor3::CoarseToFine { fine } => {
+                        ctf += 1;
+                        let cf = &el.faces[lf];
+                        let n = cf.face.normal_axis();
+                        let coord = |g: &HexGeometry, k: usize| [g.x[k], g.y[k], g.z[k]][n];
+                        let cn = coord(&el.geom, cf.nodes[0]);
+                        let mut seen = [false; 4];
+                        for &(fe, ff) in fine {
+                            // reciprocity: each fine child points back via FineToCoarse to this coarse face
+                            match &m.elements[fe].neighbors[ff as usize] {
+                                Neighbor3::FineToCoarse { coarse, face, quad } => {
+                                    assert_eq!(*coarse, e);
+                                    assert_eq!(*face as usize, lf);
+                                    seen[*quad] = true;
+                                }
+                                other => panic!("fine child not FineToCoarse: {other:?}"),
+                            }
+                            // geometric: every fine-face node lies on the coarse face plane
+                            let (ffd, fg) = (&m.elements[fe].faces[ff as usize], &m.elements[fe].geom);
+                            for &k in &ffd.nodes {
+                                assert!((coord(fg, k) - cn).abs() < 1e-12, "fine face off the coarse plane");
+                            }
+                        }
+                        assert_eq!(seen, [true; 4], "the 4 quarters must be distinct");
+                    }
+                    Neighbor3::FineToCoarse { .. } => ftc += 1,
+                    _ => {}
+                }
+            }
+        }
+        // The corner refined cell has 3 interior faces (→ 3 coarse neighbours see CoarseToFine, and
+        // its 4 children on each interface see FineToCoarse ⇒ 12) and 3 domain-boundary faces.
+        assert_eq!(ctf, 3, "CoarseToFine faces");
+        assert_eq!(ftc, 12, "FineToCoarse faces");
+    }
+
+    #[test]
+    fn fully_refined_is_conforming() {
+        // Refining the only cell of a 1×1×1 box gives a uniform 2×2×2 of children: all interior
+        // faces conforming, all external faces domain boundary — no non-conforming interfaces.
+        let m = Mesh3d::cartesian_refined(2, 1, 1, 1, [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], &[(0, 0, 0)]);
+        assert_eq!(m.n_elements(), 8);
+        for el in &m.elements {
+            for nb in &el.neighbors {
+                assert!(
+                    matches!(nb, Neighbor3::Interior { .. } | Neighbor3::Boundary { .. }),
+                    "fully-refined mesh should be conforming"
+                );
+            }
+        }
+    }
 
     #[test]
     fn element_count_and_volume() {

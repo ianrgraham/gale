@@ -7,6 +7,7 @@
 //! terms (consistency `−∮{∇u·n}[v]`, penalty `+∮τ[u][v]`, symmetry lift
 //! `−∮{∇v·n}[u]`) over the 6 hex faces. Penalty `τ = α(p+1)²/h`, `h = vol^{1/3}`.
 
+use super::amr3d::RefineHex;
 use super::face3d::Face;
 use super::mesh3d::{Mesh3d, Neighbor3};
 
@@ -118,6 +119,39 @@ impl<'m> Poisson3d<'m> {
 
         let mut r = self.apply_volume(u);
 
+        // Mortar projections (only used at non-conforming faces). `sorted_face` returns the face's
+        // n² trace nodes in (a,b) tensor order — sorted by the two tangential coords (b major, a
+        // minor) — so it lines up with the `RefineHex` face-mortar's `ia + ib·n` layout.
+        let mortar = RefineHex::new(m.order);
+        let sorted_face = |ei: usize, fc: Face| -> Vec<usize> {
+            let fd = &m.elements[ei].faces[fc as usize];
+            let g = &m.elements[ei].geom;
+            let (a, b) = match fc.normal_axis() {
+                0 => (1usize, 2usize),
+                1 => (0, 2),
+                _ => (0, 1),
+            };
+            let coord = |k: usize, axis: usize| {
+                let nd = fd.nodes[k];
+                [g.x[nd], g.y[nd], g.z[nd]][axis]
+            };
+            // Tensor order (b major, a minor). The primary (b) compare is TOLERANT: the trilinear
+            // geometry gives within-row coordinates that differ by FP rounding (~1e-15), so an exact
+            // primary compare would never tie and the secondary (a) sort would never run, scrambling
+            // each row. A tolerance well below the node spacing groups rows correctly.
+            let tol = 1e-9;
+            let mut idx: Vec<usize> = (0..fd.nodes.len()).collect();
+            idx.sort_by(|&p, &q| {
+                let (bp, bq) = (coord(p, b), coord(q, b));
+                if (bp - bq).abs() > tol {
+                    bp.partial_cmp(&bq).unwrap()
+                } else {
+                    coord(p, a).partial_cmp(&coord(q, a)).unwrap()
+                }
+            });
+            idx
+        };
+
         for (e, el) in m.elements.iter().enumerate() {
             for face in Face::ALL {
                 let f = &el.faces[face as usize];
@@ -196,6 +230,83 @@ impl<'m> Poisson3d<'m> {
                         );
                         for k in 0..nn {
                             r[e * nn + k] -= l[k];
+                        }
+                    }
+                    Neighbor3::FineToCoarse { .. } => { /* handled from the coarse side */ }
+                    Neighbor3::CoarseToFine { fine } => {
+                        // SIPG across a 2:1 octree interface, integrated on the 4 fine quarter-faces
+                        // (the 3D analogue of the 2D `Poisson::apply` CoarseToFine arm). The coarse
+                        // outward normal is used on BOTH sides; the coarse trace is projected onto
+                        // each fine quarter via the hex-face mortar `P`, and coarse-test terms are
+                        // `Pᵀ`-gathered back — an adjoint pair, keeping the operator symmetric.
+                        let ce = sorted_face(e, face);
+                        let (ncx, ncy, ncz) = (f.nx[ce[0]], f.ny[ce[0]], f.nz[ce[0]]);
+                        let uc: Vec<f64> = ce.iter().map(|&i| u[e * nn + f.nodes[i]]).collect();
+                        let dnc: Vec<f64> = ce
+                            .iter()
+                            .map(|&i| {
+                                let v = f.nodes[i];
+                                ncx * gx[e][v] + ncy * gy[e][v] + ncz * gz[e][v]
+                            })
+                            .collect();
+                        let mut hxe = vec![0.0; nn];
+                        let mut hye = vec![0.0; nn];
+                        let mut hze = vec![0.0; nn];
+                        for (q, &(re, rface)) in fine.iter().enumerate() {
+                            let (ha, hb) = (q % 2, q / 2);
+                            let tau = self.penalty(e, Some(re));
+                            let rel = &m.elements[re];
+                            let frw = &rel.faces[rface as usize];
+                            let rw = sorted_face(re, rface);
+                            let uc_m = mortar.mortar_to_fine_face(&uc, ha, hb);
+                            let dnc_m = mortar.mortar_to_fine_face(&dnc, ha, hb);
+                            let mut hxr = vec![0.0; nn];
+                            let mut hyr = vec![0.0; nn];
+                            let mut hzr = vec![0.0; nn];
+                            let mut gc = vec![0.0; rw.len()]; // coarse-test consistency+penalty
+                            let mut gl = vec![0.0; rw.len()]; // coarse-test symmetry-lift source
+                            for (mi, &i) in rw.iter().enumerate() {
+                                let vf = frw.nodes[i];
+                                let sw = frw.sw[i];
+                                let dnf = ncx * gx[re][vf] + ncy * gy[re][vf] + ncz * gz[re][vf];
+                                let jump = uc_m[mi] - u[re * nn + vf];
+                                let avg = 0.5 * (dnc_m[mi] + dnf);
+                                // Fine test (direct): consistency +∮{∇u·n}v_f, penalty −∮τ[u]v_f.
+                                r[re * nn + vf] += sw * avg - tau * sw * jump;
+                                // Coarse test (Pᵀ-gathered): −∮{∇u·n}v_c, +∮τ[u]v_c.
+                                gc[mi] = sw * (-avg + tau * jump);
+                                // Symmetry lift g = ½ sw [u] (coarse normal on both sides).
+                                let g = 0.5 * sw * jump;
+                                hxr[vf] += g * ncx;
+                                hyr[vf] += g * ncy;
+                                hzr[vf] += g * ncz;
+                                gl[mi] = g;
+                            }
+                            let cc = mortar.mortar_gather_face(&gc, ha, hb);
+                            let cl = mortar.mortar_gather_face(&gl, ha, hb);
+                            for (mc, &cv) in ce.iter().enumerate() {
+                                let node = f.nodes[cv];
+                                r[e * nn + node] += cc[mc];
+                                hxe[node] += cl[mc] * ncx;
+                                hye[node] += cl[mc] * ncy;
+                                hze[node] += cl[mc] * ncz;
+                            }
+                            let lr = add3(
+                                rel.geom.gradx_t(refh, &hxr),
+                                rel.geom.grady_t(refh, &hyr),
+                                rel.geom.gradz_t(refh, &hzr),
+                            );
+                            for k in 0..nn {
+                                r[re * nn + k] -= lr[k];
+                            }
+                        }
+                        let le = add3(
+                            el.geom.gradx_t(refh, &hxe),
+                            el.geom.grady_t(refh, &hye),
+                            el.geom.gradz_t(refh, &hze),
+                        );
+                        for k in 0..nn {
+                            r[e * nn + k] -= le[k];
                         }
                     }
                 }
@@ -364,6 +475,51 @@ mod tests {
             }
         }
         u
+    }
+
+    /// On a 2:1 octree mesh, `A·u* = 0` at every interior node for a harmonic polynomial `u*` of
+    /// degree ≤ p exactly represented in the space — the decisive SIPG consistency test for the
+    /// non-conforming mortar coupling (`u* = xy+yz+zx` is harmonic with all three normal
+    /// derivatives nonzero, so it exercises x/y/z NC faces; if the mortar `P`/`Pᵀ`, the sorted-face
+    /// ordering, or the coarse normal were wrong, the consistency/gather terms wouldn't cancel).
+    /// Polynomial MMS exactness on a 2:1 octree mesh: for `u*` of degree ≤ p, the SIPG solution of
+    /// `−Δu = −Δu*` with Dirichlet data `u*|∂Ω` reproduces the interpolant of `u*` to solver
+    /// tolerance — SIPG is consistent and the mortar coupling is exact for degree ≤ p, so the
+    /// discrete solution equals `u*` exactly (GLL quadrature is exact for the degrees involved).
+    /// This is the decisive consistency test for the non-conforming mortar: a wrong projection,
+    /// gather, normal, or sorted-face ordering would break the reproduction.
+    #[test]
+    fn nc_poisson_reproduces_polynomial() {
+        let p = 3;
+        let mesh =
+            Mesh3d::cartesian_refined(p, 2, 2, 2, [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], &[(0, 0, 0), (1, 1, 1)]);
+        let a = Poisson3d::new(&mesh, 8.0); // all-Dirichlet, reaction 0 ⇒ SPD
+        // u* of degree ≤ p (=3) with a constant Laplacian (Δu* = 2 + 4 − 1 = 5).
+        let us = |x: f64, y: f64, z: f64| x * x + 2.0 * y * y - 0.5 * z * z + x * y * z + x;
+        let fsrc = nodal(&mesh, |_, _, _| -5.0); // f = −Δu*
+        let b = a.rhs(&fsrc, us);
+        let (x, iters, resid) = a.cg(&b, 1e-13, 20000);
+        let exact = nodal(&mesh, us);
+        let err = x.iter().zip(&exact).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        assert!(err < 1e-8, "NC polynomial MMS not reproduced: ‖x−u*‖∞={err:.3e} (cg {iters} it, resid {resid:.1e})");
+    }
+
+    /// The SIPG operator on a 2:1 octree mesh must be symmetric: `⟨Au,v⟩ = ⟨Av,u⟩`. The mortar
+    /// `P`/`Pᵀ` must be an exact adjoint pair across the non-conforming interface or this breaks.
+    #[test]
+    fn nc_operator_is_symmetric() {
+        let p = 3;
+        let mesh =
+            Mesh3d::cartesian_refined(p, 2, 2, 2, [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], &[(0, 0, 0), (1, 0, 1)]);
+        let a = Poisson3d::with_reaction(&mesh, 6.0, 2.0); // Helmholtz, all-Dirichlet
+        let u = nodal(&mesh, |x, y, z| (2.1 * x + 1.0).sin() * (1.7 * y).cos() * (0.9 * z + 0.3).sin());
+        let v = nodal(&mesh, |x, y, z| (1.3 * x).cos() * (2.2 * y + 0.4).sin() * (1.1 * z).cos());
+        let au = a.apply(&u);
+        let av = a.apply(&v);
+        let uav: f64 = u.iter().zip(&av).map(|(a, b)| a * b).sum();
+        let vau: f64 = v.iter().zip(&au).map(|(a, b)| a * b).sum();
+        let rel = (uav - vau).abs() / uav.abs().max(1e-300);
+        assert!(rel < 1e-11, "asymmetry rel={rel:.3e} (⟨u,Av⟩={uav}, ⟨v,Au⟩={vau})");
     }
 
     #[test]

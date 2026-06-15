@@ -170,6 +170,9 @@ impl<'m, L: ConservationLaw3d> Hyperbolic3d<'m, L> {
                                 }
                             }
                         }
+                        Neighbor3::CoarseToFine { .. } | Neighbor3::FineToCoarse { .. } => {
+                            unreachable!("3D non-conforming AMR is not supported in Hyperbolic3d")
+                        }
                     }
                 }
             }

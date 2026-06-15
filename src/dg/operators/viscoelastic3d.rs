@@ -80,6 +80,9 @@ pub fn upwind_advection_lift3(
                     Neighbor3::Boundary { tag } => {
                         bdry(*tag).unwrap_or(std::array::from_fn(|v| field[v][g]))
                     }
+                    Neighbor3::CoarseToFine { .. } | Neighbor3::FineToCoarse { .. } => {
+                        unreachable!("3D non-conforming AMR is not supported in the viscoelastic upwind lift")
+                    }
                 };
                 let fac = face.sw[a] * un / el.geom.jw[vl];
                 for comp in 0..6 {

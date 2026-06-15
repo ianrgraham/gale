@@ -49,6 +49,68 @@ impl RefineHex {
         }
     }
 
+    /// **Hex-face mortar**: project a coarse hex-face trace (`n²` nodes in tensor order
+    /// `ia + ib·n`) onto the fine quarter-face `(ha, hb) ∈ {0,1}²` — the 2D analogue of
+    /// [`RefineQuad::mortar_to_fine`](super::amr::RefineQuad::mortar_to_fine), the tensor product
+    /// `P_ha ⊗ P_hb` of the two 1D mortar matrices (`P_0 = p_left`, `P_1 = p_right`). Exact for
+    /// degree ≤ p. Used to give a coarse hex's flux to one of its four refined face-neighbours.
+    pub fn mortar_to_fine_face(&self, coarse: &[f64], ha: usize, hb: usize) -> Vec<f64> {
+        let n = self.order + 1;
+        let (pa, pb) = (self.axis(ha), self.axis(hb));
+        let mut tmp = vec![0.0; n * n]; // tmp[ia, jb] = Σ_ja pa[ia,ja] coarse[ja, jb]
+        for jb in 0..n {
+            for ia in 0..n {
+                let mut s = 0.0;
+                for ja in 0..n {
+                    s += pa[ia * n + ja] * coarse[ja + jb * n];
+                }
+                tmp[ia + jb * n] = s;
+            }
+        }
+        let mut out = vec![0.0; n * n]; // out[ia, ib] = Σ_jb pb[ib,jb] tmp[ia, jb]
+        for ib in 0..n {
+            for ia in 0..n {
+                let mut s = 0.0;
+                for jb in 0..n {
+                    s += pb[ib * n + jb] * tmp[ia + jb * n];
+                }
+                out[ia + ib * n] = s;
+            }
+        }
+        out
+    }
+
+    /// Transpose of [`mortar_to_fine_face`] for quarter `(ha, hb)`: `out[ja,jb] = Σ_{ia,ib}
+    /// P_ha[ia,ja]·P_hb[ib,jb]·v[ia,ib]`, the adjoint `(P_ha ⊗ P_hb)ᵀ`. Scatters already-
+    /// quadrature-weighted fine-face contributions back to the coarse test nodes (keeps the SIPG
+    /// operator symmetric, `P`/`Pᵀ` an adjoint pair) — the 2D analogue of
+    /// [`RefineQuad::mortar_gather`](super::amr::RefineQuad::mortar_gather).
+    pub fn mortar_gather_face(&self, v: &[f64], ha: usize, hb: usize) -> Vec<f64> {
+        let n = self.order + 1;
+        let (pa, pb) = (self.axis(ha), self.axis(hb));
+        let mut tmp = vec![0.0; n * n]; // tmp[ja, ib] = Σ_ia pa[ia,ja] v[ia, ib]
+        for ib in 0..n {
+            for ja in 0..n {
+                let mut s = 0.0;
+                for ia in 0..n {
+                    s += pa[ia * n + ja] * v[ia + ib * n];
+                }
+                tmp[ja + ib * n] = s;
+            }
+        }
+        let mut out = vec![0.0; n * n]; // out[ja, jb] = Σ_ib pb[ib,jb] tmp[ja, ib]
+        for jb in 0..n {
+            for ja in 0..n {
+                let mut s = 0.0;
+                for ib in 0..n {
+                    s += pb[ib * n + jb] * tmp[ja + ib * n];
+                }
+                out[ja + jb * n] = s;
+            }
+        }
+        out
+    }
+
     /// Prolong a parent nodal field to child `(cx, cy, cz)`. Exact for degree ≤ p.
     pub fn prolong(&self, parent: &[f64], cx: usize, cy: usize, cz: usize) -> Vec<f64> {
         let n = self.order + 1;
@@ -237,6 +299,36 @@ mod tests {
     use super::*;
 
     const P: usize = 3;
+
+    #[test]
+    fn face_mortar_is_exact_and_adjoint() {
+        let rh = RefineHex::new(P);
+        let n = P + 1;
+        let nodes = Reference1d::new(P).nodes;
+        // A polynomial of degree ≤ P in each variable ⇒ the mortar projection is exact.
+        let f = |x: f64, y: f64| 1.0 - 0.5 * x + 2.0 * y + x * y - 0.3 * x * x * y + 0.7 * x * x * x;
+        let coarse: Vec<f64> = (0..n * n).map(|k| f(nodes[k % n], nodes[k / n])).collect();
+        for hb in 0..2 {
+            for ha in 0..2 {
+                let fine = rh.mortar_to_fine_face(&coarse, ha, hb);
+                let (sa, sb) = (if ha == 0 { -1.0 } else { 1.0 }, if hb == 0 { -1.0 } else { 1.0 });
+                for ib in 0..n {
+                    for ia in 0..n {
+                        let want = f(0.5 * (nodes[ia] + sa), 0.5 * (nodes[ib] + sb));
+                        assert!((fine[ia + ib * n] - want).abs() < 1e-12, "mortar not exact");
+                    }
+                }
+                // Adjoint: ⟨P·c, v⟩ = ⟨c, Pᵀ·v⟩ for arbitrary c, v.
+                let cc: Vec<f64> = (0..n * n).map(|k| (0.31 * k as f64 + 1.0).sin()).collect();
+                let vv: Vec<f64> = (0..n * n).map(|k| (0.17 * k as f64 + 0.5).cos()).collect();
+                let pc = rh.mortar_to_fine_face(&cc, ha, hb);
+                let ptv = rh.mortar_gather_face(&vv, ha, hb);
+                let lhs: f64 = pc.iter().zip(&vv).map(|(a, b)| a * b).sum();
+                let rhs: f64 = cc.iter().zip(&ptv).map(|(a, b)| a * b).sum();
+                assert!((lhs - rhs).abs() < 1e-12, "mortar P/Pᵀ not adjoint: {lhs} vs {rhs}");
+            }
+        }
+    }
 
     fn child_node_coords(order: usize, cx: usize, cy: usize, cz: usize) -> Vec<[f64; 3]> {
         // Child reference nodes mapped into the parent reference cube.
