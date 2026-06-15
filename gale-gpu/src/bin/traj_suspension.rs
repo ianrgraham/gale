@@ -14,20 +14,25 @@ use gale_traj::TrajectoryWriter;
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
+fn env_f64(k: &str, d: f64) -> f64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p = 4;
-    let (nx, ny) = (8usize, 8usize);
+    let n = env_usize("TRAJ_N", 16); // square mesh n×n (TRAJ_N to override)
+    let (nx, ny) = (n, n);
     let mesh = Mesh2d::rectangular(p, nx, ny, [0.0, 1.0], [0.0, 1.0]);
     let nn = mesh.refq.n_nodes();
     let ne = mesh.n_elements();
     let ndof = ne * nn;
     let r = 0.10;
-    // Finer mesh than the 3×3 check ⇒ smaller dt for the explicit convection CFL.
-    let (rho_s, eta_b, dt, nu) = (20.0, 1e-3, 1.5e-3, 0.1);
+    // Finer mesh ⇒ smaller dt for the explicit convection CFL.
+    let (rho_s, eta_b, nu) = (20.0, 1e-3, 0.1);
+    let dt = env_f64("TRAJ_DT", 8e-4);
     let (rep_k, rep_range) = (40.0, 0.06);
-    let steps = env_usize("TRAJ_STEPS", 240);
-    let every = env_usize("TRAJ_EVERY", 3);
+    let steps = env_usize("TRAJ_STEPS", 400);
+    let every = env_usize("TRAJ_EVERY", 4);
     let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/suspension.h5".to_string());
     let inflow = |_: f64, _: f64, _: f64| 1.0;
     let zero = |_: f64, _: f64, _: f64| 0.0;

@@ -7,7 +7,7 @@
 //! View: python gale-traj/python/view_traj.py /tmp/cylinder.h5 --field u --comp mag --gif
 
 use gale::dg::{
-    CircleLevelSet, Mesh2d, ShiftedBoundary, ShiftedMultigrid, ShiftedPoisson,
+    sbm_reconstruct, CircleLevelSet, Mesh2d, ShiftedBoundary, ShiftedMultigrid, ShiftedPoisson,
 };
 use gale_gpu::operators::poisson::GpuPoissonMg;
 use gale_traj::TrajectoryWriter;
@@ -22,10 +22,10 @@ fn env_f64(k: &str, d: f64) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p = 3;
     let (h, um, nu) = (0.41, 0.3, 0.001);
-    let ny = env_usize("SBM_NY", 24); // finer than the validation default (16) for a smoother cylinder
+    let ny = env_usize("SBM_NY", 32); // finer than the validation default (16) for a smoother cylinder
     let nx = ((2.2 / h) * ny as f64).round() as usize;
-    let dt = env_f64("SBM_DT", 2.5e-3);
-    let steps = env_usize("TRAJ_STEPS", 800);
+    let dt = env_f64("SBM_DT", 2e-3);
+    let steps = env_usize("TRAJ_STEPS", 1000);
     let every = env_usize("TRAJ_EVERY", 10);
     let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/cylinder.h5".to_string());
     let alpha = 5.0;
@@ -90,28 +90,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => TrajectoryWriter::create(&out, p, 2)?,
     };
     let topo = tw.write_mesh2d(&mesh)?;
-    // The cylinder is a fixed embedded boundary — record it as a body so the viewer draws a smooth
-    // filled disk over it (rather than the blocky element-staircase a masked hole would give).
+    // The cylinder is a fixed embedded boundary — record it at its TRUE radius so the viewer masks a
+    // smooth circle of the correct size. (The near-wall velocity → 0 at the no-slip boundary is real
+    // physics, not an artifact, so it is shown rather than hidden behind an inflated disk.)
     tw.write_body_radii(&[r])?;
     let pose = [[cx, cy, 0.0]];
-    // Pack (ux,uy) → [ne,nn,2] f32. Mask NODES inside the true cylinder (not whole elements) with
-    // NaN: the viewer drops sub-quads touching them, so the hole follows the circle at NODE
-    // resolution (dense at p=3) instead of the blocky element staircase. The smooth body disk drawn
-    // on top sits exactly on this near-circular hole.
+    // Pack (ux,uy) → [ne,nn,2] f32. ACTIVE (fluid) elements keep their real SBM values. For the
+    // INACTIVE elements that straddle the boundary, `sbm_reconstruct` fills the FLUID side of the gap
+    // (between the staircased surrogate edge and the true circle) with the field the SBM itself
+    // implies there: a 2nd-order Taylor extrapolation (value + ∇ + Hessian) from the nearest
+    // surrogate node — the same high-order reconstruction `sbm_force_torque` uses for drag. The SOLID
+    // side (φ<0) stays NaN ⇒ blank. The viewer then cuts a clean circle of the TRUE radius in the
+    // shader. Net effect: the boundary layer renders smoothly right up to the real cylinder surface,
+    // with no staircase sliver and no fudged geometry — the gap shows the SBM's own implied field.
     let pack = |hux: &[f64], huy: &[f64]| -> Vec<f32> {
+        let rux = sbm_reconstruct(&mesh, &sb, &ls, hux);
+        let ruy = sbm_reconstruct(&mesh, &sb, &ls, huy);
         let mut v = vec![0f32; ndof * 2];
-        for (e, el) in mesh.elements.iter().enumerate() {
-            for k in 0..nn {
-                let g = e * nn + k;
-                let (px, py) = (el.geom.x[k] - cx, el.geom.y[k] - cy);
-                if px * px + py * py < r * r {
-                    v[g * 2] = f32::NAN;
-                    v[g * 2 + 1] = f32::NAN;
-                } else {
-                    v[g * 2] = hux[g] as f32;
-                    v[g * 2 + 1] = huy[g] as f32;
-                }
-            }
+        for g in 0..ndof {
+            v[g * 2] = rux[g] as f32;
+            v[g * 2 + 1] = ruy[g] as f32;
         }
         v
     };

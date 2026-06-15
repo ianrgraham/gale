@@ -13,15 +13,20 @@ use gale_traj::TrajectoryWriter;
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
+fn env_f64(k: &str, d: f64) -> f64 {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (p, alpha) = (4usize, 5.0);
-    let (nx, ny) = (16usize, 16usize);
-    let (nu, dt) = (0.05, 5e-3);
+    let n = env_usize("TRAJ_N", 32); // square mesh n×n (TRAJ_N to override)
+    let (nx, ny) = (n, n);
+    let nu = 0.05;
+    let dt = env_f64("TRAJ_DT", 2e-3);
     let lambda = 1.0 / (nu * dt);
     let (tol, maxit) = (1e-7, 2000);
-    let steps = env_usize("TRAJ_STEPS", 600);
-    let every = env_usize("TRAJ_EVERY", 10);
+    let steps = env_usize("TRAJ_STEPS", 1000);
+    let every = env_usize("TRAJ_EVERY", 12);
     let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/lid.h5".to_string());
     let xr = [0.0, 1.0];
     let yr = [0.0, 1.0];

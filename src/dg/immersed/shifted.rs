@@ -256,6 +256,77 @@ pub fn sbm_force_torque(
     (fx, fy, t)
 }
 
+/// **SBM near-wall reconstruction for visualization.** Returns a copy of the scalar nodal `field`
+/// in which the thin fluid gap between the staircased surrogate boundary and the TRUE boundary is
+/// filled by 2nd-order Taylor extrapolation from the nearest surrogate node (value + gradient +
+/// Hessian — the same high-order extrapolation [`sbm_force_torque`] uses to reach the true boundary),
+/// and solid-side nodes (`phi < 0`) are set to NaN so a viewer can blank them. Active-element nodes
+/// keep their solved values.
+///
+/// This lets the boundary layer render smoothly down to the true boundary instead of stopping at the
+/// surrogate staircase. It is the field SBM already *implies* in the gap (the method enforces the BC
+/// by exactly this extrapolation), so it is a faithful reconstruction — accurate over the ≲1-element
+/// shift, the regime SBM is designed for — not an invented fill. Visualization only; never feed the
+/// reconstructed field back into a solve.
+pub fn sbm_reconstruct(mesh: &Mesh2d, sb: &ShiftedBoundary, ls: &impl LevelSet, field: &[f64]) -> Vec<f64> {
+    let nn = mesh.refq.n_nodes();
+    let grad = |f: &[f64], comp: usize| -> Vec<f64> {
+        let mut g = vec![0.0; mesh.n_elements() * nn];
+        for (e, el) in mesh.elements.iter().enumerate() {
+            let sl = &f[e * nn..(e + 1) * nn];
+            let gv = if comp == 0 { el.geom.grad_x(&mesh.refq, sl) } else { el.geom.grad_y(&mesh.refq, sl) };
+            g[e * nn..(e + 1) * nn].copy_from_slice(&gv);
+        }
+        g
+    };
+    let (gx, gy) = (grad(field, 0), grad(field, 1));
+    let (gxx, gxy) = (grad(&gx, 0), grad(&gx, 1)); // ∂²f/∂x², ∂²f/∂x∂y
+    let (gyx, gyy) = (grad(&gy, 0), grad(&gy, 1)); // ∂²f/∂y∂x, ∂²f/∂y²
+    // Taylor sources at each surrogate node: [x, y, f, fx, fy, fxx, fxy, fyy] (fxy symmetrized).
+    let mut src: Vec<[f64; 8]> = Vec::new();
+    for sf in &sb.faces {
+        let e = sf.elem;
+        for sn in &sf.nodes {
+            let i = e * nn + sn.node;
+            src.push([sn.x, sn.y, field[i], gx[i], gy[i], gxx[i], 0.5 * (gxy[i] + gyx[i]), gyy[i]]);
+        }
+    }
+    let eval = |x: f64, y: f64| -> f64 {
+        // 2nd-order Taylor (value + ∇ + Hessian) from the nearest surrogate node.
+        let mut best = f64::INFINITY;
+        let mut val = f64::NAN;
+        for s in &src {
+            let (dx, dy) = (x - s[0], y - s[1]);
+            let d2 = dx * dx + dy * dy;
+            if d2 < best {
+                best = d2;
+                val = s[2] + s[3] * dx + s[4] * dy + 0.5 * (s[5] * dx * dx + 2.0 * s[6] * dx * dy + s[7] * dy * dy);
+            }
+        }
+        val
+    };
+    let mut out = field.to_vec();
+    for (e, el) in mesh.elements.iter().enumerate() {
+        if sb.active[e] {
+            continue; // solved fluid element — keep as-is
+        }
+        // An inactive element that has ANY fluid node (φ≥0) straddles the true boundary: the smooth
+        // circle cuts through it. Reconstruct ALL its nodes (both sides) so the renderer drops no
+        // sub-cells — the fluid gap then tessellates continuously up to the boundary and the viewer's
+        // exact-circle shader mask cuts the true surface, with no leftover element staircase. The
+        // solid-side reconstructed values fall inside the true circle, so they are never displayed;
+        // they only keep the straddling sub-cells finite. A fully-solid element (all nodes φ<0) lies
+        // entirely inside the convex disk, so it is invisible behind the mask ⇒ leave it NaN (blank),
+        // which also keeps its meaningless deep-extrapolation out of the colour range.
+        let straddles = (0..nn).any(|k| ls.phi(el.geom.x[k], el.geom.y[k]) >= 0.0);
+        for k in 0..nn {
+            let g = e * nn + k;
+            out[g] = if straddles { eval(el.geom.x[k], el.geom.y[k]) } else { f64::NAN };
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
