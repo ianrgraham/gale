@@ -28,12 +28,35 @@ autodiff = []
 # graph-capture gate itself PASSES (cuda-oxide coop_capture_spike), the blocker is the LTO
 # atomic lowering. Keeping the kernel out of the default bundle keeps module load working.
 dot_coop = []
+# HDF5 trajectory dumping for the GPU sim demos (the `traj-*` bins). OFF by default so the
+# default device build never pulls the (statically-linked) libhdf5 C dependency; enable with
+# `cargo oxide run --features traj --bin traj-cylinder` etc.
+traj = ["dep:gale-traj"]
 
 [dependencies]
 gale = { path = ".." }
+gale-traj = { path = "../gale-traj", optional = true }
 cuda-device = { workspace = true }
 cuda-host = { workspace = true }
 cuda-core = { workspace = true }
+
+# GPU-sim trajectory dumps → one HDF5 file each, viewed via gale-traj/python/view_traj.py.
+# Gated behind the `traj` feature (pulls libhdf5). Run e.g.:
+#   cargo oxide run --features traj --bin traj-cylinder
+[[bin]]
+name = "traj-cylinder"
+path = "src/bin/traj_cylinder.rs"
+required-features = ["traj"]
+
+[[bin]]
+name = "traj-suspension"
+path = "src/bin/traj_suspension.rs"
+required-features = ["traj"]
+
+[[bin]]
+name = "traj-lid"
+path = "src/bin/traj_lid.rs"
+required-features = ["traj"]
 
 # Cross-crate validation: a consumer binary that calls the library kernel and
 # checks it against gale's CPU oracle (exercises the dependency-rlib link path).

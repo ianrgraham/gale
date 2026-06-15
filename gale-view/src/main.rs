@@ -1,0 +1,495 @@
+//! GPU (wgpu) renderer for gale HDF5 trajectories. Reads the same files the Python viewer does
+//! (single file or a split `<stem>.NNNN.h5` set), tessellates each high-order DG element on the CPU
+//! (per-element ⇒ inter-element jumps show; masked sub-quads dropped → clean holes), colors it on the
+//! GPU with the Turbo colormap, and draws rigid bodies as white circle outlines.
+//!
+//! Two modes:
+//!   - **offscreen** (default): render a frame (or `--all`) to PNG — runs headless via Vulkan.
+//!   - **`--window`**: interactive winit window (needs a display; intended for a workstation, e.g.
+//!     viewing an SSHFS-mounted trajectory from a remote sim machine). Arrow keys scrub, Space
+//!     play/pause, Home/End jump. `--watch` polls a split set for new files and appends them live,
+//!     so you can watch a running sim (point it at the `<stem>.0000.h5` of a split run).
+//!
+//! Usage: gale-view <traj.h5> [--field u] [--comp 0|mag] [--frame N|--all] [--out P] [--height H]
+//!                            [--window] [--watch] [--fps F]
+
+use bytemuck::{Pod, Zeroable};
+use std::borrow::Cow;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Vertex { pos: [f32; 2], val: f32 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct LineVertex { pos: [f32; 2] }
+
+struct Args {
+    path: String,
+    field: String,
+    comp: String,
+    frame: Option<usize>,
+    all: bool,
+    out: Option<String>,
+    height: u32,
+    window: bool,
+    watch: bool,
+    fps: u32,
+}
+
+fn parse_args() -> Args {
+    let mut a = Args { path: String::new(), field: "u".into(), comp: "0".into(), frame: None, all: false, out: None, height: 600, window: false, watch: false, fps: 20 };
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--field" => a.field = it.next().unwrap(),
+            "--comp" => a.comp = it.next().unwrap(),
+            "--frame" => a.frame = Some(it.next().unwrap().parse().unwrap()),
+            "--all" => a.all = true,
+            "--out" => a.out = Some(it.next().unwrap()),
+            "--height" => a.height = it.next().unwrap().parse().unwrap(),
+            "--window" => a.window = true,
+            "--watch" => a.watch = true,
+            "--fps" => a.fps = it.next().unwrap().parse().unwrap(),
+            _ => a.path = arg,
+        }
+    }
+    if a.path.is_empty() {
+        eprintln!("usage: gale-view <traj.h5> [--field u] [--comp 0|mag] [--frame N|--all] [--out P] [--height H] [--window] [--watch] [--fps F]");
+        std::process::exit(2);
+    }
+    a
+}
+
+// ---- trajectory file set (single file or split <stem>.NNNN.h5) ------------------------------------
+
+/// If `fname` is `<base>.NNNN.h5` (4-digit index), return `<base>`.
+fn member_base(fname: &str) -> Option<String> {
+    let s = fname.strip_suffix(".h5")?;
+    let (base, num) = s.rsplit_once('.')?;
+    (num.len() == 4 && num.bytes().all(|c| c.is_ascii_digit())).then(|| base.to_string())
+}
+
+/// List the trajectory file paths (sorted) + the stem, for a single `.h5`, a split-set member, or a
+/// bare stem. Re-run to discover files added since (for `--watch`).
+fn list_set(path: &str) -> (Vec<String>, String) {
+    let p = std::path::Path::new(path);
+    let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or(path);
+    let glob_base = |base: &str| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).ok().into_iter().flatten()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| member_base(n).as_deref() == Some(base))
+            .map(|n| dir.join(n).to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    if let Some(base) = member_base(fname) {
+        (glob_base(&base), dir.join(&base).to_string_lossy().into_owned())
+    } else if p.exists() {
+        (vec![path.to_string()], path.trim_end_matches(".h5").to_string())
+    } else {
+        let base = fname.strip_suffix(".h5").unwrap_or(fname);
+        (glob_base(base), dir.join(base).to_string_lossy().into_owned())
+    }
+}
+
+// ---- CPU tessellation ----------------------------------------------------------------------------
+
+struct Tess {
+    pos_ndc: Vec<[f32; 2]>,
+    raw: Vec<f32>,
+    indices: Vec<u32>,
+    width: u32,
+    height: u32,
+    bounds: [f32; 4], // x0, y0, dx, dy
+}
+
+fn tessellate(nodes: &[f32], field: &[f32], ne: usize, nn: usize, nc: usize, comp: &str, height: u32) -> Tess {
+    let n1 = (nn as f64).sqrt().round() as usize;
+    let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+    for k in 0..ne * nn {
+        let (x, y) = (nodes[k * 2], nodes[k * 2 + 1]);
+        x0 = x0.min(x); x1 = x1.max(x); y0 = y0.min(y); y1 = y1.max(y);
+    }
+    let (dx, dy) = ((x1 - x0).max(1e-9), (y1 - y0).max(1e-9));
+    let width = ((height as f32) * dx / dy).round().max(1.0) as u32;
+    let value = |g: usize| -> f32 {
+        if comp == "mag" {
+            let mut s = 0.0f32;
+            for c in 0..nc { let v = field[g * nc + c]; s += v * v; }
+            s.sqrt()
+        } else {
+            field[g * nc + comp.parse::<usize>().unwrap_or(0)]
+        }
+    };
+    let mut pos_ndc = Vec::with_capacity(ne * nn);
+    let mut raw = Vec::with_capacity(ne * nn);
+    for k in 0..ne * nn {
+        let (x, y) = (nodes[k * 2], nodes[k * 2 + 1]);
+        pos_ndc.push([(x - x0) / dx * 2.0 - 1.0, (y - y0) / dy * 2.0 - 1.0]);
+        raw.push(value(k));
+    }
+    let mut indices = Vec::with_capacity(ne * (n1 - 1) * (n1 - 1) * 6);
+    for e in 0..ne {
+        let base = e * nn;
+        for b in 0..n1 - 1 {
+            for aa in 0..n1 - 1 {
+                let (k00, k10, k01, k11) =
+                    (base + b * n1 + aa, base + b * n1 + aa + 1, base + (b + 1) * n1 + aa, base + (b + 1) * n1 + aa + 1);
+                if !(raw[k00].is_finite() && raw[k10].is_finite() && raw[k01].is_finite() && raw[k11].is_finite()) {
+                    continue;
+                }
+                for k in [k00, k10, k11, k00, k11, k01] { indices.push(k as u32); }
+            }
+        }
+    }
+    Tess { pos_ndc, raw, indices, width, height, bounds: [x0, y0, dx, dy] }
+}
+
+fn body_lines(poses: &[f64], radii: &[f64], bounds: [f32; 4]) -> Vec<LineVertex> {
+    let [x0, y0, dx, dy] = bounds;
+    let to_ndc = |x: f64, y: f64| LineVertex { pos: [((x as f32 - x0) / dx) * 2.0 - 1.0, ((y as f32 - y0) / dy) * 2.0 - 1.0] };
+    let nb = poses.len() / 3;
+    const SEG: usize = 64;
+    let mut v = Vec::new();
+    for i in 0..nb {
+        let (cx, cy, phi) = (poses[i * 3], poses[i * 3 + 1], poses[i * 3 + 2]);
+        let r = radii.get(i).copied().unwrap_or(*radii.first().unwrap_or(&0.0));
+        for s in 0..SEG {
+            let (t0, t1) = (std::f64::consts::TAU * s as f64 / SEG as f64, std::f64::consts::TAU * (s + 1) as f64 / SEG as f64);
+            v.push(to_ndc(cx + r * t0.cos(), cy + r * t0.sin()));
+            v.push(to_ndc(cx + r * t1.cos(), cy + r * t1.sin()));
+        }
+        v.push(to_ndc(cx, cy));
+        v.push(to_ndc(cx + r * phi.cos(), cy + r * phi.sin()));
+    }
+    v
+}
+
+// ---- HDF5 read ---------------------------------------------------------------------------------
+
+fn read_radii(h: &hdf5::File) -> Vec<f64> {
+    h.dataset("bodies/radius").and_then(|d| d.read_raw()).unwrap_or_default()
+}
+
+/// (nodes, field, ne, nn, nc, body_poses) for frame `key` in file `h`.
+fn read_frame(h: &hdf5::File, key: &str, field: &str) -> (Vec<f32>, Vec<f32>, usize, usize, usize, Vec<f64>) {
+    let g = h.group(&format!("frames/{key}")).unwrap();
+    let tid: u64 = g.attr("topology").unwrap().read_scalar().unwrap();
+    let tg = h.group(&format!("topology/{tid}")).unwrap();
+    let ne: u64 = tg.attr("ne").unwrap().read_scalar().unwrap();
+    let nn: u64 = tg.attr("nn").unwrap().read_scalar().unwrap();
+    let nodes: Vec<f32> = tg.dataset("elem_nodes").unwrap().read_raw().unwrap();
+    let ds = g.dataset(field).unwrap();
+    let nc = ds.shape()[2];
+    let fld: Vec<f32> = ds.read_raw().unwrap();
+    let poses: Vec<f64> = g.dataset("body_pose").and_then(|d| d.read_raw()).unwrap_or_default();
+    (nodes, fld, ne as usize, nn as usize, nc, poses)
+}
+
+/// Open the file paths and build the global ordered frame list (file_index, frame_key).
+fn open_frames(paths: &[String]) -> (Vec<hdf5::File>, Vec<(usize, String)>) {
+    let handles: Vec<hdf5::File> = paths.iter().map(|p| hdf5::File::open(p).expect("open h5")).collect();
+    let mut frames = Vec::new();
+    for (hi, h) in handles.iter().enumerate() {
+        let mut keys = h.group("frames").unwrap().member_names().unwrap();
+        keys.sort();
+        for k in keys { frames.push((hi, k)); }
+    }
+    (handles, frames)
+}
+
+// ---- GPU ----------------------------------------------------------------------------------------
+
+const SHADER: &str = r#"
+struct VsOut { @builtin(position) clip: vec4<f32>, @location(0) val: f32 };
+@vertex
+fn vs_main(@location(0) pos: vec2<f32>, @location(1) val: f32) -> VsOut {
+    var o: VsOut; o.clip = vec4<f32>(pos, 0.0, 1.0); o.val = val; return o;
+}
+fn turbo(t: f32) -> vec3<f32> {
+    let x = clamp(t, 0.0, 1.0);
+    let v4 = vec4<f32>(1.0, x, x * x, x * x * x);
+    let v2 = vec2<f32>(v4.z, v4.w) * v4.z;
+    let r = dot(v4, vec4<f32>(0.13572138, 4.61539260, -42.66032258, 132.13108234)) + dot(v2, vec2<f32>(-152.94239396, 59.28637943));
+    let g = dot(v4, vec4<f32>(0.09140261, 2.19418839, 4.84296658, -14.18503333)) + dot(v2, vec2<f32>(4.27729857, 2.82956604));
+    let b = dot(v4, vec4<f32>(0.10667330, 12.64194608, -60.58204836, 110.36276771)) + dot(v2, vec2<f32>(-89.90310912, 27.34824973));
+    return clamp(vec3<f32>(r, g, b), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.val != in.val) { discard; }
+    return vec4<f32>(turbo(in.val), 1.0);
+}
+@vertex
+fn vs_line(@location(0) pos: vec2<f32>) -> @builtin(position) vec4<f32> { return vec4<f32>(pos, 0.0, 1.0); }
+@fragment
+fn fs_line() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }
+"#;
+
+fn make_pipelines(device: &wgpu::Device, format: wgpu::TextureFormat) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)) });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[], push_constant_ranges: &[] });
+    let target = wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL };
+    let field = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("field"), layout: Some(&layout),
+        vertex: wgpu::VertexState { module: &shader, entry_point: "vs_main", buffers: &[wgpu::VertexBufferLayout {
+            array_stride: 12, step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }, wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 8, shader_location: 1 }],
+        }], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_main", targets: &[Some(target.clone())], compilation_options: Default::default() }),
+        primitive: wgpu::PrimitiveState::default(), depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
+    });
+    let line = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("line"), layout: Some(&layout),
+        vertex: wgpu::VertexState { module: &shader, entry_point: "vs_line", buffers: &[wgpu::VertexBufferLayout {
+            array_stride: 8, step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 }],
+        }], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: "fs_line", targets: &[Some(target)], compilation_options: Default::default() }),
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
+        depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
+    });
+    (field, line)
+}
+
+/// Letterbox viewport (x, y, w, h) fitting domain aspect `dx/dy` inside a `win_w × win_h` frame.
+fn fit_viewport(win_w: f32, win_h: f32, dx: f32, dy: f32) -> (f32, f32, f32, f32) {
+    let (ad, aw) = (dx / dy, win_w / win_h);
+    if aw > ad {
+        let w = win_h * ad;
+        ((win_w - w) * 0.5, 0.0, w, win_h)
+    } else {
+        let h = win_w / ad;
+        (0.0, (win_h - h) * 0.5, win_w, h)
+    }
+}
+
+fn vertices(t: &Tess, vmin: f32, vmax: f32) -> Vec<Vertex> {
+    t.pos_ndc.iter().zip(&t.raw).map(|(&pos, &v)| Vertex { pos, val: (v - vmin) / (vmax - vmin) }).collect()
+}
+
+// ---- offscreen (PNG) ---------------------------------------------------------------------------
+
+fn render_png(device: &wgpu::Device, queue: &wgpu::Queue, field_pl: &wgpu::RenderPipeline, line_pl: &wgpu::RenderPipeline, verts: &[Vertex], indices: &[u32], lines: &[LineVertex], w: u32, h: u32, out: &str) {
+    use wgpu::util::DeviceExt;
+    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(verts), usage: wgpu::BufferUsages::VERTEX });
+    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(indices), usage: wgpu::BufferUsages::INDEX });
+    let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(lines), usage: wgpu::BufferUsages::VERTEX }));
+    let tex = device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
+    let view = tex.create_view(&Default::default());
+    let unpadded = w * 4;
+    let padded = unpadded.div_ceil(256) * 256;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (padded * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+        rp.set_pipeline(field_pl);
+        rp.set_vertex_buffer(0, vbuf.slice(..));
+        rp.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+        rp.draw_indexed(0..indices.len() as u32, 0, 0..1);
+        if let Some(lbuf) = &lbuf { rp.set_pipeline(line_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..lines.len() as u32, 0..1); }
+    }
+    enc.copy_texture_to_buffer(wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All }, wgpu::ImageCopyBuffer { buffer: &readback, layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h) } }, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+    queue.submit([enc.finish()]);
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let data = slice.get_mapped_range();
+    let mut img = vec![0u8; (unpadded * h) as usize];
+    for row in 0..h as usize { let (s, d) = (row * padded as usize, row * unpadded as usize); img[d..d + unpadded as usize].copy_from_slice(&data[s..s + unpadded as usize]); }
+    drop(data); readback.unmap();
+    image::save_buffer(out, &img, w, h, image::ColorType::Rgba8).expect("save png");
+}
+
+/// Global color range over all frames in the set (stable coloring while scrubbing).
+fn color_range(handles: &[hdf5::File], frames: &[(usize, String)], field: &str, comp: &str) -> (f32, f32) {
+    let (mut vmin, mut vmax) = (f32::MAX, f32::MIN);
+    for (hi, key) in frames {
+        let (_n, fld, ne, nn, nc, _p) = read_frame(&handles[*hi], key, field);
+        let t = tessellate(&_n, &fld, ne, nn, nc, comp, 2);
+        for &v in &t.raw { if v.is_finite() { vmin = vmin.min(v); vmax = vmax.max(v); } }
+    }
+    if vmin < vmax { (vmin, vmax) } else { (0.0, 1.0) }
+}
+
+fn run_offscreen(args: &Args) {
+    let (paths, stem) = list_set(&args.path);
+    let (handles, frames) = open_frames(&paths);
+    let radii = read_radii(&handles[0]);
+    let nfr = frames.len();
+    let prefix = args.out.clone().unwrap_or(stem);
+    println!("{nfr} frames across {} file(s), field='{}' comp={}", handles.len(), args.field, args.comp);
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN | wgpu::Backends::GL, ..Default::default() });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: None, force_fallback_adapter: false })).expect("no wgpu adapter");
+    println!("renderer: {} [{:?}]", adapter.get_info().name, adapter.get_info().backend);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: Default::default() }, None)).unwrap();
+    let (field_pl, line_pl) = make_pipelines(&device, wgpu::TextureFormat::Rgba8Unorm);
+
+    let to_render: Vec<usize> = if args.all { (0..nfr).collect() } else { vec![args.frame.unwrap_or(nfr - 1)] };
+    let render_frames: Vec<(usize, String)> = to_render.iter().map(|&i| frames[i].clone()).collect();
+    let (vmin, vmax) = color_range(&handles, &render_frames, &args.field, &args.comp);
+    println!("value range [{vmin:.4}, {vmax:.4}]");
+    for &i in &to_render {
+        let (hi, key) = &frames[i];
+        let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, &args.field);
+        let t = tessellate(&nodes, &fld, ne, nn, nc, &args.comp, args.height);
+        let lines = if poses.is_empty() || radii.is_empty() { Vec::new() } else { body_lines(&poses, &radii, t.bounds) };
+        let verts = vertices(&t, vmin, vmax);
+        let out = if args.all { format!("{prefix}_{:06}.png", i) } else { format!("{prefix}_wgpu.png") };
+        render_png(&device, &queue, &field_pl, &line_pl, &verts, &t.indices, &lines, t.width, t.height, &out);
+        println!("wrote {out}  ({}×{})", t.width, t.height);
+    }
+}
+
+// ---- interactive window ------------------------------------------------------------------------
+
+/// GPU buffers for the current frame.
+struct FrameBuffers {
+    vbuf: wgpu::Buffer,
+    ibuf: wgpu::Buffer,
+    nidx: u32,
+    lbuf: Option<wgpu::Buffer>,
+    nline: u32,
+    bounds: [f32; 4],
+}
+
+fn run_window(args: Args) {
+    use wgpu::util::DeviceExt;
+    use winit::event::{ElementState, Event, WindowEvent};
+    use winit::event_loop::{ControlFlow, EventLoop};
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    use winit::window::WindowBuilder;
+
+    let (mut paths, _stem) = list_set(&args.path);
+    let (mut handles, mut frames) = open_frames(&paths);
+    let radii = read_radii(&handles[0]);
+    let (vmin, vmax) = color_range(&handles, &frames, &args.field, &args.comp);
+    println!("{} frames, value range [{vmin:.4}, {vmax:.4}]  (←/→ scrub, Space play, Home/End, Esc quit)", frames.len());
+
+    let event_loop = EventLoop::new().unwrap();
+    let window = Arc::new(WindowBuilder::new().with_title("gale-view").build(&event_loop).unwrap());
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN | wgpu::Backends::GL, ..Default::default() });
+    let surface = instance.create_surface(window.clone()).unwrap();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, compatible_surface: Some(&surface), force_fallback_adapter: false })).expect("no wgpu adapter");
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::downlevel_defaults(), memory_hints: Default::default() }, None)).unwrap();
+    let caps = surface.get_capabilities(&adapter);
+    let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+    let size = window.inner_size();
+    let mut config = wgpu::SurfaceConfiguration { usage: wgpu::TextureUsages::RENDER_ATTACHMENT, format, width: size.width.max(1), height: size.height.max(1), present_mode: wgpu::PresentMode::Fifo, desired_maximum_frame_latency: 2, alpha_mode: caps.alpha_modes[0], view_formats: vec![] };
+    surface.configure(&device, &config);
+    let (field_pl, line_pl) = make_pipelines(&device, format);
+
+    let build_frame = |device: &wgpu::Device, handles: &[hdf5::File], frames: &[(usize, String)], i: usize| -> FrameBuffers {
+        let (hi, key) = &frames[i];
+        let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, &args.field);
+        let t = tessellate(&nodes, &fld, ne, nn, nc, &args.comp, 2);
+        let verts = vertices(&t, vmin, vmax);
+        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
+        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&t.indices), usage: wgpu::BufferUsages::INDEX });
+        let lines = if poses.is_empty() || radii.is_empty() { Vec::new() } else { body_lines(&poses, &radii, t.bounds) };
+        let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&lines), usage: wgpu::BufferUsages::VERTEX }));
+        FrameBuffers { vbuf, ibuf, nidx: t.indices.len() as u32, lbuf, nline: lines.len() as u32, bounds: t.bounds }
+    };
+
+    let mut cur = args.frame.unwrap_or(frames.len() - 1).min(frames.len() - 1);
+    let mut fb = build_frame(&device, &handles, &frames, cur);
+    let mut playing = false;
+    let follow = args.watch; // when watching, jump to newest as files arrive
+    let frame_dt = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
+    let mut last_advance = Instant::now();
+    let mut last_scan = Instant::now();
+
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let _ = event_loop.run(move |event, elwt| match event {
+        Event::WindowEvent { event, .. } => match event {
+            WindowEvent::CloseRequested => elwt.exit(),
+            WindowEvent::Resized(s) => {
+                config.width = s.width.max(1);
+                config.height = s.height.max(1);
+                surface.configure(&device, &config);
+                window.request_redraw();
+            }
+            WindowEvent::KeyboardInput { event: ke, .. } if ke.state == ElementState::Pressed => {
+                let n = frames.len();
+                match ke.physical_key {
+                    PhysicalKey::Code(KeyCode::ArrowRight) => { cur = (cur + 1).min(n - 1); }
+                    PhysicalKey::Code(KeyCode::ArrowLeft) => { cur = cur.saturating_sub(1); }
+                    PhysicalKey::Code(KeyCode::Home) => cur = 0,
+                    PhysicalKey::Code(KeyCode::End) => cur = n - 1,
+                    PhysicalKey::Code(KeyCode::Space) => playing = !playing,
+                    PhysicalKey::Code(KeyCode::Escape) | PhysicalKey::Code(KeyCode::KeyQ) => { elwt.exit(); return; }
+                    _ => return,
+                }
+                fb = build_frame(&device, &handles, &frames, cur);
+                window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                let frame = match surface.get_current_texture() {
+                    Ok(f) => f,
+                    Err(_) => { surface.configure(&device, &config); return; }
+                };
+                let view = frame.texture.create_view(&Default::default());
+                let (vx, vy, vw, vh) = fit_viewport(config.width as f32, config.height as f32, fb.bounds[2], fb.bounds[3]);
+                let mut enc = device.create_command_encoder(&Default::default());
+                {
+                    let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None });
+                    rp.set_viewport(vx, vy, vw, vh, 0.0, 1.0);
+                    rp.set_pipeline(&field_pl);
+                    rp.set_vertex_buffer(0, fb.vbuf.slice(..));
+                    rp.set_index_buffer(fb.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.draw_indexed(0..fb.nidx, 0, 0..1);
+                    if let Some(lbuf) = &fb.lbuf { rp.set_pipeline(&line_pl); rp.set_vertex_buffer(0, lbuf.slice(..)); rp.draw(0..fb.nline, 0..1); }
+                }
+                queue.submit([enc.finish()]);
+                frame.present();
+            }
+            _ => {}
+        },
+        Event::AboutToWait => {
+            let mut dirty = false;
+            // watch: poll the split set for newly-completed files and append their frames.
+            if args.watch && last_scan.elapsed() > Duration::from_millis(500) {
+                last_scan = Instant::now();
+                let (new_paths, _) = list_set(&args.path);
+                if new_paths.len() > paths.len() {
+                    for p in &new_paths[paths.len()..] {
+                        if let Ok(h) = hdf5::File::open(p) {
+                            let hi = handles.len();
+                            let mut keys = h.group("frames").unwrap().member_names().unwrap();
+                            keys.sort();
+                            for k in keys { frames.push((hi, k)); }
+                            handles.push(h);
+                        }
+                    }
+                    paths = new_paths;
+                    if follow { cur = frames.len() - 1; dirty = true; }
+                }
+            }
+            if playing && last_advance.elapsed() >= frame_dt {
+                last_advance = Instant::now();
+                cur = if cur + 1 < frames.len() { cur + 1 } else { 0 };
+                dirty = true;
+            }
+            if dirty {
+                fb = build_frame(&device, &handles, &frames, cur);
+                window.request_redraw();
+            }
+        }
+        _ => {}
+    });
+}
+
+fn main() {
+    let args = parse_args();
+    if args.window {
+        run_window(args);
+    } else {
+        run_offscreen(&args);
+    }
+}

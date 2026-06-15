@@ -1,0 +1,21 @@
+[package]
+name = "gale-view"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Standalone (own lockfile) so the heavy wgpu dep tree stays out of the main gale workspace.
+[workspace]
+
+# Standalone GPU (wgpu) trajectory renderer for gale HDF5 trajectories. Reads the same files the
+# Python viewer does; tessellates each high-order DG element on the CPU and colors it on the GPU.
+# Offscreen mode (render frames → PNG) runs headless via Vulkan; an interactive windowed mode is a
+# follow-on (needs a display).
+
+[dependencies]
+wgpu = "22"
+winit = "0.29"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+hdf5 = { package = "hdf5-metno", version = "0.9", features = ["static", "zlib"] }

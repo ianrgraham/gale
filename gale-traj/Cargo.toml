@@ -1,0 +1,19 @@
+[package]
+name = "gale-traj"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Standalone host crate: the HDF5 trajectory writer. Kept out of the gale-gpu device
+# build so the (statically-linked, bundled) libhdf5 C dependency never touches the CUDA
+# codegen path. Depends only on the pure-host `gale` core for mesh/geometry types.
+
+[dependencies]
+# Maintained fork of the `hdf5` crate. `static` bundles + statically links libhdf5 (no
+# system libhdf5 needed); `zlib` provides the gzip dataset filter for field compression.
+hdf5 = { package = "hdf5-metno", version = "0.9", features = ["static", "zlib"] }
+gale = { path = ".." }
+
+[[bin]]
+name = "traj-demo"
+path = "src/bin/traj_demo.rs"

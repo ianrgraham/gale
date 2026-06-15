@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace]
-members = ["gale-gpu"]
+members = ["gale-gpu", "gale-traj"]
 
 # cuda-oxide runtime crates, pinned to our local fork checkout (path deps) so the
 # whole workspace shares ONE source and matches the codegen backend built from the
