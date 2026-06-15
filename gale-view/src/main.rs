@@ -4,6 +4,10 @@
 //! rigid bodies / embedded boundaries as clean circles by discarding the field inside the true circle
 //! in the fragment shader (resolution-independent — no element/node staircase) + a thin outline.
 //!
+//! **AMR-aware**: each frame carries a `topology` id and is rendered with that frame's own mesh, so a
+//! trajectory whose mesh refines/coarsens over time (an adaptive run) plays back correctly. `--grid`
+//! overlays the element boundaries, making the refining/coarsening cells visible.
+//!
 //! Two modes:
 //!   - **offscreen** (default): render a frame (or `--all`) to PNG — runs headless via Vulkan.
 //!   - **`--window`**: interactive winit window (needs a display; intended for a workstation, e.g.
@@ -65,10 +69,11 @@ struct Args {
     fps: u32,
     vmin: Option<f32>,
     vmax: Option<f32>,
+    grid: bool,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { path: String::new(), field: "u".into(), comp: "0".into(), frame: None, all: false, out: None, height: 600, window: false, watch: false, fps: 20, vmin: None, vmax: None };
+    let mut a = Args { path: String::new(), field: "u".into(), comp: "0".into(), frame: None, all: false, out: None, height: 600, window: false, watch: false, fps: 20, vmin: None, vmax: None, grid: false };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -83,11 +88,12 @@ fn parse_args() -> Args {
             "--fps" => a.fps = it.next().unwrap().parse().unwrap(),
             "--vmin" => a.vmin = Some(it.next().unwrap().parse().unwrap()),
             "--vmax" => a.vmax = Some(it.next().unwrap().parse().unwrap()),
+            "--grid" => a.grid = true,
             _ => a.path = arg,
         }
     }
     if a.path.is_empty() {
-        eprintln!("usage: gale-view <traj.h5> [--field u] [--comp 0|mag] [--frame N|--all] [--out P] [--height H] [--vmin V] [--vmax V] [--window] [--watch] [--fps F]");
+        eprintln!("usage: gale-view <traj.h5> [--field u] [--comp 0|mag] [--frame N|--all] [--out P] [--height H] [--vmin V] [--vmax V] [--grid] [--window] [--watch] [--fps F]");
         std::process::exit(2);
     }
     a
@@ -197,6 +203,24 @@ fn body_lines(poses: &[f64], radii: &[f64], bounds: [f32; 4]) -> Vec<LineVertex>
         }
         v.push(to_ndc(cx, cy));
         v.push(to_ndc(cx + r * phi.cos(), cy + r * phi.sin()));
+    }
+    v
+}
+
+/// Element-boundary lines (the 4 corner edges of every element, in NDC) — the `--grid` overlay that
+/// makes the mesh (and its AMR refine/coarsen) visible. Uses the already-NDC tessellation node
+/// positions; corners of element `e` are nodes (0,0),(n1-1,0),(n1-1,n1-1),(0,n1-1) in tensor order.
+fn grid_lines(pos_ndc: &[[f32; 2]], ne: usize, nn: usize) -> Vec<LineVertex> {
+    let n1 = (nn as f64).sqrt().round() as usize;
+    let mut v = Vec::with_capacity(ne * 8);
+    for e in 0..ne {
+        let base = e * nn;
+        let c = |i: usize, j: usize| LineVertex { pos: pos_ndc[base + i + j * n1] };
+        let (bl, br, tr, tl) = (c(0, 0), c(n1 - 1, 0), c(n1 - 1, n1 - 1), c(0, n1 - 1));
+        for [a, b] in [[bl, br], [br, tr], [tr, tl], [tl, bl]] {
+            v.push(a);
+            v.push(b);
+        }
     }
     v
 }
@@ -393,7 +417,10 @@ fn run_offscreen(args: &Args) {
         let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, &args.field);
         let t = tessellate(&nodes, &fld, ne, nn, nc, &args.comp, args.height);
         let has_bodies = !poses.is_empty() && !radii.is_empty();
-        let lines = if has_bodies { body_lines(&poses, &radii, t.bounds) } else { Vec::new() };
+        let mut lines = if has_bodies { body_lines(&poses, &radii, t.bounds) } else { Vec::new() };
+        if args.grid {
+            lines.extend(grid_lines(&t.pos_ndc, ne, nn));
+        }
         let bg = circles_bind_group(&device, &bgl, &poses, &radii);
         let verts = vertices(&t, vmin, vmax);
         let out = if args.all { format!("{prefix}_{:06}.png", i) } else { format!("{prefix}_wgpu.png") };
@@ -415,7 +442,7 @@ struct FrameBuffers {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_frame(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, handles: &[hdf5::File], frames: &[(usize, String)], i: usize, radii: &[f64], field: &str, comp: &str, vmin: &mut f32, vmax: &mut f32, ovmin: Option<f32>, ovmax: Option<f32>) -> FrameBuffers {
+fn build_frame(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, handles: &[hdf5::File], frames: &[(usize, String)], i: usize, radii: &[f64], field: &str, comp: &str, vmin: &mut f32, vmax: &mut f32, ovmin: Option<f32>, ovmax: Option<f32>, grid: bool) -> FrameBuffers {
     use wgpu::util::DeviceExt;
     let (hi, key) = &frames[i];
     let (nodes, fld, ne, nn, nc, poses) = read_frame(&handles[*hi], key, field);
@@ -429,7 +456,10 @@ fn build_frame(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout, handles: &[hd
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&verts), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&t.indices), usage: wgpu::BufferUsages::INDEX });
     let has_bodies = !poses.is_empty() && !radii.is_empty();
-    let lines = if has_bodies { body_lines(&poses, radii, t.bounds) } else { Vec::new() };
+    let mut lines = if has_bodies { body_lines(&poses, radii, t.bounds) } else { Vec::new() };
+    if grid {
+        lines.extend(grid_lines(&t.pos_ndc, ne, nn));
+    }
     let lbuf = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&lines), usage: wgpu::BufferUsages::VERTEX }));
     let bind_group = circles_bind_group(device, bgl, &poses, radii);
     FrameBuffers { vbuf, ibuf, nidx: t.indices.len() as u32, bind_group, lbuf, nline: lines.len() as u32, bounds: t.bounds }
@@ -464,6 +494,7 @@ fn run_window(args: Args) {
     let path = args.path;
     let initial = args.frame;
     let (ovmin, ovmax) = (args.vmin, args.vmax);
+    let grid = args.grid;
     let frame_dt = Duration::from_secs_f64(1.0 / args.fps.max(1) as f64);
 
     let mut paths = list_set(&path).0;
@@ -498,7 +529,7 @@ fn run_window(args: Args) {
     let (mut vmin, mut vmax) = (f32::MAX, f32::MIN);
     let follow = watch;
     let mut cur: Option<usize> = (!frames.is_empty()).then(|| initial.unwrap_or(frames.len() - 1).min(frames.len() - 1));
-    let mut fb: Option<FrameBuffers> = cur.map(|c| build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax));
+    let mut fb: Option<FrameBuffers> = cur.map(|c| build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax, grid));
     let mut playing = false;
     let mut last_advance = Instant::now();
     let mut last_scan = Instant::now();
@@ -526,7 +557,7 @@ fn run_window(args: Args) {
                     _ => return,
                 }
                 cur = Some(c);
-                fb = Some(build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax));
+                fb = Some(build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax, grid));
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -569,7 +600,7 @@ fn run_window(args: Args) {
                 dirty = true;
             }
             if dirty {
-                if let Some(c) = cur { fb = Some(build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax)); }
+                if let Some(c) = cur { fb = Some(build_frame(&device, &bgl, &handles, &frames, c, &radii, &field, &comp, &mut vmin, &mut vmax, ovmin, ovmax, grid)); }
                 window.request_redraw();
             } else if cur.is_none() {
                 window.request_redraw();
