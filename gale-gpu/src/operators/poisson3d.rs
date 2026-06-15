@@ -312,6 +312,9 @@ fn flatten3d(mesh: &Mesh3d, alpha: f64, neumann_tags: &[u32]) -> MeshArrays3d {
             ftau[e * 6 + t] = match nb {
                 Neighbor3::Interior { elem: re, .. } => alpha * p1 * p1 / h[e].min(h[*re]),
                 Neighbor3::Boundary { .. } => alpha * p1 * p1 / h[e],
+                Neighbor3::CoarseToFine { .. } | Neighbor3::FineToCoarse { .. } => {
+                    unreachable!("conforming GPU operator3d does not support non-conforming meshes (use poisson3d_nc)")
+                }
             };
             let neumann_boundary = matches!(nb, Neighbor3::Boundary { tag } if neumann_tags.contains(tag));
             for a in 0..n2 {
