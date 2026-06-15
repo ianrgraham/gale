@@ -65,9 +65,9 @@ fn ensure_poisson_nc_handle(slot: &RefCell<Option<GpuPoissonNc>>, mesh: &Mesh2d,
     }
 }
 use gale::dg::{
-    log_conformation, upwind_advection_lift, BoundaryConditions, ConformationInflow,
-    ConstitutiveModel, ConvectionScheme, Hyperbolic, IncompressibleConvection, LogConfOldroydB,
-    Mesh2d, OldroydB, PMultigrid, Poisson, VolumeForm,
+    limit_logconf_trace_bound, log_conformation, upwind_advection_lift, BoundaryConditions,
+    ConformationInflow, ConstitutiveModel, ConvectionScheme, Hyperbolic, IncompressibleConvection,
+    LogConfOldroydB, Mesh2d, OldroydB, PMultigrid, Poisson, VolumeForm,
 };
 
 /// Lazily (re)build the persistent **p-multigrid-PCG pressure** handle in `slot`: built
@@ -1028,6 +1028,7 @@ fn logconf_advance_gpu(
     uy: &[f64],
     dt: f64,
     inflow: Option<&ConformationInflow>,
+    trace_bound: Option<f64>,
 ) -> ConfResult {
     // Full rhs = GPU device kernel + host upwind lift. The advected variable is Ψ, so
     // the inflow conformation C_in enters as Ψ_in = log C_in.
@@ -1043,14 +1044,21 @@ fn logconf_advance_gpu(
         }
         Ok(k)
     };
+    // Optional bound-preserving trace cap (tr C ≤ b_max): the log-conformation analogue of FENE-P
+    // finite extensibility, applied after each SSP-RK3 stage. Keeps the high-Wi extensional growth
+    // bounded so the unbounded Oldroyd-B stress can't blow up (needed for elastic-turbulence runs).
+    let clip = |mut s: [Vec<f64>; 3]| -> [Vec<f64>; 3] {
+        if let Some(b) = trace_bound {
+            limit_logconf_trace_bound(mesh, &mut s, b);
+        }
+        s
+    };
     let k0 = rhs(psi)?;
-    let u1 = axpy3(psi, &k0, dt);
+    let u1 = clip(axpy3(psi, &k0, dt));
     let k1 = rhs(&u1)?;
-    let u2a = axpy3(&u1, &k1, dt);
-    let u2 = combine3(psi, 0.75, &u2a, 0.25);
+    let u2 = clip(combine3(psi, 0.75, &axpy3(&u1, &k1, dt), 0.25));
     let k2 = rhs(&u2)?;
-    let u3a = axpy3(&u2, &k2, dt);
-    Ok(combine3(psi, 1.0 / 3.0, &u3a, 2.0 / 3.0))
+    Ok(clip(combine3(psi, 1.0 / 3.0, &axpy3(&u2, &k2, dt), 2.0 / 3.0)))
 }
 
 /// One **ARK2 / ARS(2,2,2)** IMEX step of the log-conformation transport with a fixed
@@ -1126,6 +1134,9 @@ pub struct GpuViscoelasticDualSplitting {
     fy: Box<dyn Fn(f64, f64, f64) -> f64>,
     /// Optional conformation inflow boundary data (incoming polymer state at an inlet).
     inflow: Option<ConformationInflow>,
+    /// Optional bound-preserving cap on `tr C` (log-conf model only) — the FENE-P-like finite-
+    /// extensibility limiter applied after each conformation RK stage. `None` ⇒ unbounded (Oldroyd-B).
+    trace_bound: Option<f64>,
     /// Persistent GPU Poisson handle (P4) for the momentum (velocity) solves, lazily built
     /// on the first step and reused across timesteps. Conforming meshes only.
     poisson: RefCell<Option<GpuPoisson>>,
@@ -1165,6 +1176,7 @@ impl GpuViscoelasticDualSplitting {
             fx: Box::new(|_, _, _| 0.0),
             fy: Box::new(|_, _, _| 0.0),
             inflow: None,
+            trace_bound: None,
             poisson: RefCell::new(None),
             poisson_nc: RefCell::new(None),
             mg_pressure: RefCell::new(None),
@@ -1172,6 +1184,14 @@ impl GpuViscoelasticDualSplitting {
             mg_vely: RefCell::new(None),
             solve_tol: 1e-10,
         }
+    }
+
+    /// Cap `tr C ≤ b_max` after each conformation RK stage (log-conf model) — the FENE-P-like
+    /// finite-extensibility bound that keeps high-Wi extensional growth from blowing up. `b_max` is
+    /// the maximum polymer stretch (≈ FENE-P L²). Default off (unbounded Oldroyd-B).
+    pub fn with_trace_bound(mut self, b_max: f64) -> Self {
+        self.trace_bound = Some(b_max);
+        self
     }
 
     /// Set the per-step elliptic-solve tolerance (default `1e-10`); see
@@ -1300,7 +1320,7 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
                 }
                 gale::sim::ViscoModel::LogConf => {
                     let lc = LogConfOldroydB::new(&state.mesh, self.lambda, self.eta_p);
-                    logconf_advance_gpu(&state.mesh, &lc, &c, &nux, &nuy, self.dt, self.inflow.as_ref())
+                    logconf_advance_gpu(&state.mesh, &lc, &c, &nux, &nuy, self.dt, self.inflow.as_ref(), self.trace_bound)
                 }
             }
             .expect("gale-gpu: viscoelastic conformation advance failed");
