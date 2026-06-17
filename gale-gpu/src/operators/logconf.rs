@@ -10,12 +10,13 @@
 //!
 //!   ∂ₜΨ = −(u·∇)Ψ + (ΩΨ − ΨΩ) + 2B + (1/λ)(e^{−Ψ} − I).
 
-use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 #[cfg(feature = "autodiff")]
 use cuda_device::device;
 use cuda_device::{kernel, thread, DisjointSlice, SharedArray};
 use cuda_host::cuda_module;
 use gale::dg::{LogConfOldroydB, Mesh2d};
+use std::sync::Arc;
 
 const NN_MAX: usize = 81;
 
@@ -487,6 +488,101 @@ mod kernels {
             *o = myy + theta * (unsafe { PYY[m] } - myy);
         }
     }
+
+    /// Recover the **conformation** `C = exp(Ψ)` from the log-conformation `Ψ=[a,b,d]` per node
+    /// (symmetric matrix exp via eigendecomposition). One thread per node (grid-stride). Mirrors
+    /// the host `gale::dg::LogConfOldroydB::conformation` (`sym_apply` with `f = exp`).
+    #[kernel]
+    pub fn conformation(
+        pxx: &[f64], pxy: &[f64], pyy: &[f64], n1: u32,
+        mut cxx: DisjointSlice<f64>, mut cxy: DisjointSlice<f64>, mut cyy: DisjointSlice<f64>,
+    ) {
+        let nn = (n1 as usize) * (n1 as usize);
+        let e = thread::blockIdx_x() as usize;
+        let m = thread::threadIdx_x() as usize;
+        let b = e * nn + m;
+        let (pa, pb, pd) = (pxx[b], pxy[b], pyy[b]);
+        let tr = 0.5 * (pa + pd);
+        let diff = pa - pd;
+        let rad = (0.25 * diff * diff + pb * pb).sqrt();
+        let (m1, m2) = (tr + rad, tr - rad);
+        let theta = 0.5f64 * (2.0f64 * pb).atan2(diff);
+        let (c, s) = (theta.cos(), theta.sin());
+        let (e1, e2) = (m1.exp(), m2.exp());
+        if let Some(o) = cxx.get_mut(thread::index_1d()) {
+            *o = c * c * e1 + s * s * e2;
+        }
+        if let Some(o) = cxy.get_mut(thread::index_1d()) {
+            *o = c * s * (e1 - e2);
+        }
+        if let Some(o) = cyy.get_mut(thread::index_1d()) {
+            *o = s * s * e1 + c * c * e2;
+        }
+    }
+
+    /// **Upwind advection surface lift** for the 3-component conformation field `Ψ` — the DG
+    /// inter-element flux correction the volume `psi_rhs` omits. One block per element, one thread
+    /// per node; thread 0 walks the element's 4 faces and accumulates, into shared per-component
+    /// `RFACE`, the inflow correction `sw·uₙ·(Ψ_int − Ψ_ext)` (`uₙ = u·n`, only where `uₙ < 0`),
+    /// then every thread writes `out = RFACE / jw`. Mirrors the host `upwind_advection_lift`.
+    /// Conforming meshes (interior + boundary faces); boundary faces pass `face_nbr = self` so they
+    /// contribute zero (no-slip walls have `uₙ = 0`; no-inflow boundaries use the interior trace).
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn upwind_lift(
+        ux: &[f64], uy: &[f64], pxx: &[f64], pxy: &[f64], pyy: &[f64], jw: &[f64], n1: u32,
+        face_vl: &[u32], face_nx: &[f64], face_ny: &[f64], face_sw: &[f64], face_nbr: &[u32],
+        mut oxx: DisjointSlice<f64>, mut oxy: DisjointSlice<f64>, mut oyy: DisjointSlice<f64>,
+    ) {
+        static mut RXX: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        static mut RXY: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        static mut RYY: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        let n1 = n1 as usize;
+        let nn = n1 * n1;
+        let e = thread::blockIdx_x() as usize;
+        let m = thread::threadIdx_x() as usize;
+        let b = e * nn + m;
+        unsafe {
+            RXX[m] = 0.0;
+            RXY[m] = 0.0;
+            RYY[m] = 0.0;
+        }
+        thread::sync_threads();
+        if m == 0 {
+            let mut t = 0usize;
+            while t < 4 {
+                let mut a = 0usize;
+                while a < n1 {
+                    let idx = (e * 4 + t) * n1 + a;
+                    let vl = face_vl[idx] as usize;
+                    let gi = e * nn + vl;
+                    let un = ux[gi] * face_nx[idx] + uy[gi] * face_ny[idx];
+                    if un < 0.0 {
+                        let ext = face_nbr[idx] as usize;
+                        let fac = face_sw[idx] * un;
+                        unsafe {
+                            RXX[vl] += fac * (pxx[gi] - pxx[ext]);
+                            RXY[vl] += fac * (pxy[gi] - pxy[ext]);
+                            RYY[vl] += fac * (pyy[gi] - pyy[ext]);
+                        }
+                    }
+                    a += 1;
+                }
+                t += 1;
+            }
+        }
+        thread::sync_threads();
+        let inv = 1.0 / jw[b];
+        if let Some(o) = oxx.get_mut(thread::index_1d()) {
+            *o = unsafe { RXX[m] } * inv;
+        }
+        if let Some(o) = oxy.get_mut(thread::index_1d()) {
+            *o = unsafe { RXY[m] } * inv;
+        }
+        if let Some(o) = oyy.get_mut(thread::index_1d()) {
+            *o = unsafe { RYY[m] } * inv;
+        }
+    }
 }
 
 /// Compute the log-conformation (Fattal–Kupferman) Ψ time-derivative `∂ₜΨ` on the
@@ -506,54 +602,7 @@ pub fn logconf_psi_rhs(
     ux: &[f64],
     uy: &[f64],
 ) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
-    let nn = mesh.refq.n_nodes();
-    let ne = mesh.n_elements();
-    let ndof = ne * nn;
-    let n1 = mesh.order + 1;
-    assert_eq!(ux.len(), ndof, "velocity length must be n_elements·n_nodes");
-    assert_eq!(uy.len(), ndof, "velocity length must be n_elements·n_nodes");
-    for c in psi {
-        assert_eq!(c.len(), ndof, "Ψ component length must be n_elements·n_nodes");
-    }
-    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
-
-    // Flatten per-node metrics.
-    let (mut rx, mut ry, mut sx, mut sy) =
-        (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
-    for (e, el) in mesh.elements.iter().enumerate() {
-        for k in 0..nn {
-            rx[e * nn + k] = el.geom.rx[k];
-            ry[e * nn + k] = el.geom.ry[k];
-            sx[e * nn + k] = el.geom.sx[k];
-            sy[e * nn + k] = el.geom.sy[k];
-        }
-    }
-
-    let ctx = CudaContext::new(0)?;
-    let stream = ctx.default_stream();
-    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
-    let d_dev = up(&mesh.refq.line.diff)?;
-    let ux_d = up(ux)?;
-    let uy_d = up(uy)?;
-    let pxx_d = up(&psi[0])?;
-    let pxy_d = up(&psi[1])?;
-    let pyy_d = up(&psi[2])?;
-    let rx_d = up(&rx)?;
-    let ry_d = up(&ry)?;
-    let sx_d = up(&sx)?;
-    let sy_d = up(&sy)?;
-    let mut dxx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut dxy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut dyy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-
-    let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
-    module.psi_rhs(
-        &stream, cfg, &d_dev, &ux_d, &uy_d, &pxx_d, &pxy_d, &pyy_d,
-        &rx_d, &ry_d, &sx_d, &sy_d, lc.lambda.recip(), n1 as u32,
-        &mut dxx, &mut dxy, &mut dyy,
-    )?;
-    Ok([dxx.to_host_vec(&stream)?, dxy.to_host_vec(&stream)?, dyy.to_host_vec(&stream)?])
+    GpuLogConf::new()?.psi_rhs(mesh, lc, psi, ux, uy)
 }
 
 /// GPU per-node IMEX implicit relaxation solve (Phase 3): solve `Ψ − γ·S(Ψ) = B` for the
@@ -568,33 +617,204 @@ pub fn logconf_implicit_relax(
     b: &[Vec<f64>; 3],
     gamma: f64,
 ) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
-    let nn = mesh.refq.n_nodes();
-    let ne = mesh.n_elements();
-    let ndof = ne * nn;
-    let n1 = mesh.order + 1;
-    for c in b {
-        assert_eq!(c.len(), ndof, "B component length must be n_elements·n_nodes");
+    GpuLogConf::new()?.implicit_relax(mesh, lc, b, gamma)
+}
+
+/// Persistent GPU handle for the log-conformation transport kernels. Holds the CUDA context +
+/// loaded kernel module so the per-step constitutive evaluations REUSE them, instead of creating a
+/// context and JIT-loading the whole kernel bundle on every call — which is ~0.3 s of host-side
+/// setup each and, called 3× per SSP-RK3 step, leaves the GPU almost idle (the device does one tiny
+/// kernel then waits while the host reloads the module). Mirrors the persistent
+/// [`GpuPoisson`](crate::operators::poisson::GpuPoisson). The handle is mesh-independent (only the
+/// data uploads depend on the mesh), so it never needs rebuilding on an AMR remesh: build once,
+/// reuse for the whole run. The free functions [`logconf_psi_rhs`]/[`logconf_implicit_relax`] are
+/// one-shot shims (build a fresh handle per call) kept for tests and non-hot callers.
+pub struct GpuLogConf {
+    stream: Arc<CudaStream>,
+    module: kernels::LoadedModule,
+}
+
+impl GpuLogConf {
+    /// Create the CUDA context and load the kernel module once.
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.default_stream();
+        let module = kernels::load(&ctx)?;
+        Ok(Self { stream, module })
     }
-    assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
 
-    let ctx = CudaContext::new(0)?;
-    let stream = ctx.default_stream();
-    let up = |v: &[f64]| DeviceBuffer::from_host(&stream, v);
-    let bxx_d = up(&b[0])?;
-    let bxy_d = up(&b[1])?;
-    let byy_d = up(&b[2])?;
-    let mut oxx = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut oxy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
-    let mut oyy = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+    /// Build on a caller-provided stream (shares one non-legacy stream with the `GpuPoissonMg`
+    /// handles in a device-resident step — see [`GpuPoissonMg::new_on_stream`]).
+    pub fn new_on_stream(stream: std::sync::Arc<CudaStream>) -> Result<Self, Box<dyn std::error::Error>> {
+        let module = kernels::load(stream.context())?;
+        Ok(Self { stream, module })
+    }
 
-    let module = kernels::load(&ctx)?;
-    let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
-    module.implicit_relax(
-        &stream, cfg, &bxx_d, &bxy_d, &byy_d,
-        gamma, lc.lambda.recip(), lc.mobility, lc.extensibility, n1 as u32,
-        &mut oxx, &mut oxy, &mut oyy,
-    )?;
-    Ok([oxx.to_host_vec(&stream)?, oxy.to_host_vec(&stream)?, oyy.to_host_vec(&stream)?])
+    /// `∂ₜΨ` (the log-conformation transport rhs) on the GPU, reusing this handle's context/module.
+    /// Bit-for-bit equal to the one-shot [`logconf_psi_rhs`] (and the CPU oracle).
+    pub fn psi_rhs(
+        &self,
+        mesh: &Mesh2d,
+        lc: &LogConfOldroydB,
+        psi: &[Vec<f64>; 3],
+        ux: &[f64],
+        uy: &[f64],
+    ) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
+        let nn = mesh.refq.n_nodes();
+        let ne = mesh.n_elements();
+        let ndof = ne * nn;
+        let n1 = mesh.order + 1;
+        assert_eq!(ux.len(), ndof, "velocity length must be n_elements·n_nodes");
+        assert_eq!(uy.len(), ndof, "velocity length must be n_elements·n_nodes");
+        for c in psi {
+            assert_eq!(c.len(), ndof, "Ψ component length must be n_elements·n_nodes");
+        }
+        assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
+
+        // Flatten per-node metrics.
+        let (mut rx, mut ry, mut sx, mut sy) =
+            (vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof], vec![0.0; ndof]);
+        for (e, el) in mesh.elements.iter().enumerate() {
+            for k in 0..nn {
+                rx[e * nn + k] = el.geom.rx[k];
+                ry[e * nn + k] = el.geom.ry[k];
+                sx[e * nn + k] = el.geom.sx[k];
+                sy[e * nn + k] = el.geom.sy[k];
+            }
+        }
+
+        let stream = &self.stream;
+        let module = &self.module;
+        let up = |v: &[f64]| DeviceBuffer::from_host(stream, v);
+        let d_dev = up(&mesh.refq.line.diff)?;
+        let ux_d = up(ux)?;
+        let uy_d = up(uy)?;
+        let pxx_d = up(&psi[0])?;
+        let pxy_d = up(&psi[1])?;
+        let pyy_d = up(&psi[2])?;
+        let rx_d = up(&rx)?;
+        let ry_d = up(&ry)?;
+        let sx_d = up(&sx)?;
+        let sy_d = up(&sy)?;
+        let mut dxx = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut dxy = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut dyy = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+
+        let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
+        module.psi_rhs(
+            stream, cfg, &d_dev, &ux_d, &uy_d, &pxx_d, &pxy_d, &pyy_d,
+            &rx_d, &ry_d, &sx_d, &sy_d, lc.lambda.recip(), n1 as u32,
+            &mut dxx, &mut dxy, &mut dyy,
+        )?;
+        Ok([dxx.to_host_vec(stream)?, dxy.to_host_vec(stream)?, dyy.to_host_vec(stream)?])
+    }
+
+    /// IMEX implicit relaxation solve on the GPU, reusing this handle's context/module. Bit-for-bit
+    /// equal to the one-shot [`logconf_implicit_relax`].
+    pub fn implicit_relax(
+        &self,
+        mesh: &Mesh2d,
+        lc: &LogConfOldroydB,
+        b: &[Vec<f64>; 3],
+        gamma: f64,
+    ) -> Result<[Vec<f64>; 3], Box<dyn std::error::Error>> {
+        let nn = mesh.refq.n_nodes();
+        let ne = mesh.n_elements();
+        let ndof = ne * nn;
+        let n1 = mesh.order + 1;
+        for c in b {
+            assert_eq!(c.len(), ndof, "B component length must be n_elements·n_nodes");
+        }
+        assert!(nn <= NN_MAX, "p too large for NN_MAX={NN_MAX}");
+
+        let stream = &self.stream;
+        let module = &self.module;
+        let up = |v: &[f64]| DeviceBuffer::from_host(stream, v);
+        let bxx_d = up(&b[0])?;
+        let bxy_d = up(&b[1])?;
+        let byy_d = up(&b[2])?;
+        let mut oxx = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut oxy = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut oyy = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+
+        let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 };
+        module.implicit_relax(
+            stream, cfg, &bxx_d, &bxy_d, &byy_d,
+            gamma, lc.lambda.recip(), lc.mobility, lc.extensibility, n1 as u32,
+            &mut oxx, &mut oxy, &mut oyy,
+        )?;
+        Ok([oxx.to_host_vec(stream)?, oxy.to_host_vec(stream)?, oyy.to_host_vec(stream)?])
+    }
+
+    // ===== Device-resident launch wrappers (DeviceBuffer in/out, no host transfer) =============
+    // These take pre-uploaded device buffers (state + mesh metrics/face data, owned by the caller)
+    // and just launch the kernel on this handle's stream — the building blocks for a device-resident
+    // viscoelastic step. `n1 = order+1`, `ne = n_elements`.
+
+    /// `C = exp(Ψ)` on device (block per element). See [`kernels::conformation`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn conformation_dev(
+        &self, ne: usize, n1: u32,
+        pxx: &DeviceBuffer<f64>, pxy: &DeviceBuffer<f64>, pyy: &DeviceBuffer<f64>,
+        cxx: &mut DeviceBuffer<f64>, cxy: &mut DeviceBuffer<f64>, cyy: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let nn = n1 * n1;
+        let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn, 1, 1), shared_mem_bytes: 0 };
+        self.module.conformation(&self.stream, cfg, pxx, pxy, pyy, n1, cxx, cxy, cyy)?;
+        Ok(())
+    }
+
+    /// Log-conf volume rhs `∂ₜΨ` on device (block per element). See [`kernels::psi_rhs`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn psi_rhs_dev(
+        &self, ne: usize, n1: u32, d: &DeviceBuffer<f64>,
+        ux: &DeviceBuffer<f64>, uy: &DeviceBuffer<f64>,
+        pxx: &DeviceBuffer<f64>, pxy: &DeviceBuffer<f64>, pyy: &DeviceBuffer<f64>,
+        rx: &DeviceBuffer<f64>, ry: &DeviceBuffer<f64>, sx: &DeviceBuffer<f64>, sy: &DeviceBuffer<f64>,
+        inv_lambda: f64,
+        dxx: &mut DeviceBuffer<f64>, dxy: &mut DeviceBuffer<f64>, dyy: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let nn = n1 * n1;
+        let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn, 1, 1), shared_mem_bytes: 0 };
+        self.module.psi_rhs(&self.stream, cfg, d, ux, uy, pxx, pxy, pyy, rx, ry, sx, sy, inv_lambda, n1, dxx, dxy, dyy)?;
+        Ok(())
+    }
+
+    /// Upwind advection surface lift for Ψ on device (block per element). See [`kernels::upwind_lift`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn upwind_lift_dev(
+        &self, ne: usize, n1: u32,
+        ux: &DeviceBuffer<f64>, uy: &DeviceBuffer<f64>,
+        pxx: &DeviceBuffer<f64>, pxy: &DeviceBuffer<f64>, pyy: &DeviceBuffer<f64>, jw: &DeviceBuffer<f64>,
+        face_vl: &DeviceBuffer<u32>, face_nx: &DeviceBuffer<f64>, face_ny: &DeviceBuffer<f64>,
+        face_sw: &DeviceBuffer<f64>, face_nbr: &DeviceBuffer<u32>,
+        oxx: &mut DeviceBuffer<f64>, oxy: &mut DeviceBuffer<f64>, oyy: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let nn = n1 * n1;
+        let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn, 1, 1), shared_mem_bytes: 0 };
+        self.module.upwind_lift(&self.stream, cfg, ux, uy, pxx, pxy, pyy, jw, n1, face_vl, face_nx, face_ny, face_sw, face_nbr, oxx, oxy, oyy)?;
+        Ok(())
+    }
+
+    /// FENE-P trace-bound limiter on device (block per element). See [`kernels::limit_logconf_trace`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn limit_trace_dev(
+        &self, ne: usize, n1: u32,
+        pxx: &DeviceBuffer<f64>, pxy: &DeviceBuffer<f64>, pyy: &DeviceBuffer<f64>, jw: &DeviceBuffer<f64>,
+        b_max: f64,
+        oxx: &mut DeviceBuffer<f64>, oxy: &mut DeviceBuffer<f64>, oyy: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let nn = n1 * n1;
+        let cfg = LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn, 1, 1), shared_mem_bytes: 0 };
+        self.module.limit_logconf_trace(&self.stream, cfg, pxx, pxy, pyy, jw, b_max, n1, oxx, oxy, oyy)?;
+        Ok(())
+    }
+
+    /// This handle's CUDA stream — so a device-resident caller can allocate buffers on the same
+    /// stream/context the kernels run on (interoperating with a `GpuPoissonMg` on the same context).
+    pub fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
 }
 
 /// Differentiate the implicit relaxation w.r.t. `1/λ`: returns `[∂Ψxx, ∂Ψxy, ∂Ψyy]

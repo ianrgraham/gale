@@ -2757,6 +2757,19 @@ impl GpuPoissonMg {
         Ok(Self { stream, module, dev, mixed: false, graph: false, while_graph: false, ws: std::cell::RefCell::new(None), while_exec: std::cell::RefCell::new(None) })
     }
 
+    /// Build the handle on a **caller-provided stream** (and its context) instead of the context's
+    /// default/legacy stream. This is how several handles (pressure + velocity + diffusion, plus a
+    /// `GpuLogConf`) are made to SHARE one non-legacy stream — required for a device-resident step
+    /// where their kernels chain on the same ordered stream AND for CUDA-graph capture (illegal on
+    /// the legacy stream). Loads its own module on the stream's context (one-time) and uploads the
+    /// hierarchy. Pair with [`with_while_graph`](Self::with_while_graph) (which keeps a non-legacy
+    /// stream as-is). Create the stream once via `CudaContext::new(0)?.new_stream()?`.
+    pub fn new_on_stream(mg: PMultigrid, stream: std::sync::Arc<CudaStream>) -> Result<Self, Box<dyn std::error::Error>> {
+        let module = kernels::load(stream.context())?;
+        let dev = MgConst::build(&stream, &mg)?;
+        Ok(Self { stream, module, dev, mixed: false, graph: false, while_graph: false, ws: std::cell::RefCell::new(None), while_exec: std::cell::RefCell::new(None) })
+    }
+
     /// Build the persistent handle for an **SBM** hierarchy (`ShiftedMultigrid`): uploads every
     /// level once (SBM `fnbr`/shift vectors/active masks), then [`solve`](Self::solve) drives the
     /// SBM-aware V-cycle. The amortized analogue of the one-shot [`sbm_pcg_solve`], for time loops

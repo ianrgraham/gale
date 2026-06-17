@@ -122,9 +122,8 @@ impl TrajectoryWriter {
         Ok(())
     }
 
-    /// Register a 2D mesh as a new topology (per-element physical node coords), returning its id.
-    /// Call once for a fixed mesh, or again after an AMR remesh; frames reference the id they use.
-    pub fn write_mesh2d(&mut self, mesh: &Mesh2d) -> hdf5::Result<u64> {
+    /// Extract a mesh's per-element physical node coordinates as `[ne*nn*2]` f32.
+    fn mesh_nodes(mesh: &Mesh2d) -> (usize, usize, Vec<f32>) {
         let nn = mesh.refq.n_nodes();
         let ne = mesh.n_elements();
         let mut nodes = vec![0f32; ne * nn * 2];
@@ -132,6 +131,38 @@ impl TrajectoryWriter {
             for k in 0..nn {
                 nodes[(e * nn + k) * 2] = el.geom.x[k] as f32;
                 nodes[(e * nn + k) * 2 + 1] = el.geom.y[k] as f32;
+            }
+        }
+        (ne, nn, nodes)
+    }
+
+    /// Register a 2D mesh as a new topology (per-element physical node coords), returning its id.
+    /// Call once for a fixed mesh, or again after an AMR remesh; frames reference the id they use.
+    /// Prefer [`topology_for`](Self::topology_for) for adaptive runs — it re-emits only when the
+    /// geometry actually changes (this one *always* mints a new id).
+    pub fn write_mesh2d(&mut self, mesh: &Mesh2d) -> hdf5::Result<u64> {
+        let (ne, nn, nodes) = Self::mesh_nodes(mesh);
+        let id = self.topo_count;
+        let t = TopoData { ne, nn, nodes };
+        Self::write_topo(&self.file, id, &t)?;
+        self.topologies.push(t);
+        self.topo_count += 1;
+        Ok(id)
+    }
+
+    /// Topology id to use for `mesh`, **re-emitting a new topology only when the geometry has
+    /// actually changed** since the last call (byte-identical node coords ⇒ the existing id is
+    /// reused, so an unchanged mesh doesn't bloat the file). This is the correct call for an AMR
+    /// trajectory: detecting a remesh by *element count* alone misses a constant-dof remesh
+    /// (refine one region, coarsen another), which then pairs the new field with a STALE topology
+    /// and the viewer draws the field at the wrong cells — a blocky scramble that looks like a
+    /// solver artifact but is purely a topology-pairing bug. Call this every dumped frame and pass
+    /// the returned id to [`write_frame`](Self::write_frame); no element-count bookkeeping needed.
+    pub fn topology_for(&mut self, mesh: &Mesh2d) -> hdf5::Result<u64> {
+        let (ne, nn, nodes) = Self::mesh_nodes(mesh);
+        if let Some(last) = self.topologies.last() {
+            if last.ne == ne && last.nn == nn && last.nodes == nodes {
+                return Ok(self.topo_count - 1);
             }
         }
         let id = self.topo_count;
@@ -222,7 +253,20 @@ impl TrajectoryWriter {
         }
         self.frame_in_file += 1;
         self.frame += 1;
+        // Commit the frame to disk immediately so a later crash (solver blow-up / panic) cannot
+        // corrupt the file: every frame written so far stays valid and openable. A flush per dumped
+        // frame is negligible next to the simulation steps between dumps.
+        self.file.flush()?;
         Ok(())
+    }
+
+    /// Flush all buffered data for the current file to disk, leaving it in a **valid, openable**
+    /// state. HDF5 buffers writes and only guarantees a consistent on-disk file once it is flushed
+    /// or closed; a process that crashes (panics, blows up) mid-run before a flush can leave the
+    /// file unreadable. Call this after each frame (cheap relative to a simulation step) so that if
+    /// the run dies, every frame written so far survives. Idempotent and safe to call any time.
+    pub fn flush(&self) -> hdf5::Result<()> {
+        self.file.flush()
     }
 
     /// Total number of frames written across all files.

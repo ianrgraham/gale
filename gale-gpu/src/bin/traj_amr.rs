@@ -56,8 +56,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let nn = sim.state.mesh.refq.n_nodes();
     let mut tw = TrajectoryWriter::create(&out, p, 2)?;
-    let mut topo = tw.write_mesh2d(&sim.state.mesh)?;
-    let mut last_ne = sim.state.mesh.n_elements();
+    // `topology_for` re-emits topology on any GEOMETRY change (not just element-count change), so a
+    // constant-ndof AMR remesh doesn't pair the new field with a stale mesh (which mis-draws cells).
+    let mut topo = tw.topology_for(&sim.state.mesh)?;
 
     // Pack the velocity field of the CURRENT mesh as interleaved [ne, nn, 2] f32.
     let pack = |sim: &Simulation| -> (Vec<f32>, usize) {
@@ -78,18 +79,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nchunks = steps / every;
     for c in 0..nchunks {
         sim.run(every as u64);
-        let ne = sim.state.mesh.n_elements();
-        if ne != last_ne {
-            // The AMR updater changed the mesh ⇒ register a new topology for the frames that follow.
-            topo = tw.write_mesh2d(&sim.state.mesh)?;
-            last_ne = ne;
-        }
+        topo = tw.topology_for(&sim.state.mesh)?;
         let (f, ne) = pack(&sim);
         tw.write_frame(((c + 1) * every) as f64 * dt, ((c + 1) * every) as u64, topo, ne, nn, &[("u", f, 2)], None)?;
         if c % 4 == 0 || ne != 64 {
             println!("  chunk {c}: {ne} elems");
         }
     }
-    println!("wrote {} frames → {out} (final mesh {last_ne} elems)", tw.n_frames());
+    println!("wrote {} frames → {out} (final mesh {} elems)", tw.n_frames(), sim.state.mesh.n_elements());
     Ok(())
 }

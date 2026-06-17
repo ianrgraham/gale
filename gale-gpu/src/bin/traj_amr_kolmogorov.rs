@@ -44,7 +44,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let refine_thr = env_f64("KO_REFINE", 3e-2);
     let coarsen_thr = env_f64("KO_COARSEN", 3e-3);
     let amr_on = env_usize("KO_AMR", 1) != 0;
-    let out = std::env::args().nth(1).unwrap_or_else(|| "/tmp/kolmo.h5".to_string());
+    let bmax = env_f64("KO_BMAX", 0.0); // FENE-P-like trace cap (≈L²); 0 ⇒ unbounded Oldroyd-B
+    let kappa = env_f64("KO_KAPPA", 0.0); // polymer stress diffusion κ (Sc = ν₀/κ); 0 ⇒ off
+    let kimpl = env_usize("KO_KIMPL", 1) != 0; // 1 ⇒ implicit diffusion (no CFL); 0 ⇒ explicit
+    // Output path: an explicit CLI arg / `KO_OUT` wins; otherwise auto-name from the swept
+    // parameters so a parameter scan never overwrites itself. `Sc0` means diffusion off.
+    let sc_tag = if kappa > 0.0 { format!("Sc{:.0}", nu0 / kappa) } else { "Sc0".to_string() };
+    let out = std::env::args().nth(1).or_else(|| std::env::var("KO_OUT").ok()).unwrap_or_else(|| {
+        format!(
+            "/tmp/kolmo_lam{lambda}_F{force}_nu{nu0}_nk{nk}_{sc_tag}_amr{}.h5",
+            amr_on as u8
+        )
+    });
 
     let eta_s = beta * nu0;
     let eta_p = (1.0 - beta) * nu0;
@@ -71,17 +82,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "velocity",
         &[Box::new(u_ic) as Box<dyn Fn(f64, f64) -> f64>, Box::new(v_ic)],
     );
-    // Conformation field, initialized to equilibrium C = I below.
+    // Conformation field. The LogConf model stores Ψ = log C, so equilibrium C = I is Ψ = 0.
     let cid = st.add_field_from(
         "conformation",
         &[
-            Box::new(|_: f64, _: f64| 1.0) as Box<dyn Fn(f64, f64) -> f64>,
+            Box::new(|_: f64, _: f64| 0.0) as Box<dyn Fn(f64, f64) -> f64>,
             Box::new(|_: f64, _: f64| 0.0),
-            Box::new(|_: f64, _: f64| 1.0),
+            Box::new(|_: f64, _: f64| 0.0),
         ],
     );
 
-    let bmax = env_f64("KO_BMAX", 0.0); // FENE-P-like trace cap (≈L²); 0 ⇒ unbounded Oldroyd-B
     let mut integ = gale_gpu::GpuViscoelasticDualSplitting::new(
         vid, cid, dt, eta_s, eta_p, lambda, alpha, ViscoModel::LogConf,
     )
@@ -89,6 +99,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .drive(fx, fy);
     if bmax > 0.0 {
         integ = integ.with_trace_bound(bmax);
+    }
+    if kappa > 0.0 {
+        integ = if kimpl {
+            integ.with_stress_diffusion_implicit(kappa)
+        } else {
+            integ.with_stress_diffusion(kappa)
+        };
+        let mode = if kimpl { "implicit" } else { "explicit" };
+        println!("  stress diffusion κ = {kappa:.2e}  (Sc = ν₀/κ = {:.2}, {mode})", nu0 / kappa);
     }
     let mut sim = Simulation::new(st);
     sim.set_integrator(integ);
@@ -102,50 +121,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let nn = sim.state.mesh.refq.n_nodes();
     let mut tw = TrajectoryWriter::create(&out, p, 2)?;
-    let mut topo = tw.write_mesh2d(&sim.state.mesh)?;
-    let mut last_ne = sim.state.mesh.n_elements();
+    // `topology_for` re-emits a topology whenever the mesh GEOMETRY changes (not just when the
+    // element count changes) — an AMR remesh can swap which cells are refined at constant element
+    // count, and pairing the new field with the old topology renders it at the wrong cells.
+    let mut topo = tw.topology_for(&sim.state.mesh)?;
 
-    // Pack velocity (2-comp) and the polymer-stretch diagnostic tr C (= Cxx + Cyy, 1-comp).
-    let pack = |sim: &Simulation| -> (Vec<f32>, Vec<f32>, usize, f64) {
+    // Pack velocity (2-comp) and the polymer-stretch diagnostic tr C (1-comp). The field stores
+    // Ψ = log C, so convert Ψ → C = exp(Ψ) before taking the trace.
+    let pack = |sim: &Simulation| -> (Vec<f32>, Vec<f32>, usize, f64, f64, bool) {
         let v = sim.state.field("velocity");
-        let c = sim.state.field("conformation");
+        let cfld = sim.state.field("conformation");
         let (ux, uy) = (v.component(0), v.component(1));
-        let (cxx, cyy) = (c.component(0), c.component(2));
+        let psi: [Vec<f64>; 3] =
+            [cfld.component(0).to_vec(), cfld.component(1).to_vec(), cfld.component(2).to_vec()];
+        let lc = gale::dg::LogConfOldroydB::new(&sim.state.mesh, lambda, eta_p);
+        let cc = lc.conformation(&psi); // [Cxx, Cxy, Cyy] = exp(Ψ)
         let ne = sim.state.mesh.n_elements();
         let mut uf = vec![0f32; ne * nn * 2];
         let mut tf = vec![0f32; ne * nn];
         let mut trmax = 0.0f64;
+        let mut vke = 0.0f64; // cross-stream kinetic energy ⟨v²⟩: 0 for laminar Kolmogorov,
+        let mut finite = true; // grows/fluctuates at the elastic(-inertial) instability onset.
         for g in 0..ne * nn {
             uf[g * 2] = ux[g] as f32;
             uf[g * 2 + 1] = uy[g] as f32;
-            let tr = cxx[g] + cyy[g];
+            let tr = cc[0][g] + cc[2][g];
             tf[g] = tr as f32;
             trmax = trmax.max(tr);
+            vke += uy[g] * uy[g];
+            finite &= ux[g].is_finite() && uy[g].is_finite() && tr.is_finite();
         }
-        (uf, tf, ne, trmax)
+        vke /= (ne * nn) as f64;
+        (uf, tf, ne, trmax, vke, finite)
     };
 
-    let (u0, t0, ne0, tr0) = pack(&sim);
+    let (u0, t0, ne0, tr0, vke0, _) = pack(&sim);
     tw.write_frame(0.0, 0, topo, ne0, nn, &[("u", u0, 2), ("trC", t0, 1)], None)?;
-    println!("  frame 0: {ne0} elems, max tr C = {tr0:.3}");
+    println!("  frame 0: {ne0} elems, max tr C = {tr0:.3}, ⟨v²⟩ = {vke0:.3e}");
 
     let nchunks = steps / every;
     for c in 0..nchunks {
         sim.run(every as u64);
-        let ne = sim.state.mesh.n_elements();
-        if ne != last_ne {
-            topo = tw.write_mesh2d(&sim.state.mesh)?;
-            last_ne = ne;
-        }
-        let (uf, tf, ne, trmax) = pack(&sim);
+        topo = tw.topology_for(&sim.state.mesh)?;
+        let (uf, tf, ne, trmax, vke, finite) = pack(&sim);
         let step = ((c + 1) * every) as u64;
-        tw.write_frame(step as f64 * dt, step, topo, ne, nn, &[("u", uf, 2), ("trC", tf, 1)], None)?;
-        if !trmax.is_finite() {
-            eprintln!("  BLEW UP at step {step} (max tr C non-finite) — lower Wi or add a stabilizer");
+        // Stop BEFORE writing a non-finite frame: the trajectory then contains only valid frames,
+        // and (with the per-frame flush in TrajectoryWriter) stays openable even on a blow-up.
+        if !finite {
+            eprintln!("  BLEW UP at step {step} (velocity/tr C non-finite) — lower Wi or add a stabilizer");
             break;
         }
+        tw.write_frame(step as f64 * dt, step, topo, ne, nn, &[("u", uf, 2), ("trC", tf, 1)], None)?;
         if c % 5 == 0 {
-            println!("  frame {}: {ne} elems, max tr C = {trmax:.3}", c + 1);
+            println!("  frame {}: {ne} elems, max tr C = {trmax:.3}, ⟨v²⟩ = {vke:.3e}", c + 1);
         }
     }
     println!("wrote {} frames → {out}", tw.n_frames());

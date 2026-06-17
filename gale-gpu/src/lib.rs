@@ -28,8 +28,10 @@
 pub mod distributed;
 pub mod flow;
 pub mod flow3d;
+pub mod amr_mesh;
 pub mod immersed;
 pub mod operators;
+pub mod resident;
 
 // Backwards-compatible flat re-exports of the most-used host API.
 pub use distributed::{multigpu_advection_2d, multigpu_advection_3d};
@@ -44,9 +46,10 @@ pub use immersed::{
 };
 pub use operators::advection::{advection_rhs, GpuAdvection};
 pub use operators::advection3d::advection3d_rhs;
+pub use operators::amr::{prolong_gpu, restrict_gpu, smoothness_se_gpu};
 pub use operators::burgers::burgers_rhs;
 pub use operators::euler::euler_rhs;
-pub use operators::logconf::{logconf_implicit_relax, logconf_limit_trace, logconf_psi_rhs};
+pub use operators::logconf::{logconf_implicit_relax, logconf_limit_trace, logconf_psi_rhs, GpuLogConf};
 #[cfg(feature = "autodiff")]
 pub use operators::logconf::{
     logconf_fit_relax_params, logconf_implicit_relax_grad, logconf_implicit_relax_vjp,

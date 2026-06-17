@@ -30,26 +30,69 @@ COARSEN/AMR, TRAJ_STEPS/EVERY).
   **trace cap** to the framework log-conf advance: `GpuViscoelasticDualSplitting::with_trace_bound(b)`
   (applies `limit_logconf_trace_bound` after each RK stage). With it, the AMR-OFF high-Wi run is
   healthy (Wi≈16, El≈4: tr C grows smoothly 2.0→3.6 over 600 steps, no blow-up).
-- **OPEN ISSUE — AMR conformation remap breaks SPD.** With AMR ON at the same high Wi, the
-  conformation collapses (tr C → 0) shortly after a remesh. Root cause: `remap_component_flat`
-  prolongs/restricts the conformation tensor **componentwise**, which does NOT preserve positive-
-  definiteness; high-Wi C sits near the SPD boundary, so interpolation pushes it non-SPD → `log C`
-  collapses it. Velocity has no SPD constraint, which is why the Newtonian AMR demos were fine.
-  Confirmed by isolation: AMR-off healthy, AMR-on collapses (same params).
+- **AMR + viscoelastic flow works at high Wi — no SPD issue.** The LogConf model stores **Ψ = log C**
+  (equilibrium Ψ = 0), which is SPD-by-construction (C = exp Ψ), so the componentwise AMR remap of Ψ
+  is fine. With the correct equilibrium IC, AMR-on at Wi≈16/El≈4 is healthy: tr C grows smoothly
+  2 → 10 → 66 → 236 → 500 (the trace cap acting as FENE-P L²), no collapse, no blow-up, and thin
+  birefringent **strands form** (visible in tr C). [Earlier I reported a "tr C → 0 collapse / SPD-loss
+  via remap" — that was WRONG: an artifact of a buggy demo IC (Ψ set to [1,0,1] instead of 0) plus a
+  mislabeled diagnostic (it printed tr Ψ, not tr C). Corrected here.]
+- **CONSTITUTIVE NOTE:** with the LogConf field = Ψ, initialize the conformation field to **0**
+  (equilibrium), not [1,0,1]; and to report tr C you must convert Ψ → C via
+  `LogConfOldroydB::conformation` (the field is the log, not C).
 
-## Fix path (next)
-1. **SPD-preserving conformation remap** (the blocker). Options: (a) remap in log-space (Ψ = log C
-   is unconstrained; C = exp(Ψ) is always SPD) — cleanest but the state field stores C; (b)
-   project C back to SPD after each remap via the existing `limit_conformation_bounds` (det ≥ ε) —
-   a defensive clamp, easiest to bolt on (apply post-remap, or in the integrator before `log C`).
-2. **Then** longer runs + parameter tuning to reach developed ET/EIT (likely Re~1–10, Wi~10–50,
-   El~1–10, FENE-P L²~few hundred), with AMR refining the strands.
-3. **Possibly** a proper polymer **stress-diffusion** term `κ∇²Ψ` (Sc=ν/κ) if the limiter alone
-   doesn't tame the steep stress fronts — the literature standard. AMR's payoff: resolve the strands
-   so a smaller κ (higher Sc, more faithful) suffices vs a uniform mesh.
+## The AMR blow-up — ROOT CAUSE FOUND & FIXED
+With a refine threshold low enough to actually track the strands, the AMR-on run blew up to NaN
+**at a remesh event** (velocity → inf in one step; the implicit Helmholtz/pressure solve returned a
+NaN residual), while the *identical* AMR-off run was perfectly healthy (tr C → 500 cap). The
+blow-up was **not** physics, **not** a remap overshoot, and **not** an SPD loss. It was a stale
+**persistent GPU solver handle**.
+
+- The flow integrators hold persistent elliptic-solver handles (`GpuPoisson`/`GpuPoissonNc`/
+  `GpuPoissonMg`, the P4 perf win) and rebuilt them only when the **dof count changed**
+  (`h.ndof() != ndof`). But an AMR remesh can refine one region and coarsen another, leaving the
+  element count unchanged while the operator (connectivity + per-element metrics) is completely
+  different. (Confirmed in the trace: two consecutive frames both had 594 elements, then it blew
+  up.) The stale handle then applied the **old mesh's operator** to the **new mesh's field** ⇒
+  garbage solve ⇒ one-step blow-up of the coupled flow.
+- **Fix** (`gale-gpu/src/flow.rs`): a cheap **topology fingerprint** (`mesh_fingerprint`, hashing
+  element count + two opposite corner coords per element) stored per integrator; at the top of every
+  `step`, `invalidate_handles_on_remesh` clears all five handle slots when the fingerprint changes,
+  forcing a rebuild for the new operator. Static (non-AMR) meshes compute the fingerprint once and
+  never rebuild ⇒ zero regression (confirmed: `ns-check`, `ve-check` still PASS; `gpu-amr-flow-check`
+  matches CPU to 1.6e-10).
+- **Defense-in-depth** (not the root cause, but a legitimate safety net kept in): a **pointwise**
+  spectral clamp `clamp_logconf_spectrum(Ψ, b)` (cap each eigenvalue of Ψ to ±ln b ⇒ every C
+  eigenvalue in [1/b, b]; reset non-finite nodes to equilibrium). Applied to the conformation as the
+  VE integrator reads it (post-AMR-remap), since the cell-mean-preserving `limit_logconf_trace_bound`
+  *bails out* when the element mean itself violates the bound — exactly what a bad remap produces.
+
+Also fixed alongside: **trajectory durability** — `TrajectoryWriter::write_frame` now flushes after
+each frame, and the demo checks finiteness *before* writing, so a blow-up leaves a valid, openable
+`.h5` with only good frames (previously a crash left the whole file unreadable).
+
+**And the SAME ne-detection mistake in the dump** — the AMR trajectory re-emitted topology only on
+`ne != last_ne`, so a constant-ndof remesh paired the new field with a STALE topology and the viewer
+drew each element at the wrong cell: a blocky horizontal-band scramble. I first misread that scramble
+as high-Wi under-resolution; it was overwhelmingly the topology-pairing bug (proven by re-pairing the
+identical field data with correct vs stale topology — stale=blocky, correct=smooth). FIX:
+`TrajectoryWriter::topology_for(mesh)` re-emits topology only when the geometry actually changes.
+The field is much smoother than first reported. A *minor* genuine under-resolution effect remains at
+late times once tr C saturates the cap (real strand-tip specks + `trC_min → 0.01`), which is the
+honest motivation for stress diffusion below — but it is secondary, not the cause of the glitch.
 
 ## What works now
-`traj-amr-kolmogorov` runs a stable viscoelastic Kolmogorov flow with the trace-bound limiter; AMR
-is wired (refines on conformation smoothness) and works for the velocity field but corrupts the
-conformation at high Wi until the SPD-preserving remap (fix #1) lands. Without AMR it's a clean
-moderate/high-Wi VE flow.
+`traj-amr-kolmogorov` runs a **robust** viscoelastic Kolmogorov flow with AMR tracking the strands:
+at Wi≈16/El≈4 it develops the elastic instability, the thin birefringent stress strands appear, the
+mesh refines to follow them (576 → ~1200 elements over 1000 steps, no blow-up), and the FENE-P-like
+trace cap holds tr C at L². The stale-handle bug that capped how aggressively we could refine is
+gone.
+
+## Fix path (next)
+1. **Longer runs + parameter tuning** to reach developed ET/EIT (Re~1–10, Wi~10–50, El~1–10,
+   FENE-P L² ~ few hundred), now that AMR can refine freely.
+2. **Possibly** a proper polymer **stress-diffusion** term `κ∇²Ψ` (Sc=ν/κ) if the trace cap alone
+   doesn't tame the steep stress fronts — the literature standard. AMR's payoff: resolve the strands
+   so a smaller κ (higher Sc, more faithful) suffices vs a uniform mesh.
+3. Indicate on a strand-sharp field if needed (Ψ = log C compresses strand contrast: tr C≈300 is
+   only Ψ≈5.7); storing/indicating on tr C is an option.

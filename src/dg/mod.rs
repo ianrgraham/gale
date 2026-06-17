@@ -64,6 +64,8 @@ pub mod viscoelastic3d;
 pub mod filter;
 #[path = "operators/multigrid.rs"]
 pub mod multigrid;
+#[path = "operators/multigrid_nc.rs"]
+pub mod multigrid_nc;
 #[path = "operators/shifted_multigrid.rs"]
 pub mod shifted_multigrid;
 
@@ -114,6 +116,7 @@ pub use hyperbolic::{
 };
 pub use mesh::{Element, Mesh2d, Neighbor};
 pub use multigrid::PMultigrid;
+pub use multigrid_nc::PMultigridNc;
 pub use shifted_multigrid::ShiftedMultigrid;
 pub use nonconforming::{NcAdvection, NcMesh, NcNeighbor};
 pub use poisson::{Poisson, ShiftedPoisson};
@@ -123,7 +126,8 @@ pub use quad::Reference2dQuad;
 pub use reference::Reference1d;
 pub use stokes::{ConvectionScheme, Stokes};
 pub use viscoelastic::{
-    free_energy_density, free_energy_total, limit_conformation_bounds, limit_logconf_trace_bound,
+    clamp_logconf_spectrum, free_energy_density, free_energy_total, limit_conformation_bounds,
+    limit_logconf_trace_bound,
     limit_scalar_bounds, log_conformation, upwind_advection_lift, ConformationBoundLimiter,
     ConformationInflow, ConstitutiveModel, LogConfOldroydB, LogConfTraceLimiter, OldroydB,
     ViscoelasticFlow,

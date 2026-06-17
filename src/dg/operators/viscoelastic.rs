@@ -1117,6 +1117,42 @@ pub fn limit_logconf_trace_bound(mesh: &Mesh2d, psi: &mut [Vec<f64>], b_max: f64
     }
 }
 
+/// **Pointwise** eigenvalue clamp of the log-conformation `Ψ` so the recovered conformation
+/// `C = exp(Ψ)` has every eigenvalue in `[1/b_max, b_max]` at every node. Unlike
+/// [`limit_logconf_trace_bound`] (a cell-mean-preserving Zhang–Shu blend that *bails out* when
+/// the element mean already violates the bound), this is an unconditional per-node spectral
+/// projection: `m_i ← clamp(m_i, −ln b_max, +ln b_max)`. It is dissipative (does **not** preserve
+/// the cell mean), so it is NOT for the transport step — its job is to sanitise a field that an
+/// **AMR remap** has just Lagrange-interpolated. At a thin stress strand that interpolation can
+/// overshoot Ψ; because `C = exp(Ψ)` amplifies the overshoot exponentially, an un-clamped remapped
+/// field blows the momentum solve to NaN before the per-RK-stage limiter can act. Applying this on
+/// the conformation as it is read (post-remap) bounds the spectrum unconditionally.
+pub fn clamp_logconf_spectrum(psi: &mut [Vec<f64>], b_max: f64) {
+    if !b_max.is_finite() || b_max <= 1.0 {
+        return;
+    }
+    let lim = b_max.ln();
+    let n = psi[0].len();
+    for g in 0..n {
+        let (a, b, d) = (psi[0][g], psi[1][g], psi[2][g]);
+        if !(a.is_finite() && b.is_finite() && d.is_finite()) {
+            // Irrecoverable node (a prior step already produced NaN/Inf): reset to equilibrium.
+            psi[0][g] = 0.0;
+            psi[1][g] = 0.0;
+            psi[2][g] = 0.0;
+            continue;
+        }
+        let (mu1, mu2, c, s) = sym_eig(a, b, d);
+        let m1 = mu1.clamp(-lim, lim);
+        let m2 = mu2.clamp(-lim, lim);
+        if m1 != mu1 || m2 != mu2 {
+            psi[0][g] = c * c * m1 + s * s * m2;
+            psi[1][g] = c * s * (m1 - m2);
+            psi[2][g] = s * s * m1 + c * c * m2;
+        }
+    }
+}
+
 /// [`StageHook`](crate::sim::integrate::StageHook) wrapper for [`limit_logconf_trace_bound`],
 /// enforcing `tr exp(Ψ) ≤ b_max` on the log-conformation state after each Runge–Kutta stage.
 pub struct LogConfTraceLimiter {
@@ -1872,6 +1908,31 @@ mod tests {
         for v in 0..3 {
             assert!((m1[v] - m0[v]).abs() < 1e-12, "Ψ-mean comp {v} not conserved");
         }
+    }
+
+    #[test]
+    fn spectral_clamp_bounds_unconditionally_even_with_bad_mean() {
+        // The pointwise spectral clamp must bound the spectrum even when the *element mean* already
+        // violates the bound — the exact case `limit_logconf_trace_bound` bails out of, and the one
+        // an AMR remap overshoot produces. Also: non-finite nodes reset to equilibrium.
+        let b = 10.0;
+        let lim = (b as f64).ln();
+        // Every node over the bound (so the mean is over too): Ψ = diag(5, 0) ⇒ tr C = e⁵+1 ≈ 149.
+        let ndof = 4;
+        let mut psi = [vec![5.0; ndof], vec![0.0; ndof], vec![0.0; ndof]];
+        psi[0][3] = f64::NAN; // an irrecoverable node from a prior blow-up
+        psi[1][3] = f64::INFINITY;
+        clamp_logconf_spectrum(&mut psi, b);
+        for g in 0..ndof {
+            let (a, bb, d) = (psi[0][g], psi[1][g], psi[2][g]);
+            assert!(a.is_finite() && bb.is_finite() && d.is_finite(), "node {g} left non-finite");
+            let (m1, m2, _, _) = sym_eig(a, bb, d);
+            assert!(m1 <= lim + 1e-12 && m2 <= lim + 1e-12, "node {g} eigenvalue exceeds ln(b)");
+            // C = exp(Ψ) eigenvalues ≤ b ⇒ tr C ≤ 2b, and stays SPD.
+            assert!(m1.exp() <= b + 1e-9 && m2.exp() <= b + 1e-9, "node {g} C eigenvalue > b");
+        }
+        // The NaN node was reset to equilibrium Ψ = 0 (C = I).
+        assert_eq!((psi[0][3], psi[1][3], psi[2][3]), (0.0, 0.0, 0.0));
     }
 
     #[test]

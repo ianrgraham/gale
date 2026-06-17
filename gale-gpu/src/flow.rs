@@ -19,6 +19,7 @@ use crate::operators::poisson::{
 use crate::operators::poisson_nc::{
     helmholtz_nc_cg_solve_tags, poisson_nc_cg_solve, pressure_nc_cg_solve, GpuPoissonNc,
 };
+use crate::operators::logconf::GpuLogConf;
 use std::cell::RefCell;
 
 /// True if the mesh has any 2:1 non-conforming interface (hanging nodes). The GPU
@@ -29,6 +30,54 @@ fn mesh_is_nonconforming(mesh: &Mesh2d) -> bool {
     mesh.elements.iter().any(|el| {
         el.neighbors.iter().any(|n| matches!(n, Neighbor::CoarseToFine { .. } | Neighbor::FineToCoarse { .. }))
     })
+}
+
+/// A cheap topology fingerprint of `mesh`, used to detect an AMR remesh that the persistent
+/// solver handles must be rebuilt for. Hashing the dof count alone is **not** enough: a remesh
+/// can refine one region and coarsen another, leaving the element count unchanged while the
+/// operator (connectivity + per-element metrics) is completely different — a stale handle then
+/// applies the OLD operator to the NEW field and the solve returns garbage (in practice a
+/// one-step blow-up of the coupled viscoelastic flow). Two opposite corners per element pin down
+/// each element's position and size, so this changes whenever any cell is refined/coarsened or the
+/// element ordering shifts, even at constant dof count.
+fn mesh_fingerprint(mesh: &Mesh2d) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    mesh.n_elements().hash(&mut h);
+    for el in &mesh.elements {
+        let last = el.geom.x.len() - 1;
+        el.geom.x[0].to_bits().hash(&mut h);
+        el.geom.y[0].to_bits().hash(&mut h);
+        el.geom.x[last].to_bits().hash(&mut h);
+        el.geom.y[last].to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Discard every persistent solver handle when the mesh topology has changed since the last step
+/// (an AMR remesh). Compares the stored fingerprint in `fp` against the current mesh; on a
+/// mismatch it clears all five handle slots (so the `ensure_*` helpers rebuild them for the new
+/// operator) and records the new fingerprint. The `ndof`-only guard inside `ensure_*` cannot catch
+/// a constant-dof remesh — this does. Call once at the top of every integrator `step`.
+#[allow(clippy::too_many_arguments)]
+fn invalidate_handles_on_remesh(
+    fp: &RefCell<Option<u64>>,
+    mesh: &Mesh2d,
+    poisson: &RefCell<Option<GpuPoisson>>,
+    poisson_nc: &RefCell<Option<GpuPoissonNc>>,
+    mg_pressure: &RefCell<Option<GpuPoissonMg>>,
+    mg_velx: &RefCell<Option<GpuPoissonMg>>,
+    mg_vely: &RefCell<Option<GpuPoissonMg>>,
+) {
+    let cur = mesh_fingerprint(mesh);
+    if fp.borrow().map_or(true, |old| old != cur) {
+        *poisson.borrow_mut() = None;
+        *poisson_nc.borrow_mut() = None;
+        *mg_pressure.borrow_mut() = None;
+        *mg_velx.borrow_mut() = None;
+        *mg_vely.borrow_mut() = None;
+        *fp.borrow_mut() = Some(cur);
+    }
 }
 
 /// Lazily (re)build the persistent [`GpuPoisson`] handle in `slot` for `mesh`, so an
@@ -65,7 +114,8 @@ fn ensure_poisson_nc_handle(slot: &RefCell<Option<GpuPoissonNc>>, mesh: &Mesh2d,
     }
 }
 use gale::dg::{
-    limit_logconf_trace_bound, log_conformation, upwind_advection_lift, BoundaryConditions,
+    clamp_logconf_spectrum, limit_logconf_trace_bound, log_conformation, upwind_advection_lift,
+    BoundaryConditions,
     ConformationInflow, ConstitutiveModel, ConvectionScheme, Hyperbolic, IncompressibleConvection,
     LogConfOldroydB, Mesh2d, OldroydB, PMultigrid, Poisson, VolumeForm,
 };
@@ -89,9 +139,10 @@ fn ensure_mg_pressure_handle(
     let ndof = mesh.n_elements() * mesh.refq.n_nodes();
     if cur.as_ref().map_or(true, |h| h.ndof() != ndof) {
         // None if `mesh` is not a uniform rectangular grid ⇒ stay on the CG pressure path.
-        // CUDA-graph the V-cycle: the MG solve is launch-bound, so capturing its ~500-launch
-        // sequence and replaying it with one cuGraphLaunch is a bit-exact 1.0–1.5× wall-clock win
-        // (largest at the small/medium grids the flow runs). Validated end-to-end through ns-check.
+        // CUDA-graph the V-cycle (launch-bound remediation; ~bit-exact, validated through ns-check).
+        // NOTE: the whole-loop `with_while_graph` path was A/B-tested here and gave NO wall-clock
+        // win (it removed graph-capture/alloc API churn, but that was <1 ms/step — the per-step cost
+        // is host-bound, dominated by the trace limiter when the FENE-P cap is on). Left off.
         *cur = PMultigrid::from_mesh(mesh, alpha, 0.0, neumann_tags)
             .and_then(|mg| GpuPoissonMg::new(mg).and_then(|h| h.with_cuda_graph(true)).ok());
     }
@@ -690,6 +741,9 @@ pub struct GpuStokesIntegrator {
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
     mg_velx: RefCell<Option<GpuPoissonMg>>,
     mg_vely: RefCell<Option<GpuPoissonMg>>,
+    /// Topology fingerprint of the mesh the handles above were built for; an AMR remesh changes it
+    /// and forces a rebuild (see [`invalidate_handles_on_remesh`]).
+    mesh_fp: RefCell<Option<u64>>,
     solve_tol: f64,
 }
 
@@ -709,6 +763,7 @@ impl GpuStokesIntegrator {
             mg_pressure: RefCell::new(None),
             mg_velx: RefCell::new(None),
             mg_vely: RefCell::new(None),
+            mesh_fp: RefCell::new(None),
             solve_tol: 1e-10,
         }
     }
@@ -741,6 +796,10 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
 
     fn step(&self, state: &mut gale::sim::State, hook: &dyn gale::sim::StateStageHook) {
         let t_new = state.time.t + self.dt;
+        invalidate_handles_on_remesh(
+            &self.mesh_fp, &state.mesh, &self.poisson, &self.poisson_nc, &self.mg_pressure,
+            &self.mg_velx, &self.mg_vely,
+        );
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
         ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, state.mesh.boundary_tags());
@@ -813,6 +872,9 @@ pub struct GpuDualSplitting {
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
     mg_velx: RefCell<Option<GpuPoissonMg>>,
     mg_vely: RefCell<Option<GpuPoissonMg>>,
+    /// Topology fingerprint of the mesh the handles above were built for; an AMR remesh changes it
+    /// and forces a rebuild (see [`invalidate_handles_on_remesh`]).
+    mesh_fp: RefCell<Option<u64>>,
     solve_tol: f64,
 }
 
@@ -838,6 +900,7 @@ impl GpuDualSplitting {
             mg_pressure: RefCell::new(None),
             mg_velx: RefCell::new(None),
             mg_vely: RefCell::new(None),
+            mesh_fp: RefCell::new(None),
             solve_tol: 1e-10,
         }
     }
@@ -911,6 +974,10 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
             None => (Vec::new(), Vec::new()),
         };
         let lambda = 1.0 / (self.nu * self.dt);
+        invalidate_handles_on_remesh(
+            &self.mesh_fp, &state.mesh, &self.poisson, &self.poisson_nc, &self.mg_pressure,
+            &self.mg_velx, &self.mg_vely,
+        );
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
         ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, pres_tags);
@@ -1020,8 +1087,10 @@ fn oldroyd_advance_gpu(
 /// One SSP-RK3 step of the log-conformation transport with a fixed velocity,
 /// evaluating the rhs on the **GPU** ([`crate::logconf_psi_rhs`]). Mirrors
 /// `gale::dg::LogConfOldroydB::step_ssp_rk3`.
+#[allow(clippy::too_many_arguments)]
 fn logconf_advance_gpu(
     mesh: &Mesh2d,
+    lcg: &GpuLogConf,
     lc: &LogConfOldroydB,
     psi: &[Vec<f64>; 3],
     ux: &[f64],
@@ -1029,17 +1098,39 @@ fn logconf_advance_gpu(
     dt: f64,
     inflow: Option<&ConformationInflow>,
     trace_bound: Option<f64>,
+    kappa: f64,
+    alpha: f64,
 ) -> ConfResult {
-    // Full rhs = GPU device kernel + host upwind lift. The advected variable is Ψ, so
-    // the inflow conformation C_in enters as Ψ_in = log C_in.
+    // Optional polymer stress diffusion κ∇²Ψ (Sureshkumar–Beris). Computed via the SIPG Laplacian:
+    // the operator `apply` gives the weak action (A Ψ)_i ≈ m_i·(−∇²Ψ)_i with lumped mass m_i = jw_i,
+    // so the strong-form nodal Laplacian is ∇²Ψ ≈ −(A Ψ)_i / jw_i and the diffusion contribution to
+    // dΨ/dt is −κ (A Ψ)_i / jw_i. Pure-Neumann BC (zero stress flux at the walls), reaction 0. Built
+    // once outside the rhs closure; A is SPD ⇒ the term is dissipative (stable, explicit).
+    let diffusion = (kappa > 0.0).then(|| {
+        let op = Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags());
+        let nn = mesh.refq.n_nodes();
+        let jw: Vec<f64> = mesh.elements.iter().flat_map(|e| e.geom.jw.iter().copied()).collect();
+        debug_assert_eq!(jw.len(), mesh.n_elements() * nn);
+        (op, jw)
+    });
+    // Full rhs = GPU device kernel + host upwind lift (+ optional host SIPG stress diffusion). The
+    // advected variable is Ψ, so the inflow conformation C_in enters as Ψ_in = log C_in.
     let rhs = |pp: &[Vec<f64>; 3]| -> ConfResult {
-        let mut k = crate::logconf_psi_rhs(mesh, lc, pp, ux, uy)?;
+        let mut k = lcg.psi_rhs(mesh, lc, pp, ux, uy)?;
         let lift = upwind_advection_lift(mesh, pp, ux, uy, |tag| {
             inflow.filter(|i| i.tags.contains(&tag)).map(|i| log_conformation(i.c))
         });
         for comp in 0..3 {
             for g in 0..k[comp].len() {
                 k[comp][g] += lift[comp][g];
+            }
+        }
+        if let Some((op, jw)) = &diffusion {
+            for comp in 0..3 {
+                let a_psi = op.apply(&pp[comp]);
+                for g in 0..k[comp].len() {
+                    k[comp][g] -= kappa * a_psi[g] / jw[g];
+                }
             }
         }
         Ok(k)
@@ -1059,6 +1150,48 @@ fn logconf_advance_gpu(
     let u2 = clip(combine3(psi, 0.75, &axpy3(&u1, &k1, dt), 0.25));
     let k2 = rhs(&u2)?;
     Ok(clip(combine3(psi, 1.0 / 3.0, &axpy3(&u2, &k2, dt), 2.0 / 3.0)))
+}
+
+/// Operator-split **implicit** polymer stress diffusion for the log-conformation field. For each Ψ
+/// component it solves the backward-Euler diffusion update `Ψⁿ⁺¹ = (I − dt·κ M⁻¹A)⁻¹ Ψ*`, written
+/// as the Helmholtz system `(λ_d M + A) Ψⁿ⁺¹ = λ_d M Ψ*` with `λ_d = 1/(dt·κ)` and pure-Neumann BC
+/// (zero stress flux at the walls; `M = diag(jw)` is the lumped DG-SEM mass). Unconditionally
+/// stable ⇒ κ (and the strand width ≈ √(κ/γ̇)) is NOT limited by the step, and the mesh can be
+/// refined freely — unlike the explicit κ∇²Ψ in [`logconf_advance_gpu`]. Reuses the GPU CG
+/// Helmholtz solve, dispatching to the non-conforming (mortar) path on AMR meshes. With a physical
+/// κ (Sc ≈ 1) λ_d is large, so the operator is mass-dominated and the CG converges in a few iters.
+#[allow(clippy::too_many_arguments)]
+fn apply_logconf_diffusion_implicit(
+    mesh: &Mesh2d,
+    psi: &mut [Vec<f64>; 3],
+    kappa: f64,
+    dt: f64,
+    alpha: f64,
+    tol: f64,
+    poisson: Option<&GpuPoisson>,
+    poisson_nc: Option<&GpuPoissonNc>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let lambda_d = 1.0 / (dt * kappa);
+    let jw: Vec<f64> = mesh.elements.iter().flat_map(|e| e.geom.jw.iter().copied()).collect();
+    let neumann = mesh.boundary_tags();
+    for comp in 0..3 {
+        // RHS b = λ_d M Ψ* with the lumped mass M = diag(jw).
+        let b: Vec<f64> = psi[comp].iter().zip(&jw).map(|(p, w)| lambda_d * w * p).collect();
+        // Reuse the integrator's PERSISTENT elliptic handle (mesh uploaded once) — three one-shot
+        // solves per step would re-flatten+re-upload the operator each call and dominate the cost.
+        // The operator is non-singular (λ_d M makes it SPD even all-Neumann), so no deflation.
+        let (sol, _iters) = match (poisson, poisson_nc) {
+            (Some(h), _) => h.solve(&b, lambda_d, &neumann, false, tol, 20000)?,
+            (_, Some(h)) => h.solve(&b, lambda_d, &neumann, false, tol, 20000)?,
+            // Fallback (no persistent handle available): one-shot CG.
+            _ if mesh_is_nonconforming(mesh) => {
+                helmholtz_nc_cg_solve_tags(mesh, &b, alpha, lambda_d, &neumann, tol, 20000)?
+            }
+            _ => helmholtz_cg_solve_tags(mesh, &b, alpha, lambda_d, &neumann, tol, 20000)?,
+        };
+        psi[comp] = sol;
+    }
+    Ok(())
 }
 
 /// One **ARK2 / ARS(2,2,2)** IMEX step of the log-conformation transport with a fixed
@@ -1137,6 +1270,16 @@ pub struct GpuViscoelasticDualSplitting {
     /// Optional bound-preserving cap on `tr C` (log-conf model only) — the FENE-P-like finite-
     /// extensibility limiter applied after each conformation RK stage. `None` ⇒ unbounded (Oldroyd-B).
     trace_bound: Option<f64>,
+    /// Polymer **stress-diffusion** coefficient `κ` (log-conf model): adds `κ∇²Ψ` to the
+    /// conformation transport (Sureshkumar–Beris regularization, Schmidt number `Sc = ν/κ`). `0` ⇒
+    /// off. Gives the thin birefringent stress strands a finite, mesh-resolvable width so high-Wi
+    /// elastic-turbulence runs don't accumulate grid-scale stress noise. Treated EXPLICITLY in the
+    /// SSP-RK3 rhs ⇒ a parabolic step limit `dt ≲ h²/κ` (fine at one refinement level).
+    kappa: f64,
+    /// If set, apply `κ∇²Ψ` IMPLICITLY (operator-split Helmholtz solve after the transport) instead
+    /// of explicitly in the RK3 rhs. Removes the parabolic step limit, so a meaningful `κ` (Sc ~ 1)
+    /// works and the mesh can be refined freely — the required path for elastic-turbulence runs.
+    diffusion_implicit: bool,
     /// Persistent GPU Poisson handle (P4) for the momentum (velocity) solves, lazily built
     /// on the first step and reused across timesteps. Conforming meshes only.
     poisson: RefCell<Option<GpuPoisson>>,
@@ -1144,6 +1287,14 @@ pub struct GpuViscoelasticDualSplitting {
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
     mg_velx: RefCell<Option<GpuPoissonMg>>,
     mg_vely: RefCell<Option<GpuPoissonMg>>,
+    /// Topology fingerprint of the mesh the handles above were built for; an AMR remesh changes it
+    /// and forces a rebuild (see [`invalidate_handles_on_remesh`]).
+    mesh_fp: RefCell<Option<u64>>,
+    /// Persistent log-conformation kernel handle (context + loaded module), built once and reused
+    /// across all RK stages and steps. Mesh-INDEPENDENT, so it survives AMR remeshes unchanged.
+    /// Without it, the conformation rhs created a context + JIT-loaded the kernel bundle on every
+    /// call (3×/step), leaving the GPU near-idle — the dominant viscoelastic-step cost.
+    logconf: RefCell<Option<GpuLogConf>>,
     solve_tol: f64,
 }
 
@@ -1177,11 +1328,15 @@ impl GpuViscoelasticDualSplitting {
             fy: Box::new(|_, _, _| 0.0),
             inflow: None,
             trace_bound: None,
+            kappa: 0.0,
+            diffusion_implicit: false,
             poisson: RefCell::new(None),
             poisson_nc: RefCell::new(None),
             mg_pressure: RefCell::new(None),
             mg_velx: RefCell::new(None),
             mg_vely: RefCell::new(None),
+            mesh_fp: RefCell::new(None),
+            logconf: RefCell::new(None),
             solve_tol: 1e-10,
         }
     }
@@ -1191,6 +1346,26 @@ impl GpuViscoelasticDualSplitting {
     /// the maximum polymer stretch (≈ FENE-P L²). Default off (unbounded Oldroyd-B).
     pub fn with_trace_bound(mut self, b_max: f64) -> Self {
         self.trace_bound = Some(b_max);
+        self
+    }
+
+    /// Add polymer **stress diffusion** `κ∇²Ψ` to the (log-conf) conformation transport
+    /// (Sureshkumar–Beris; Schmidt number `Sc = ν/κ`). Regularizes the thin stress strands to a
+    /// finite, resolvable width — the standard stabilizer for elastic / elasto-inertial turbulence.
+    /// Default off (`κ = 0`). Explicit ⇒ keep `dt ≲ h²/κ`.
+    pub fn with_stress_diffusion(mut self, kappa: f64) -> Self {
+        self.kappa = kappa;
+        self.diffusion_implicit = false;
+        self
+    }
+
+    /// Add polymer stress diffusion `κ∇²Ψ` applied **implicitly** (operator-split Helmholtz solve
+    /// after the transport). Unlike [`with_stress_diffusion`] there is NO parabolic step limit, so a
+    /// physically meaningful `κ` (Schmidt number `Sc = ν/κ ~ 1`) can be used and the mesh refined
+    /// freely — the path for elastic / elasto-inertial turbulence. Log-conf model only.
+    pub fn with_stress_diffusion_implicit(mut self, kappa: f64) -> Self {
+        self.kappa = kappa;
+        self.diffusion_implicit = true;
         self
     }
 
@@ -1278,12 +1453,28 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
                 let v = state.fields.by_id(self.velocity);
                 (v.component(0).to_vec(), v.component(1).to_vec())
             };
-            let c = {
+            let mut c = {
                 let f = state.fields.by_id(self.conformation);
                 [f.component(0).to_vec(), f.component(1).to_vec(), f.component(2).to_vec()]
             };
+            // The conformation we just read may have been remapped by an AMR pass since the last
+            // step. AMR Lagrange-interpolates Ψ = log C across element boundaries; at a sharp stress
+            // strand that interpolation can OVERSHOOT, and because C = exp(Ψ) the overshoot is
+            // amplified exponentially — enough to blow up the momentum solve to NaN before the
+            // per-RK-stage limiter downstream ever runs. The cell-mean-preserving
+            // `limit_logconf_trace_bound` can't help here: it *bails out* when the element mean
+            // itself violates the bound (which a bad remap produces). Use the unconditional
+            // POINTWISE spectral clamp on the just-read Ψ instead, so the (possibly overshot)
+            // remapped field is sanitised before it feeds the stress divergence and the advance.
+            if let Some(b) = self.trace_bound {
+                clamp_logconf_spectrum(&mut c, b);
+            }
             // Momentum: GPU velocity using ∇·τ_p from the OLD conformation + drive.
             let (bx, by) = self.body_force(&state.mesh, &c, t_new);
+            invalidate_handles_on_remesh(
+                &self.mesh_fp, &state.mesh, &self.poisson, &self.poisson_nc, &self.mg_pressure,
+                &self.mg_velx, &self.mg_vely,
+            );
             ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
             ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
             ensure_mg_pressure_handle(&self.mg_pressure, &state.mesh, self.alpha, state.mesh.boundary_tags());
@@ -1314,16 +1505,40 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
                 .expect("gale-gpu: viscoelastic velocity step failed");
             // Constitutive: GPU SSP-RK3 conformation transport with the NEW velocity.
-            let npsi = match self.model {
+            // Stress diffusion κ∇²Ψ is applied EXPLICITLY inside the RK3 rhs (`kappa_explicit`)
+            // unless implicit diffusion is selected, in which case it's an operator-split implicit
+            // solve AFTER the transport (no parabolic CFL — see `apply_logconf_diffusion_implicit`).
+            let kappa_explicit = if self.diffusion_implicit { 0.0 } else { self.kappa };
+            let mut npsi = match self.model {
                 gale::sim::ViscoModel::OldroydB => {
                     oldroyd_advance_gpu(&state.mesh, &c, &nux, &nuy, self.dt, self.lambda, self.inflow.as_ref())
                 }
                 gale::sim::ViscoModel::LogConf => {
+                    // Persistent log-conf kernel handle (context + module loaded once, reused across
+                    // all RK stages and steps). Mesh-independent ⇒ never rebuilt on a remesh.
+                    if self.logconf.borrow().is_none() {
+                        *self.logconf.borrow_mut() =
+                            Some(GpuLogConf::new().expect("gale-gpu: GpuLogConf build failed"));
+                    }
+                    let lcg = self.logconf.borrow();
+                    let lcg = lcg.as_ref().unwrap();
                     let lc = LogConfOldroydB::new(&state.mesh, self.lambda, self.eta_p);
-                    logconf_advance_gpu(&state.mesh, &lc, &c, &nux, &nuy, self.dt, self.inflow.as_ref(), self.trace_bound)
+                    logconf_advance_gpu(&state.mesh, lcg, &lc, &c, &nux, &nuy, self.dt, self.inflow.as_ref(), self.trace_bound, kappa_explicit, self.alpha)
                 }
             }
             .expect("gale-gpu: viscoelastic conformation advance failed");
+            if self.diffusion_implicit && self.kappa > 0.0 && matches!(self.model, gale::sim::ViscoModel::LogConf) {
+                apply_logconf_diffusion_implicit(
+                    &state.mesh, &mut npsi, self.kappa, self.dt, self.alpha, self.solve_tol,
+                    handle.as_ref(), nc_handle.as_ref(),
+                )
+                .expect("gale-gpu: implicit stress-diffusion solve failed");
+                // Diffusion smooths, so it should not push tr C over the cap — but re-apply the
+                // bound after the split to keep the FENE-P guarantee exact.
+                if let Some(b) = self.trace_bound {
+                    limit_logconf_trace_bound(&state.mesh, &mut npsi, b);
+                }
+            }
             (nux, nuy, npsi)
         };
         {

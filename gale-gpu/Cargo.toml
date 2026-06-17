@@ -461,6 +461,18 @@ name = "rhs-assemble-check"
 path = "src/bin/rhs_assemble_check.rs"
 
 [[bin]]
+name = "resident-ns-check"
+path = "src/bin/resident_ns_check.rs"
+
+[[bin]]
+name = "resident-ve-kernels-check"
+path = "src/bin/resident_ve_kernels_check.rs"
+
+[[bin]]
+name = "resident-ve-check"
+path = "src/bin/resident_ve_check.rs"
+
+[[bin]]
 name = "device-resident-flow-check"
 path = "src/bin/device_resident_flow_check.rs"
 
@@ -506,3 +518,75 @@ path = "src/bin/sbm_velocity_check.rs"
 [[bin]]
 name = "sbm-moving-disk-check"
 path = "src/bin/sbm_moving_disk_check.rs"
+
+[[bin]]
+name = "resident-ve-perf"
+path = "src/bin/resident_ve_perf.rs"
+
+[[bin]]
+name = "amr-indicator-check"
+path = "src/bin/amr_indicator_check.rs"
+
+[[bin]]
+name = "amr-flag-check"
+path = "src/bin/amr_flag_check.rs"
+
+[[bin]]
+name = "amr-refine-device-check"
+path = "src/bin/amr_refine_device_check.rs"
+
+[[bin]]
+name = "amr-balance-device-check"
+path = "src/bin/amr_balance_device_check.rs"
+
+[[bin]]
+name = "amr-connectivity-device-check"
+path = "src/bin/amr_connectivity_device_check.rs"
+
+[[bin]]
+name = "amr-remap-device-check"
+path = "src/bin/amr_remap_device_check.rs"
+
+[[bin]]
+name = "amr-resident-adapt-check"
+path = "src/bin/amr_resident_adapt_check.rs"
+
+[[bin]]
+name = "amr-adapt-perf"
+path = "src/bin/amr_adapt_perf.rs"
+
+[[bin]]
+name = "resident-ns-step-perf"
+path = "src/bin/resident_ns_step_perf.rs"
+
+[[bin]]
+name = "nc-mg-check"
+path = "src/bin/nc_mg_check.rs"
+
+[[bin]]
+name = "amr-remap-check"
+path = "src/bin/amr_remap_check.rs"
+
+[[bin]]
+name = "amr-mesh-check"
+path = "src/bin/amr_mesh_check.rs"
+
+[[bin]]
+name = "amr-connectivity-check"
+path = "src/bin/amr_connectivity_check.rs"
+
+[[bin]]
+name = "amr-nc-resident-check"
+path = "src/bin/amr_nc_resident_check.rs"
+
+[[bin]]
+name = "device-resident-flow-nc-check"
+path = "src/bin/device_resident_flow_nc_check.rs"
+
+[[bin]]
+name = "device-resident-adapt-check"
+path = "src/bin/device_resident_adapt_check.rs"
+
+[[bin]]
+name = "dump-bundles"
+path = "src/bin/dump_bundles.rs"

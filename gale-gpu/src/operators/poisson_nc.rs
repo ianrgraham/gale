@@ -96,7 +96,7 @@ mod kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn operator_nc(
         d: &[f64], u: &[f64], gx: &[f64], gy: &[f64], rx: &[f64], ry: &[f64], sx: &[f64],
-        sy: &[f64], jw: &[f64], n1: u32,
+        sy: &[f64], jw: &[f64], n1: u32, ne: u32,
         // conforming-face data (natural face order), `(e*4+t)*n1 + a`:
         face_vl: &[u32], face_nx: &[f64], face_ny: &[f64], face_sw: &[f64], face_nbr: &[u32],
         // per-edge metadata:
@@ -108,81 +108,78 @@ mod kernels {
         p0: &[f64], p1: &[f64],
         lambda: f64, mut out: DisjointSlice<f64>,
     ) {
+        let _ = ne; // kept for signature stability; this kernel launches one block per element
         static mut DS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         static mut PR: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         static mut PS: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut RF: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut HX: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
-        static mut HY: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
         let n1 = n1 as usize;
         let nn = n1 * n1;
         let e = thread::blockIdx_x() as usize;
         let m = thread::threadIdx_x() as usize;
         let b = e * nn + m;
+        let wx = jw[b] * gx[b];
+        let wy = jw[b] * gy[b];
         unsafe {
             DS[m] = d[m];
-            RF[m] = 0.0;
-            HX[m] = 0.0;
-            HY[m] = 0.0;
-            let wx = jw[b] * gx[b];
-            let wy = jw[b] * gy[b];
             PR[m] = rx[b] * wx + ry[b] * wy;
             PS[m] = sx[b] * wx + sy[b] * wy;
         }
-        thread::sync_threads();
-        if m == 0 {
-            let mut t = 0usize;
-            while t < 4 {
-                let et = e * 4 + t;
-                let kind = ekind[et];
-                let tau = etau[et];
-                if kind == K_CONF {
-                    // ---- conforming Interior / Dirichlet(BND) / Neumann(NEU) ----
-                    // Identical to the conforming `operator`: per face node `a` in the
-                    // face's natural order, `face_nbr` gives the neighbor global node.
-                    let mut a = 0usize;
-                    while a < n1 {
+
+        // ---- Face/SIPG/mortar contribution by node-parallel GATHER ----
+        // Thread `m` owns local node `m` and accumulates ITS OWN SIPG consistency/penalty `rf` and
+        // symmetry-lift `hx,hy` into REGISTERS (no shared accumulators ⇒ no cross-face races, fully
+        // parallel — replaces the old single-thread `m==0` face loop, which left 15 of 16 threads idle
+        // and ran the matvec at ~18% occupancy). For each of the 4 edges we find node `m`'s position on
+        // that edge (a cheap `n1` scan of the edge's node list; `m` is on the edge iff found), then run
+        // the SAME per-kind arithmetic as before for that one node — per-node contribution set and
+        // accumulation order are identical ⇒ bit-for-bit equal. (Multi-element packing was tried and
+        // REVERTED: this gather is register-heavy and latency-bound, so over-subscribing threads/block
+        // spills and is measurably slower — same lesson as the conforming operator.)
+        let mut rf = 0.0f64;
+        let mut hx = 0.0f64;
+        let mut hy = 0.0f64;
+        let mut t = 0usize;
+        while t < 4 {
+            let et = e * 4 + t;
+            let kind = ekind[et];
+            let tau = etau[et];
+            if kind == K_CONF {
+                // conforming: node list is the face's natural order `face_vl`.
+                let mut a = 0usize;
+                while a < n1 {
+                    if face_vl[et * n1 + a] as usize == m {
                         let idx = et * n1 + a;
-                        let vl = face_vl[idx] as usize;
-                        let nx = face_nx[idx];
-                        let ny = face_ny[idx];
-                        let sw = face_sw[idx];
                         let nbr = face_nbr[idx];
-                        if nbr == NEU {
-                            a += 1;
-                            continue;
+                        if nbr != NEU {
+                            let nx = face_nx[idx];
+                            let ny = face_ny[idx];
+                            let sw = face_sw[idx];
+                            let dun_e = nx * gx[b] + ny * gy[b];
+                            let ug = u[b];
+                            let (avg, jump, gfac) = if nbr == BND {
+                                (dun_e, ug, 1.0)
+                            } else {
+                                let ng = nbr as usize;
+                                (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
+                            };
+                            let g = gfac * sw * jump;
+                            rf += -sw * avg + tau * sw * jump;
+                            hx += g * nx;
+                            hy += g * ny;
                         }
-                        let dun_e = nx * gx[e * nn + vl] + ny * gy[e * nn + vl];
-                        let ug = u[e * nn + vl];
-                        let (avg, jump, gfac) = if nbr == BND {
-                            (dun_e, ug, 1.0)
-                        } else {
-                            let ng = nbr as usize;
-                            (0.5 * (dun_e + nx * gx[ng] + ny * gy[ng]), ug - u[ng], 0.5)
-                        };
-                        let g = gfac * sw * jump;
-                        unsafe {
-                            RF[vl] += -sw * avg + tau * sw * jump;
-                            HX[vl] += g * nx;
-                            HY[vl] += g * ny;
-                        }
-                        a += 1;
+                        break; // a node appears once per edge
                     }
-                } else if kind == K_FINE_TO_COARSE {
-                    // ---- this element E is FINE; one coarse neighbor C ----
-                    // Standard gather, but the neighbor trace comes from C projected
-                    // to E's fine face nodes via `P_half`. E uses its OWN normal.
-                    let fnx = enx[et];
-                    let fny = eny[et];
-                    let half = half0[et];
-                    // Projected coarse trace at each of E's fine sorted nodes i:
-                    //   u_nbr_i  = Σ_k P_half[i,k] * uc[k]
-                    //   dun_nbr_i= Σ_k P_half[i,k] * dnc[k]   (E's normal on C's grad)
-                    let mut i = 0usize;
-                    while i < n1 {
-                        let si = self_sorted[et * n1 + i] as usize;
+                    a += 1;
+                }
+            } else if kind == K_FINE_TO_COARSE {
+                // E is FINE: node list is `self_sorted`; neighbor trace = coarse projected via P_half.
+                let fnx = enx[et];
+                let fny = eny[et];
+                let half = half0[et];
+                let mut i = 0usize;
+                while i < n1 {
+                    if self_sorted[et * n1 + i] as usize == m {
                         let sw = self_sw[et * n1 + i];
-                        // project coarse trace onto fine node i.
                         let mut u_nbr = 0.0f64;
                         let mut dun_nbr = 0.0f64;
                         let mut k = 0usize;
@@ -193,35 +190,29 @@ mod kernels {
                             dun_nbr += pw * (fnx * gx[ck] + fny * gy[ck]);
                             k += 1;
                         }
-                        let u_self = u[e * nn + si];
-                        let dun_self = fnx * gx[e * nn + si] + fny * gy[e * nn + si];
+                        let u_self = u[b];
+                        let dun_self = fnx * gx[b] + fny * gy[b];
                         let avg = 0.5 * (dun_self + dun_nbr);
                         let jump = u_self - u_nbr;
                         let g = 0.5 * sw * jump;
-                        unsafe {
-                            RF[si] += -sw * avg + tau * sw * jump;
-                            HX[si] += g * fnx;
-                            HY[si] += g * fny;
-                        }
-                        i += 1;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * fnx;
+                        hy += g * fny;
+                        break;
                     }
-                } else {
-                    // ---- this element E is COARSE; two fine neighbors (halves 0,1) ----
-                    // Integrate on each fine mortar and `Pᵀ`-gather to E's coarse nodes.
-                    // E uses its OWN normal.
-                    let fnx = enx[et];
-                    let fny = eny[et];
-                    let mut h = 0usize;
-                    while h < 2 {
-                        // For coarse node j we accumulate Σ_i P_h[i,j]·(gc_i, gl_i).
-                        let mut j = 0usize;
-                        while j < n1 {
-                            let cj = self_sorted[et * n1 + j] as usize;
-                            let mut rf_acc = 0.0f64;
-                            let mut hl_acc = 0.0f64;
+                    i += 1;
+                }
+            } else {
+                // E is COARSE: node `m` = coarse node at sorted index `j`; gather Σ_h Σ_i P_h[i,j]·(…).
+                let fnx = enx[et];
+                let fny = eny[et];
+                let mut j = 0usize;
+                while j < n1 {
+                    if self_sorted[et * n1 + j] as usize == m {
+                        let mut h = 0usize;
+                        while h < 2 {
                             let mut i = 0usize;
                             while i < n1 {
-                                // projected coarse value/flux at fine node i.
                                 let mut ucp = 0.0f64;
                                 let mut dncp = 0.0f64;
                                 let mut k = 0usize;
@@ -232,7 +223,6 @@ mod kernels {
                                     dncp += pw * (fnx * gx[e * nn + ck] + fny * gy[e * nn + ck]);
                                     k += 1;
                                 }
-                                // fine values.
                                 let (fk, swf) = if h == 0 {
                                     (nbr0_sorted[et * n1 + i] as usize, swf0[et * n1 + i])
                                 } else {
@@ -245,29 +235,23 @@ mod kernels {
                                 let gc = -swf * avg + tau * swf * jump;
                                 let gl = 0.5 * swf * jump;
                                 let pw = if h == 0 { p0[i * n1 + j] } else { p1[i * n1 + j] };
-                                rf_acc += pw * gc;
-                                hl_acc += pw * gl;
+                                rf += pw * gc;
+                                hx += pw * gl * fnx;
+                                hy += pw * gl * fny;
                                 i += 1;
                             }
-                            unsafe {
-                                RF[cj] += rf_acc;
-                                HX[cj] += hl_acc * fnx;
-                                HY[cj] += hl_acc * fny;
-                            }
-                            j += 1;
+                            h += 1;
                         }
-                        h += 1;
+                        break;
                     }
+                    j += 1;
                 }
-                t += 1;
             }
+            t += 1;
         }
-        thread::sync_threads();
-        let hxm = unsafe { HX[m] };
-        let hym = unsafe { HY[m] };
         unsafe {
-            PR[m] -= rx[b] * hxm + ry[b] * hym;
-            PS[m] -= sx[b] * hxm + sy[b] * hym;
+            PR[m] -= rx[b] * hx + ry[b] * hy;
+            PS[m] -= sx[b] * hx + sy[b] * hy;
         }
         thread::sync_threads();
         let i = m % n1;
@@ -280,9 +264,8 @@ mod kernels {
             }
             k += 1;
         }
-        let rfm = unsafe { RF[m] };
         if let Some(o) = out.get_mut(thread::index_1d()) {
-            *o = acc + rfm + lambda * jw[b] * u[b];
+            *o = acc + rf + lambda * jw[b] * u[b];
         }
     }
 
@@ -303,6 +286,201 @@ mod kernels {
         let i = idx.get();
         if let Some(o) = y.get_mut(idx) {
             *o = x[i] + b * *o;
+        }
+    }
+
+    /// y ← c·y (scale in place).
+    #[kernel]
+    pub fn scal_nc(mut y: DisjointSlice<f64>, c: f64) {
+        let idx = thread::index_1d();
+        if let Some(o) = y.get_mut(idx) {
+            *o *= c;
+        }
+    }
+
+    /// out ← a⊙b + c⊙d (Hadamard FMA; the convection primitive u·∂ₓu + v·∂ᵧu).
+    #[kernel]
+    pub fn fma2_nc(a: &[f64], b: &[f64], c: &[f64], d: &[f64], mut out: DisjointSlice<f64>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = out.get_mut(idx) {
+            *o = a[i] * b[i] + c[i] * d[i];
+        }
+    }
+
+    /// Damped-Jacobi smoother update `x ← x + ω·D⁻¹·(b − A·x)` (one sweep; `ax` is `A·x` precomputed).
+    /// The p-multigrid relaxation, pointwise on resident fields.
+    #[kernel]
+    pub fn jacobi_nc(mut x: DisjointSlice<f64>, inv_diag: &[f64], b: &[f64], ax: &[f64], omega: f64) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = x.get_mut(idx) {
+            *o += omega * inv_diag[i] * (b[i] - ax[i]);
+        }
+    }
+
+    /// **p-prolong** (coarse order → fine order): per element, tensor-Lagrange interpolation
+    /// `fine[i,j] = Σ_ab I[i,a] I[j,b] coarse[a,b]` with the 1D `fine×coarse` matrix `interp`
+    /// (`nff×ncc`). One block per element, `nff·nff` threads. Element-local ⇒ ignores the mortar
+    /// non-conformity (the multigrid transfer never crosses a face). Matches CPU `PMultigridNc::prolong`.
+    #[kernel]
+    pub fn prolong_p_nc(coarse: &[f64], interp: &[f64], ncc1: u32, nff1: u32, mut out: DisjointSlice<f64>) {
+        static mut CF: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        let ncc = ncc1 as usize;
+        let nff = nff1 as usize;
+        let cc = ncc * ncc;
+        let ff = nff * nff;
+        let e = thread::blockIdx_x() as usize;
+        let m = thread::threadIdx_x() as usize;
+        if m < cc {
+            unsafe { CF[m] = coarse[e * cc + m]; }
+        }
+        thread::sync_threads();
+        if m >= ff {
+            return;
+        }
+        let i = m % nff;
+        let j = m / nff;
+        let mut s = 0.0f64;
+        let mut b = 0usize;
+        while b < ncc {
+            let mut row = 0.0f64;
+            let mut a = 0usize;
+            while a < ncc {
+                row += interp[i * ncc + a] * unsafe { CF[a + b * ncc] };
+                a += 1;
+            }
+            s += interp[j * ncc + b] * row;
+            b += 1;
+        }
+        if let Some(o) = out.get_mut(thread::index_1d()) {
+            *o = s;
+        }
+    }
+
+    /// **p-restrict** (fine order → coarse order) = transpose of [`prolong_p_nc`]:
+    /// `coarse[a,b] = Σ_ij I[i,a] I[j,b] fine[i,j]`. One block per element, `ncc·ncc` threads.
+    #[kernel]
+    pub fn restrict_p_nc(fine: &[f64], interp: &[f64], ncc1: u32, nff1: u32, mut out: DisjointSlice<f64>) {
+        static mut FF: SharedArray<f64, NN_MAX> = SharedArray::UNINIT;
+        let ncc = ncc1 as usize;
+        let nff = nff1 as usize;
+        let cc = ncc * ncc;
+        let ff = nff * nff;
+        let e = thread::blockIdx_x() as usize;
+        let m = thread::threadIdx_x() as usize;
+        if m < ff {
+            unsafe { FF[m] = fine[e * ff + m]; }
+        }
+        thread::sync_threads();
+        if m >= cc {
+            return;
+        }
+        let a = m % ncc;
+        let b = m / ncc;
+        let mut s = 0.0f64;
+        let mut j = 0usize;
+        while j < nff {
+            let mut col = 0.0f64;
+            let mut i = 0usize;
+            while i < nff {
+                col += interp[i * ncc + a] * unsafe { FF[i + j * nff] };
+                i += 1;
+            }
+            s += interp[j * ncc + b] * col;
+            j += 1;
+        }
+        // Output is COARSE-strided (cc per element), but the block is sized to the FINE node count
+        // (nff²), so index_1d() = e·nff² + m is NOT the output index — write e·cc + m explicitly.
+        // Threads m<cc are unique over (e, coarse-node) ⇒ scatter is race-free.
+        let e = thread::blockIdx_x() as usize;
+        unsafe {
+            *out.get_unchecked_mut(e * cc + m) = s;
+        }
+    }
+
+    /// **h-coarsen restrict** (order-1 REFINED → order-1 UNIFORM base): per base node, an unrefined
+    /// cell injects; a refined cell `Pᵀ`-gathers its 4 children via the shared 2:1 matrices `quad_pq`
+    /// (`[q*16+f*4+a]`). One thread per base node. `base_ids[bc*4]` = element id (unrefined) or the 4
+    /// child ids (refined); `base_kind[bc]` = 0/1.
+    #[kernel]
+    pub fn restrict_to_base_nc(
+        refined: &[f64], base_kind: &[u8], base_ids: &[u32], quad_pq: &[f64], nbc: u32, mut out: DisjointSlice<f64>,
+    ) {
+        let idx = thread::index_1d();
+        let tid = idx.get();
+        if tid >= nbc as usize * 4 {
+            return;
+        }
+        let bc = tid / 4;
+        let a = tid % 4;
+        let val = if base_kind[bc] == 0 {
+            refined[base_ids[bc * 4] as usize * 4 + a]
+        } else {
+            let mut s = 0.0f64;
+            let mut q = 0usize;
+            while q < 4 {
+                let cq = base_ids[bc * 4 + q] as usize;
+                let mut f = 0usize;
+                while f < 4 {
+                    s += quad_pq[q * 16 + f * 4 + a] * refined[cq * 4 + f];
+                    f += 1;
+                }
+                q += 1;
+            }
+            s
+        };
+        if let Some(o) = out.get_mut(idx) {
+            *o = val;
+        }
+    }
+
+    /// **h-coarsen prolong** (order-1 UNIFORM base → order-1 REFINED) = transpose of
+    /// [`restrict_to_base_nc`]: per base cell, inject (unrefined) or bilinearly evaluate the parent at
+    /// each child node (refined). One thread per base cell; scatter writes to disjoint refined elements.
+    #[kernel]
+    pub fn prolong_from_base_nc(
+        base: &[f64], base_kind: &[u8], base_ids: &[u32], quad_pq: &[f64], nbc: u32, mut out: DisjointSlice<f64>,
+    ) {
+        let idx = thread::index_1d();
+        let bc = idx.get();
+        if bc >= nbc as usize {
+            return;
+        }
+        if base_kind[bc] == 0 {
+            let rid = base_ids[bc * 4] as usize;
+            let mut a = 0usize;
+            while a < 4 {
+                unsafe { *out.get_unchecked_mut(rid * 4 + a) = base[bc * 4 + a]; }
+                a += 1;
+            }
+        } else {
+            let mut q = 0usize;
+            while q < 4 {
+                let cq = base_ids[bc * 4 + q] as usize;
+                let mut f = 0usize;
+                while f < 4 {
+                    let mut s = 0.0f64;
+                    let mut a = 0usize;
+                    while a < 4 {
+                        s += quad_pq[q * 16 + f * 4 + a] * base[bc * 4 + a];
+                        a += 1;
+                    }
+                    unsafe { *out.get_unchecked_mut(cq * 4 + f) = s; }
+                    f += 1;
+                }
+                q += 1;
+            }
+        }
+    }
+
+    /// b ← scale·jw⊙f + lift (diagonal-mass RHS assembly: M·(scale·f) + boundary lift).
+    #[kernel]
+    pub fn rhs_madd_nc(jw: &[f64], f: &[f64], lift: &[f64], scale: f64, mut b: DisjointSlice<f64>) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if let Some(o) = b.get_mut(idx) {
+            *o = scale * jw[i] * f[i] + lift[i];
         }
     }
 
@@ -342,6 +520,14 @@ mod kernels {
 /// host-side sum of partials stays trivial. `RED` threads per block.
 fn dot_blocks(ndof: usize) -> usize {
     ndof.div_ceil(RED).clamp(1, 1024)
+}
+
+/// Launch config for `operator_nc`: one block per element, `nn` threads (the node-parallel face
+/// gather makes each node-thread do its own SIPG/mortar work). Multi-element packing was tried and
+/// reverted — this register-heavy, latency-bound matvec runs slower when threads/block is raised
+/// (register spills), and dynamic-shared tiling defeated the compiler's const-folded indexing.
+fn op_launch_cfg(ne: usize, nn: usize) -> LaunchConfig {
+    LaunchConfig { grid_dim: (ne as u32, 1, 1), block_dim: (nn as u32, 1, 1), shared_mem_bytes: 0 }
 }
 
 /// Per-element metrics + flattened (conforming + non-conforming) face metadata,
@@ -634,8 +820,8 @@ pub fn poisson_nc_apply(
         &mut gx_dev, &mut gy_dev,
     )?;
     module.operator_nc(
-        &stream, cfg, &d_dev, &u_dev, &gx_dev, &gy_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev,
-        &jw_dev, ma.n1, &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ekind_dev,
+        &stream, op_launch_cfg(ma.ne, ma.nn), &d_dev, &u_dev, &gx_dev, &gy_dev, &rx_dev, &ry_dev, &sx_dev, &sy_dev,
+        &jw_dev, ma.n1, ma.ne as u32, &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ekind_dev,
         &enx_dev, &eny_dev, &etau_dev, &half0_dev, &self_sorted_dev, &self_sw_dev, &nbr0_dev,
         &nbr1_dev, &swf0_dev, &swf1_dev, &p0_dev, &p1_dev, reaction, &mut out_dev,
     )?;
@@ -751,7 +937,7 @@ fn cg_nc_impl(
         ($field:expr, $dst:expr) => {{
             module.gradient_nc(&stream, cfg, &d_dev, $field, &rx_dev, &ry_dev, &sx_dev, &sy_dev, n1, &mut gx, &mut gy)?;
             module.operator_nc(
-                &stream, cfg, &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1,
+                &stream, op_launch_cfg(ma.ne, ma.nn), &d_dev, $field, &gx, &gy, &rx_dev, &ry_dev, &sx_dev, &sy_dev, &jw_dev, n1, ma.ne as u32,
                 &fvl_dev, &fnx_dev, &fny_dev, &fsw_dev, &fnbr_dev, &ekind_dev, &enx_dev, &eny_dev,
                 &etau_dev, &half0_dev, &ss_dev, &ssw_dev, &nbr0_dev, &nbr1_dev, &swf0_dev, &swf1_dev,
                 &p0_dev, &p1_dev, reaction, $dst,
@@ -899,6 +1085,184 @@ impl GpuPoissonNc {
         self.ndof
     }
 
+    /// This handle's CUDA stream (so device-resident callers allocate on the same stream/context).
+    pub fn stream(&self) -> &CudaStream {
+        &self.stream
+    }
+    /// Upload a host field to a fresh device buffer on this handle's stream.
+    pub fn upload(&self, v: &[f64]) -> Result<DeviceBuffer<f64>, Box<dyn std::error::Error>> {
+        Ok(DeviceBuffer::from_host(&self.stream, v)?)
+    }
+    /// Download a device field to host (diagnostics / I/O only).
+    pub fn download(&self, v: &DeviceBuffer<f64>) -> Result<Vec<f64>, Box<dyn std::error::Error>> {
+        Ok(v.to_host_vec(&self.stream)?)
+    }
+    /// Allocate a zeroed `ndof` device field on this handle's stream.
+    pub fn alloc(&self) -> Result<DeviceBuffer<f64>, Box<dyn std::error::Error>> {
+        Ok(DeviceBuffer::<f64>::zeroed(&self.stream, self.ndof)?)
+    }
+
+    // ===== Device-resident assembly primitives (NC analogues of GpuPoissonMg's) =================
+    // Element-local / pointwise ops on resident fields, so a dual-splitting step can run on a
+    // non-conforming (AMR) mesh entirely on the GPU. The metrics (`rx_dev`..`jw_dev`) were uploaded
+    // once at construction; these reuse them.
+
+    fn vcfg(&self) -> LaunchConfig {
+        LaunchConfig::for_num_elems(self.ndof as u32)
+    }
+    fn ecfg(&self) -> LaunchConfig {
+        LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: (self.nn as u32, 1, 1), shared_mem_bytes: 0 }
+    }
+
+    /// Element-local physical gradient `gx=∂src/∂x, gy=∂src/∂y` (same as the matvec's, NC-mesh metrics).
+    pub fn gradient_dev(&self, src: &DeviceBuffer<f64>, gx: &mut DeviceBuffer<f64>, gy: &mut DeviceBuffer<f64>) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.gradient_nc(&self.stream, self.ecfg(), &self.d_dev, src, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, self.n1, gx, gy)?;
+        Ok(())
+    }
+    /// `y ← y + a·x`.
+    pub fn axpy_dev(&self, y: &mut DeviceBuffer<f64>, x: &DeviceBuffer<f64>, a: f64) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.axpy_nc(&self.stream, self.vcfg(), y, x, a)?;
+        Ok(())
+    }
+    /// `y ← c·y`.
+    pub fn scal_dev(&self, y: &mut DeviceBuffer<f64>, c: f64) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.scal_nc(&self.stream, self.vcfg(), y, c)?;
+        Ok(())
+    }
+    /// `dst ← src` (device-to-device copy).
+    pub fn copy_dev(&self, dst: &mut DeviceBuffer<f64>, src: &DeviceBuffer<f64>) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            cuda_core::memory::memcpy_dtod_async(dst.cu_deviceptr(), src.cu_deviceptr(), self.ndof * 8, self.stream.cu_stream())?;
+        }
+        Ok(())
+    }
+    /// `out ← a⊙b + c⊙d` (convection primitive).
+    pub fn fma2_dev(&self, out: &mut DeviceBuffer<f64>, a: &DeviceBuffer<f64>, b: &DeviceBuffer<f64>, c: &DeviceBuffer<f64>, d: &DeviceBuffer<f64>) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.fma2_nc(&self.stream, self.vcfg(), a, b, c, d, out)?;
+        Ok(())
+    }
+    /// `b ← scale·jw⊙f + lift` (diagonal-mass RHS assembly).
+    pub fn rhs_madd_dev(&self, b: &mut DeviceBuffer<f64>, jw: &DeviceBuffer<f64>, f: &DeviceBuffer<f64>, lift: &DeviceBuffer<f64>, scale: f64) -> Result<(), Box<dyn std::error::Error>> {
+        self.module.rhs_madd_nc(&self.stream, self.vcfg(), jw, f, lift, scale, b)?;
+        Ok(())
+    }
+
+    // ===== p-multigrid building blocks (device-resident; the V-cycle driver lives in multigrid_nc) =====
+    pub fn nn(&self) -> usize {
+        self.nn
+    }
+    pub fn ne(&self) -> usize {
+        self.ne
+    }
+    /// `order + 1` (the 1D node count) — needed to size p-transfers between levels.
+    pub fn n1_pub(&self) -> u32 {
+        self.n1
+    }
+
+    /// Build the device `fnbr` (boundary-face Dirichlet/Neumann marker) for the given `neumann_tags`
+    /// once — reused across every V-cycle smooth/matvec at this level (no per-apply host work).
+    pub fn build_fnbr_dev(&self, neumann_tags: &[u32]) -> Result<DeviceBuffer<u32>, Box<dyn std::error::Error>> {
+        let mut fnbr = self.fnbr_base.clone();
+        if !neumann_tags.is_empty() {
+            for &(idx, tag) in &self.bnodes {
+                if neumann_tags.contains(&tag) {
+                    fnbr[idx] = NEU;
+                }
+            }
+        }
+        Ok(DeviceBuffer::from_host(&self.stream, &fnbr)?)
+    }
+
+    /// Device operator apply `out ← (reaction·M + A)·field` with a prebuilt `fnbr_dev` and caller
+    /// scratch `gx,gy`. The matvec used by the smoother and the PCG, no per-call host work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_dev(
+        &self, field: &DeviceBuffer<f64>, reaction: f64, fnbr_dev: &DeviceBuffer<u32>,
+        gx: &mut DeviceBuffer<f64>, gy: &mut DeviceBuffer<f64>, out: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = self.ecfg();
+        self.module.gradient_nc(&self.stream, cfg, &self.d_dev, field, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, self.n1, gx, gy)?;
+        self.module.operator_nc(
+            &self.stream, op_launch_cfg(self.ne, self.nn), &self.d_dev, field, gx, gy, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, &self.jw_dev, self.n1, self.ne as u32,
+            &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, fnbr_dev, &self.ekind_dev, &self.enx_dev, &self.eny_dev,
+            &self.etau_dev, &self.half0_dev, &self.ss_dev, &self.ssw_dev, &self.nbr0_dev, &self.nbr1_dev, &self.swf0_dev, &self.swf1_dev,
+            &self.p0_dev, &self.p1_dev, reaction, out,
+        )?;
+        Ok(())
+    }
+
+    /// One damped-Jacobi sweep `x ← x + ω·D⁻¹·(b − A·x)` (computes `A·x` into the caller's `ax`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn jacobi_dev(
+        &self, x: &mut DeviceBuffer<f64>, b: &DeviceBuffer<f64>, inv_diag: &DeviceBuffer<f64>, omega: f64, reaction: f64,
+        fnbr_dev: &DeviceBuffer<u32>, gx: &mut DeviceBuffer<f64>, gy: &mut DeviceBuffer<f64>, ax: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.apply_dev(x, reaction, fnbr_dev, gx, gy, ax)?;
+        self.module.jacobi_nc(&self.stream, self.vcfg(), x, inv_diag, b, ax, omega)?;
+        Ok(())
+    }
+
+    /// p-prolong `out(this level, order p_f) ← coarse(order p_c)` (element-local tensor interp). `ncc1
+    /// = p_c+1`, `nff1 = p_f+1 = this.n1`; `interp` is the 1D `nff×ncc` Lagrange matrix.
+    pub fn prolong_p_dev(
+        &self, coarse: &DeviceBuffer<f64>, interp: &DeviceBuffer<f64>, ncc1: u32, out: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: (self.nn as u32, 1, 1), shared_mem_bytes: 0 };
+        self.module.prolong_p_nc(&self.stream, cfg, coarse, interp, ncc1, self.n1, out)?;
+        Ok(())
+    }
+
+    /// p-restrict `out(this level, order p_c) ← fine(order p_f)` = transpose of prolong. Launched with
+    /// the FINE block size (`nff1·nff1` threads) so the shared load covers the fine element. `nff1 =
+    /// p_f+1`, this level's `n1 = p_c+1`.
+    pub fn restrict_p_dev(
+        &self, fine: &DeviceBuffer<f64>, interp: &DeviceBuffer<f64>, nff1: u32, out: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: ((nff1 * nff1) as u32, 1, 1), shared_mem_bytes: 0 };
+        self.module.restrict_p_nc(&self.stream, cfg, fine, interp, self.n1, nff1, out)?;
+        Ok(())
+    }
+
+    /// `Σ a⊙b` over the field (CG scalar; multi-block partial + host sum, like `solve_dev`).
+    pub fn dot_dev(&self, a: &DeviceBuffer<f64>, b: &DeviceBuffer<f64>) -> Result<f64, Box<dyn std::error::Error>> {
+        let nb = dot_blocks(self.ndof);
+        let mut partial = DeviceBuffer::<f64>::zeroed(&self.stream, nb)?;
+        let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+        self.module.dot_nc_partial(&self.stream, red, a, b, self.ndof as u64, &mut partial)?;
+        Ok(partial.to_host_vec(&self.stream)?.iter().sum::<f64>())
+    }
+
+    /// h-coarsen restrict (this order-1 REFINED level → order-1 UNIFORM base, `nbc·4` dof). Device,
+    /// no host work — the multigrid_nc handle launches this on the coarsest level.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restrict_to_base_dev(
+        &self, refined: &DeviceBuffer<f64>, base_kind: &DeviceBuffer<u8>, base_ids: &DeviceBuffer<u32>,
+        quad_pq: &DeviceBuffer<f64>, nbc: usize, out: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = LaunchConfig::for_num_elems((nbc * 4) as u32);
+        self.module.restrict_to_base_nc(&self.stream, cfg, refined, base_kind, base_ids, quad_pq, nbc as u32, out)?;
+        Ok(())
+    }
+
+    /// h-coarsen prolong (order-1 UNIFORM base → this order-1 REFINED level), transpose of the above.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prolong_from_base_dev(
+        &self, base: &DeviceBuffer<f64>, base_kind: &DeviceBuffer<u8>, base_ids: &DeviceBuffer<u32>,
+        quad_pq: &DeviceBuffer<f64>, nbc: usize, out: &mut DeviceBuffer<f64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = LaunchConfig::for_num_elems(nbc as u32);
+        self.module.prolong_from_base_nc(&self.stream, cfg, base, base_kind, base_ids, quad_pq, nbc as u32, out)?;
+        Ok(())
+    }
+
+    /// Upload a `u8`/`u32` slice to a device buffer on this handle's stream (h-coarsen metadata).
+    pub fn upload_u8(&self, v: &[u8]) -> Result<DeviceBuffer<u8>, Box<dyn std::error::Error>> {
+        Ok(DeviceBuffer::from_host(&self.stream, v)?)
+    }
+    pub fn upload_u32(&self, v: &[u32]) -> Result<DeviceBuffer<u32>, Box<dyn std::error::Error>> {
+        Ok(DeviceBuffer::from_host(&self.stream, v)?)
+    }
+
     /// Solve `(reaction·M + A)·x = b` on this non-conforming mesh by CG (mortar matvec +
     /// multi-block dot, host-sum scalars). `neumann_tags` are the natural-BC boundary tags;
     /// `deflate` removes the constant nullspace each iteration (pure-Neumann pressure). No
@@ -964,7 +1328,7 @@ impl GpuPoissonNc {
             ($field:expr, $dst:expr) => {{
                 module.gradient_nc(stream, cfg, &self.d_dev, $field, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, n1, &mut gx, &mut gy)?;
                 module.operator_nc(
-                    stream, cfg, &self.d_dev, $field, &gx, &gy, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, &self.jw_dev, n1,
+                    stream, op_launch_cfg(self.ne, self.nn), &self.d_dev, $field, &gx, &gy, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, &self.jw_dev, n1, self.ne as u32,
                     &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, &fnbr_dev, &self.ekind_dev, &self.enx_dev, &self.eny_dev,
                     &self.etau_dev, &self.half0_dev, &self.ss_dev, &self.ssw_dev, &self.nbr0_dev, &self.nbr1_dev, &self.swf0_dev, &self.swf1_dev,
                     &self.p0_dev, &self.p1_dev, reaction, $dst,
@@ -978,8 +1342,19 @@ impl GpuPoissonNc {
         let mut rs = dot!(&r, &r);
         let mut iters = 0;
         for it in 0..maxit {
+            // Convergence check BEFORE forming α — this also catches a zero / near-zero RHS (e.g. the
+            // first projection step where div=0 ⇒ rs=0), which would otherwise give the deflated-CG
+            // 0/0 = NaN breakdown the conforming path guards against. Then x stays its (zero) iterate.
+            if rs.sqrt() / bn < tol {
+                iters = it;
+                break;
+            }
             apply!(&p, &mut ap);
             let pap = dot!(&p, &ap);
+            if !(pap > 0.0) {
+                iters = it; // operator breakdown (singular direction) ⇒ stop with the current iterate
+                break;
+            }
             let alpha_cg = rs / pap;
             module.axpy_nc(stream, vec_cfg, &mut x, &p, alpha_cg)?;
             module.axpy_nc(stream, vec_cfg, &mut r, &ap, -alpha_cg)?;
@@ -994,5 +1369,127 @@ impl GpuPoissonNc {
             rs = rs_new;
         }
         Ok((x.to_host_vec(stream)?, iters))
+    }
+
+    /// **Device-native** non-conforming solve `(reaction·M + A)·x = b`: `rhs` is already on the
+    /// device, the solution is written into `out` (length [`ndof`](Self::ndof)), optionally
+    /// warm-started from `x0` — **no field HtoD/DtoH**. The mortar matvec + vector ops run on the
+    /// device; only the CG convergence scalar (the dot sum) reads back. The non-conforming/AMR
+    /// analogue of [`GpuPoissonMg::solve_dev`], for the device-resident AMR step. Returns iters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve_dev(
+        &self,
+        rhs: &DeviceBuffer<f64>,
+        x0: Option<&DeviceBuffer<f64>>,
+        out: &mut DeviceBuffer<f64>,
+        reaction: f64,
+        neumann_tags: &[u32],
+        deflate: bool,
+        tol: f64,
+        maxit: usize,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let stream = &self.stream;
+        let module = &self.module;
+        let ndof = self.ndof;
+
+        let mut fnbr = self.fnbr_base.clone();
+        if !neumann_tags.is_empty() {
+            for &(idx, tag) in &self.bnodes {
+                if neumann_tags.contains(&tag) {
+                    fnbr[idx] = NEU;
+                }
+            }
+        }
+        let fnbr_dev = DeviceBuffer::from_host(stream, &fnbr)?;
+
+        let nb = dot_blocks(ndof);
+        let mut r = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut p = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut ap = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut gx = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut gy = DeviceBuffer::<f64>::zeroed(stream, ndof)?;
+        let mut partial = DeviceBuffer::<f64>::zeroed(stream, nb)?;
+        let ones = DeviceBuffer::from_host(stream, &vec![1.0f64; ndof])?;
+
+        let cfg = LaunchConfig { grid_dim: (self.ne as u32, 1, 1), block_dim: (self.nn as u32, 1, 1), shared_mem_bytes: 0 };
+        let red = LaunchConfig { grid_dim: (nb as u32, 1, 1), block_dim: (RED as u32, 1, 1), shared_mem_bytes: 0 };
+        let vec_cfg = LaunchConfig::for_num_elems(ndof as u32);
+        let n1 = self.n1;
+        let n64 = ndof as u64;
+        let ninv = 1.0 / ndof as f64;
+
+        macro_rules! dot {
+            ($a:expr, $b:expr) => {{
+                module.dot_nc_partial(stream, red, $a, $b, n64, &mut partial)?;
+                partial.to_host_vec(stream)?.iter().sum::<f64>()
+            }};
+        }
+        macro_rules! deflate_v {
+            ($v:expr) => {{
+                if deflate {
+                    let mean = dot!($v, &ones) * ninv;
+                    module.axpy_nc(stream, vec_cfg, $v, &ones, -mean)?;
+                }
+            }};
+        }
+        macro_rules! apply {
+            ($field:expr, $dst:expr) => {{
+                module.gradient_nc(stream, cfg, &self.d_dev, $field, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, n1, &mut gx, &mut gy)?;
+                module.operator_nc(
+                    stream, op_launch_cfg(self.ne, self.nn), &self.d_dev, $field, &gx, &gy, &self.rx_dev, &self.ry_dev, &self.sx_dev, &self.sy_dev, &self.jw_dev, n1, self.ne as u32,
+                    &self.fvl_dev, &self.fnx_dev, &self.fny_dev, &self.fsw_dev, &fnbr_dev, &self.ekind_dev, &self.enx_dev, &self.eny_dev,
+                    &self.etau_dev, &self.half0_dev, &self.ss_dev, &self.ssw_dev, &self.nbr0_dev, &self.nbr1_dev, &self.swf0_dev, &self.swf1_dev,
+                    &self.p0_dev, &self.p1_dev, reaction, $dst,
+                )?;
+            }};
+        }
+
+        // r = b − A·x0 (warm start), x = x0; or r = b, x = 0.
+        match x0 {
+            Some(x0d) => {
+                module.xpby_nc(stream, vec_cfg, out, x0d, 0.0)?; // out = x0
+                apply!(&*out, &mut ap);
+                module.xpby_nc(stream, vec_cfg, &mut r, rhs, 0.0)?; // r = b
+                module.axpy_nc(stream, vec_cfg, &mut r, &ap, -1.0)?; // r -= A·x0
+            }
+            None => {
+                module.xpby_nc(stream, vec_cfg, out, rhs, 0.0)?; // out = b (temp)
+                module.axpy_nc(stream, vec_cfg, out, rhs, -1.0)?; // out = 0
+                module.xpby_nc(stream, vec_cfg, &mut r, rhs, 0.0)?; // r = b
+            }
+        }
+        deflate_v!(&mut r);
+        module.xpby_nc(stream, vec_cfg, &mut p, &r, 0.0)?; // p = r
+        let bn = dot!(&r, &r).sqrt().max(1e-300);
+        let mut rs = dot!(&r, &r);
+        let mut iters = 0;
+        for it in 0..maxit {
+            // Convergence check BEFORE forming α — this also catches a zero / near-zero RHS (e.g. the
+            // first projection step where div=0 ⇒ rs=0), which would otherwise give the deflated-CG
+            // 0/0 = NaN breakdown the conforming path guards against. Then x stays its (zero) iterate.
+            if rs.sqrt() / bn < tol {
+                iters = it;
+                break;
+            }
+            apply!(&p, &mut ap);
+            let pap = dot!(&p, &ap);
+            if !(pap > 0.0) {
+                iters = it; // operator breakdown (singular direction) ⇒ stop with the current iterate
+                break;
+            }
+            let alpha_cg = rs / pap;
+            module.axpy_nc(stream, vec_cfg, out, &p, alpha_cg)?;
+            module.axpy_nc(stream, vec_cfg, &mut r, &ap, -alpha_cg)?;
+            deflate_v!(&mut r);
+            let rs_new = dot!(&r, &r);
+            iters = it + 1;
+            if rs_new.sqrt() / bn < tol {
+                break;
+            }
+            let beta = rs_new / rs;
+            module.xpby_nc(stream, vec_cfg, &mut p, &r, beta)?;
+            rs = rs_new;
+        }
+        Ok(iters)
     }
 }

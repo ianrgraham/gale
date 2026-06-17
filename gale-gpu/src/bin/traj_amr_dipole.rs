@@ -70,8 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let nn = sim.state.mesh.refq.n_nodes();
     let mut tw = TrajectoryWriter::create(&out, p, 2)?;
-    let mut topo = tw.write_mesh2d(&sim.state.mesh)?;
-    let mut last_ne = sim.state.mesh.n_elements();
+    // `topology_for` re-emits topology on any GEOMETRY change (not just element-count change), so a
+    // constant-ndof AMR remesh doesn't pair the new field with a stale mesh (which mis-draws cells).
+    let mut topo = tw.topology_for(&sim.state.mesh)?;
 
     let pack = |sim: &Simulation| -> (Vec<f32>, usize, f64) {
         let v = sim.state.field("velocity");
@@ -94,11 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let nchunks = steps / every;
     for c in 0..nchunks {
         sim.run(every as u64);
-        let ne = sim.state.mesh.n_elements();
-        if ne != last_ne {
-            topo = tw.write_mesh2d(&sim.state.mesh)?;
-            last_ne = ne;
-        }
+        topo = tw.topology_for(&sim.state.mesh)?;
         let (f, ne, umax) = pack(&sim);
         let step = ((c + 1) * every) as u64;
         tw.write_frame(step as f64 * dt, step, topo, ne, nn, &[("u", f, 2)], None)?;

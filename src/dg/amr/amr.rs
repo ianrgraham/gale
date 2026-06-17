@@ -289,6 +289,16 @@ impl RefineQuad {
         }
     }
 
+    /// The 1D half-child interpolation matrix for axis side `c` (`0`=left, `1`=right) — exposed so a
+    /// GPU remap kernel can upload the identical operators and match `prolong`/`restrict` bit-for-bit.
+    pub fn axis_matrix(&self, c: usize) -> &[f64] {
+        self.axis(c)
+    }
+    /// LGL quadrature weights (used by the conservative [`restrict`](Self::restrict)).
+    pub fn weights(&self) -> &[f64] {
+        &self.w
+    }
+
     /// Prolong a parent nodal field to child `(cx, cy)`. Exact for degree ≤ p.
     pub fn prolong(&self, parent: &[f64], cx: usize, cy: usize) -> Vec<f64> {
         let n = self.order + 1;
@@ -418,6 +428,16 @@ impl SmoothnessIndicator {
         let vinv = mat_inverse(n, &v);
         let gamma = (0..n).map(|k| 2.0 / (2.0 * k as f64 + 1.0)).collect();
         Self { order, vinv, gamma }
+    }
+
+    /// Nodal→modal transform `V⁻¹` (`(p+1)²` row-major) — exposed so a GPU port can upload the
+    /// identical transform and match this indicator bit-for-bit.
+    pub fn vinv(&self) -> &[f64] {
+        &self.vinv
+    }
+    /// Legendre L2 norms `γ_k = 2/(2k+1)`.
+    pub fn gamma(&self) -> &[f64] {
+        &self.gamma
     }
 
     /// Fraction of L2 energy in the highest modes (`a==p` or `b==p`), in `[0,1]`.

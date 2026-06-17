@@ -8,4 +8,16 @@ I've add the basic scaffold of a cuda-oxide project, which may be executed from 
 
 While we'll focus initially on Rust-only usage is fine, I'd like for this to eventually have a Python entry point as well, using pyo3 as the interface. 
 
-Multi-GPU is a must here. I myself am running two Titan Vs on a 64 core EPYC 7702P machine with 256GB of memory. We likely want to maintain flexibility between CPU & GPU dispatch for various parts of the simulation workload, depending upon what it is. I also want to make sure we have 1st class support of the immersed boundary method with our DG method sim. 
+Multi-GPU is a must here. I myself am running two Titan Vs on a 64 core EPYC 7702P machine with 256GB of memory. We likely want to maintain flexibility between CPU & GPU dispatch for various parts of the simulation workload, depending upon what it is. I also want to make sure we have 1st class support of the immersed boundary method with our DG method sim.
+
+## GPU performance is a first-class requirement (non-negotiable)
+
+These sims must be FAST — the whole point is to outrun existing tools. A correct-but-slow GPU kernel is a defect, not progress. Whenever you write or modify GPU code (a CUDA `#[kernel]`, a host launch wrapper, or wiring a GPU op into a per-step integrator path), you MUST invoke the `gale-gpu-perf` skill and complete its profiling gate **in the same session, before calling the work done**. Do not defer it.
+
+**Production = 100% device-resident, GPU-self-driving.** "Production" means ready to run parameter sweeps. The bar: from dispatch to conclusion the run is fully device-resident — the host does NO per-step work and NO per-step sync; the simulation drives itself on the GPU (whole step captured as a CUDA graph, whole time loop a device-driven while/conditional graph, inner solves nested conditional sub-graphs). EVERYTHING the host did between kernels — vector ops, trace limiter, spectral clamp, upwind lift, assembly, convergence test, AND mesh adaptation (AMR indicator/flagging/rebuild/remap) — runs on the GPU. Host I/O only as an async dump every N steps, off the critical path. A sim with per-step host orchestration is a PROTOTYPE; do not run sweeps on it.
+
+Hard rules (the recurring mistakes — catch them by reading the code, then prove it with a profile):
+- **RULE ZERO — synchronizing host↔device copies in a loop will MURDER performance.** ANY host↔device copy that happens every step/stage/iteration and forces a device/stream sync (`cuStreamSynchronize`, a blocking `cuMemcpy`, `.to_host_vec()`) serializes CPU and GPU and leaves the device idle — the difference between ~5% and ~85% GPU utilization. Keep fields DEVICE-RESIDENT and do the math (axpy/clip/clamp/lift/reduction/convergence test) in device kernels; move static data once. Per-step copies are only OK for unavoidable I/O (e.g. a dump every N steps), and even then async + off the critical path. In nsys, copy/sync counts must NOT scale with steps×stages.
+- NEVER `CudaContext::new` / `kernels::load` inside a per-step/per-stage function — use a persistent handle built once (see `GpuPoisson`, `GpuLogConf`).
+- Upload static mesh metrics once (re-upload only on AMR remesh), never per call.
+- PROFILE before declaring done: `nvidia-smi dmon -s ut` (SM util + PCIe), then `ncu` on the hot kernel (ncu works here — `RmProfilingAdminOnly: 0`). Report before/after step time AND sustained GPU util. "It works" ≠ done; "it works + profile numbers" = done.
