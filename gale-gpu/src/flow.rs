@@ -32,6 +32,86 @@ fn mesh_is_nonconforming(mesh: &Mesh2d) -> bool {
     })
 }
 
+/// Recover the base Cartesian grid + refine-set of a `Mesh2d::cartesian_refined` mesh, so the
+/// non-conforming p-multigrid (which needs `nx,ny,xr,yr,refine` to build its h-coarsening tail) can
+/// be constructed from a mesh the integrator holds only by reference. Returns `None` if the mesh is
+/// NOT a clean 2:1-refined axis-aligned Cartesian grid (⇒ caller falls back to plain-CG NC). The
+/// element ordering is irrelevant here — we bin elements by geometric base-cell index.
+fn infer_refined_grid(mesh: &Mesh2d) -> Option<(usize, usize, [f64; 2], [f64; 2], Vec<(usize, usize)>)> {
+    let ne = mesh.n_elements();
+    if ne == 0 {
+        return None;
+    }
+    // Per-element axis-aligned bbox + global bbox.
+    let bbox = |g: &gale::dg::QuadGeometry| {
+        let (mut x0, mut x1) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut y0, mut y1) = (f64::INFINITY, f64::NEG_INFINITY);
+        for k in 0..g.x.len() {
+            x0 = x0.min(g.x[k]); x1 = x1.max(g.x[k]);
+            y0 = y0.min(g.y[k]); y1 = y1.max(g.y[k]);
+        }
+        (x0, x1, y0, y1)
+    };
+    let boxes: Vec<(f64, f64, f64, f64)> = mesh.elements.iter().map(|e| bbox(&e.geom)).collect();
+    let (mut gx0, mut gx1, mut gy0, mut gy1) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    let (mut wmax, mut hmax) = (0.0f64, 0.0f64);
+    for &(x0, x1, y0, y1) in &boxes {
+        gx0 = gx0.min(x0); gx1 = gx1.max(x1);
+        gy0 = gy0.min(y0); gy1 = gy1.max(y1);
+        wmax = wmax.max(x1 - x0); hmax = hmax.max(y1 - y0);
+    }
+    if !(wmax > 0.0 && hmax > 0.0) {
+        return None;
+    }
+    // Base cell size = the coarsest (unrefined) element; nx,ny from the domain extent.
+    let nxf = (gx1 - gx0) / wmax;
+    let nyf = (gy1 - gy0) / hmax;
+    let nx = nxf.round() as usize;
+    let ny = nyf.round() as usize;
+    if nx == 0 || ny == 0 || (nxf - nx as f64).abs() > 1e-6 || (nyf - ny as f64).abs() > 1e-6 {
+        return None; // extent not an integer multiple of the base cell ⇒ not a clean base grid
+    }
+    let (dxb, dyb) = ((gx1 - gx0) / nx as f64, (gy1 - gy0) / ny as f64);
+    let tol = 1e-6 * (dxb + dyb);
+    // Bin each element into its base cell; a base cell is refined iff it holds half-size elements.
+    let mut count = vec![0u8; nx * ny]; // # sub-elements seen per base cell
+    let mut full = vec![false; nx * ny]; // base cell has a full-size element
+    for &(x0, x1, y0, y1) in &boxes {
+        let (w, h) = (x1 - x0, y1 - y0);
+        let cx = (((0.5 * (x0 + x1)) - gx0) / dxb).floor() as i64;
+        let cy = (((0.5 * (y0 + y1)) - gy0) / dyb).floor() as i64;
+        if cx < 0 || cy < 0 || cx as usize >= nx || cy as usize >= ny {
+            return None;
+        }
+        let bc = cx as usize + cy as usize * nx;
+        let is_full = (w - dxb).abs() < tol && (h - dyb).abs() < tol;
+        let is_half = (w - 0.5 * dxb).abs() < tol && (h - 0.5 * dyb).abs() < tol;
+        if is_full {
+            full[bc] = true;
+            count[bc] += 1;
+        } else if is_half {
+            count[bc] += 1;
+        } else {
+            return None; // an element that is neither base- nor half-size ⇒ not a 2:1 grid
+        }
+    }
+    // Validate: every base cell is exactly 1 full element OR 4 half elements.
+    let mut refine = Vec::new();
+    for cy in 0..ny {
+        for cx in 0..nx {
+            let bc = cx + cy * nx;
+            if full[bc] && count[bc] == 1 {
+                // unrefined
+            } else if !full[bc] && count[bc] == 4 {
+                refine.push((cx, cy));
+            } else {
+                return None; // partial / inconsistent cell ⇒ bail to plain CG
+            }
+        }
+    }
+    Some((nx, ny, [gx0, gx1], [gy0, gy1], refine))
+}
+
 /// A cheap topology fingerprint of `mesh`, used to detect an AMR remesh that the persistent
 /// solver handles must be rebuilt for. Hashing the dof count alone is **not** enough: a remesh
 /// can refine one region and coarsen another, leaving the element count unchanged while the
@@ -68,6 +148,9 @@ fn invalidate_handles_on_remesh(
     mg_pressure: &RefCell<Option<GpuPoissonMg>>,
     mg_velx: &RefCell<Option<GpuPoissonMg>>,
     mg_vely: &RefCell<Option<GpuPoissonMg>>,
+    // Optional NC p-multigrid slots (only the viscoelastic AMR integrator has these).
+    mg_nc_pressure: Option<&RefCell<Option<crate::operators::multigrid_nc::GpuPMultigridNc>>>,
+    mg_nc_velocity: Option<&RefCell<Option<crate::operators::multigrid_nc::GpuPMultigridNc>>>,
 ) {
     let cur = mesh_fingerprint(mesh);
     if fp.borrow().map_or(true, |old| old != cur) {
@@ -76,7 +159,53 @@ fn invalidate_handles_on_remesh(
         *mg_pressure.borrow_mut() = None;
         *mg_velx.borrow_mut() = None;
         *mg_vely.borrow_mut() = None;
+        if let Some(s) = mg_nc_pressure {
+            *s.borrow_mut() = None;
+        }
+        if let Some(s) = mg_nc_velocity {
+            *s.borrow_mut() = None;
+        }
         *fp.borrow_mut() = Some(cur);
+    }
+}
+
+/// Lazily build the **non-conforming p-multigrid** handle in `slot` for an AMR `mesh`: built only
+/// when the mesh is non-conforming AND its base grid + refine-set can be recovered
+/// ([`infer_refined_grid`]); cleared otherwise (⇒ plain-CG NC fallback). `reaction`/`neumann_tags`/
+/// `singular` select the pressure (0, all-Neumann, deflated) vs velocity (λ, Dirichlet) operator.
+/// Rebuilt on remesh via the fingerprint clear in [`invalidate_handles_on_remesh`].
+#[allow(clippy::too_many_arguments)]
+fn ensure_mg_nc_handle(
+    slot: &RefCell<Option<crate::operators::multigrid_nc::GpuPMultigridNc>>,
+    mesh: &Mesh2d,
+    alpha: f64,
+    reaction: f64,
+    neumann_tags: Vec<u32>,
+    singular: bool,
+) {
+    let mut cur = slot.borrow_mut();
+    if !mesh_is_nonconforming(mesh) {
+        *cur = None;
+        return;
+    }
+    if cur.is_some() {
+        return; // valid for this topology (the fingerprint clear handles remeshes)
+    }
+    if let Some((nx, ny, xr, yr, refine)) = infer_refined_grid(mesh) {
+        let p = mesh.order;
+        *cur = crate::operators::multigrid_nc::GpuPMultigridNc::new(
+            p, nx, ny, xr, yr, &refine, alpha, reaction, neumann_tags, singular,
+        )
+        .ok(); // None on failure ⇒ silently fall back to plain-CG NC
+        if std::env::var("NC_MG_DEBUG").is_ok() {
+            eprintln!(
+                "[nc-mg] base {nx}×{ny}, {} refined, reaction={reaction}, singular={singular} ⇒ {}",
+                refine.len(),
+                if cur.is_some() { "MG-NC active" } else { "build FAILED → plain CG" }
+            );
+        }
+    } else if std::env::var("NC_MG_DEBUG").is_ok() {
+        eprintln!("[nc-mg] infer_refined_grid FAILED (not a clean refined grid) → plain CG");
     }
 }
 
@@ -234,6 +363,13 @@ pub struct GpuStokes<'m, 'p> {
     /// [`with_mg_velocity`].
     mg_velx: Option<&'p GpuPoissonMg>,
     mg_vely: Option<&'p GpuPoissonMg>,
+    /// Optional **non-conforming p-multigrid** handles (the AMR analogue of `mg_pressure`/
+    /// `mg_velx`): when the mesh has hanging nodes, route the pressure/velocity solves through these
+    /// (mesh-independent ~28 iters) instead of the plain-CG `poisson_nc` (thousands of iters at
+    /// scale). One velocity handle suffices for the closed box (both components all-Dirichlet, same
+    /// reaction λ). `None` ⇒ the plain-CG NC path. Set via [`with_mg_nc`].
+    mg_nc_pressure: Option<&'p crate::operators::multigrid_nc::GpuPMultigridNc>,
+    mg_nc_velocity: Option<&'p crate::operators::multigrid_nc::GpuPMultigridNc>,
     /// Pressure-Poisson assembly (pure Neumann, singular).
     pressure: Poisson<'m>,
     /// Velocity Helmholtz assembly `(λM + A)`, one per component (differ only in their
@@ -269,6 +405,8 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             mg_pressure: None,
             mg_velx: None,
             mg_vely: None,
+            mg_nc_pressure: None,
+            mg_nc_velocity: None,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, mesh.boundary_tags()),
             velocity_x: Poisson::with_reaction(mesh, alpha, lambda),
             velocity_y: Poisson::with_reaction(mesh, alpha, lambda),
@@ -322,6 +460,19 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         self
     }
 
+    /// Attach the **non-conforming p-multigrid** handles (pressure + velocity) for AMR meshes — the
+    /// MG analogue of [`with_mg_pressure`]/[`with_mg_velocity`] on the mortar path. When present, the
+    /// NC pressure/velocity solves route through these instead of plain-CG `poisson_nc`.
+    pub fn with_mg_nc(
+        mut self,
+        pressure: &'p crate::operators::multigrid_nc::GpuPMultigridNc,
+        velocity: &'p crate::operators::multigrid_nc::GpuPMultigridNc,
+    ) -> Self {
+        self.mg_nc_pressure = Some(pressure);
+        self.mg_nc_velocity = Some(velocity);
+        self
+    }
+
     /// Override the per-step elliptic-solve relative tolerance (default `1e-10`). In a
     /// time-accurate run the solve only needs to be as accurate as the time-discretization
     /// error, so a looser tol can cut iterations with no loss in the physical solution.
@@ -351,6 +502,8 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             mg_pressure: None,
             mg_velx: None,
             mg_vely: None,
+            mg_nc_pressure: None,
+            mg_nc_velocity: None,
             pressure: Poisson::with_bc(mesh, alpha, 0.0, pres_neumann.clone()),
             velocity_x: Poisson::with_bc(mesh, alpha, lambda, velx_neumann.clone()),
             velocity_y: Poisson::with_bc(mesh, alpha, lambda, vely_neumann.clone()),
@@ -527,7 +680,11 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
             // p-MG-PCG (mesh-independent iters; auto-deflated for the singular pure-Neumann op).
             self.mg_pressure.unwrap().solve(&bp, self.tol, self.maxit)?
         } else if nc {
-            if let Some(h) = self.poisson_nc {
+            if let Some(mg) = self.mg_nc_pressure {
+                // NC p-MG-PCG (mesh-independent; the deflation for the singular pure-Neumann op is
+                // built into the handle). Replaces the plain-CG NC pressure solve at scale.
+                mg.solve(&bp, self.tol, self.maxit)?
+            } else if let Some(h) = self.poisson_nc {
                 h.solve(&bp, 0.0, &self.pres_neumann_tags, true, self.tol, self.maxit)?
             } else {
                 pressure_nc_cg_solve(mesh, &bp, self.alpha, self.tol, self.maxit)?
@@ -554,7 +711,10 @@ impl<'m, 'p> GpuStokes<'m, 'p> {
         let by = self.velocity_y.rhs(&fyv, |x, y| bc_v(x, y, t));
         let solve_vel = |b: &[f64], neu: &[u32], mg: Option<&GpuPoissonMg>| -> Result<Vec<f64>, Box<dyn std::error::Error>> {
             Ok(if nc {
-                if let Some(h) = self.poisson_nc {
+                if let Some(mgnc) = self.mg_nc_velocity {
+                    // NC p-MG-PCG viscous Helmholtz (reaction λ baked into the handle); non-singular.
+                    mgnc.solve(b, self.tol, self.maxit)?.0
+                } else if let Some(h) = self.poisson_nc {
                     h.solve(b, lambda, neu, false, self.tol, self.maxit)?.0
                 } else {
                     poisson_nc_cg_solve(mesh, b, self.alpha, lambda, self.tol, self.maxit)?.0
@@ -798,7 +958,7 @@ impl gale::sim::StateIntegrator for GpuStokesIntegrator {
         let t_new = state.time.t + self.dt;
         invalidate_handles_on_remesh(
             &self.mesh_fp, &state.mesh, &self.poisson, &self.poisson_nc, &self.mg_pressure,
-            &self.mg_velx, &self.mg_vely,
+            &self.mg_velx, &self.mg_vely, None, None,
         );
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
@@ -976,7 +1136,7 @@ impl gale::sim::StateIntegrator for GpuDualSplitting {
         let lambda = 1.0 / (self.nu * self.dt);
         invalidate_handles_on_remesh(
             &self.mesh_fp, &state.mesh, &self.poisson, &self.poisson_nc, &self.mg_pressure,
-            &self.mg_velx, &self.mg_vely,
+            &self.mg_velx, &self.mg_vely, None, None,
         );
         ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
         ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
@@ -1287,6 +1447,12 @@ pub struct GpuViscoelasticDualSplitting {
     mg_pressure: RefCell<Option<GpuPoissonMg>>,
     mg_velx: RefCell<Option<GpuPoissonMg>>,
     mg_vely: RefCell<Option<GpuPoissonMg>>,
+    /// **Non-conforming p-multigrid** handles for AMR meshes — pressure (reaction 0, deflated) and
+    /// velocity (reaction λ). When the mesh has hanging nodes these route the elliptic solves through
+    /// mesh-independent MG (~28 iters) instead of plain-CG `poisson_nc` (thousands at scale). Rebuilt
+    /// on remesh via the fingerprint clear; `None` ⇒ plain-CG NC fallback.
+    mg_nc_pressure: RefCell<Option<crate::operators::multigrid_nc::GpuPMultigridNc>>,
+    mg_nc_velocity: RefCell<Option<crate::operators::multigrid_nc::GpuPMultigridNc>>,
     /// Topology fingerprint of the mesh the handles above were built for; an AMR remesh changes it
     /// and forces a rebuild (see [`invalidate_handles_on_remesh`]).
     mesh_fp: RefCell<Option<u64>>,
@@ -1335,6 +1501,8 @@ impl GpuViscoelasticDualSplitting {
             mg_pressure: RefCell::new(None),
             mg_velx: RefCell::new(None),
             mg_vely: RefCell::new(None),
+            mg_nc_pressure: RefCell::new(None),
+            mg_nc_velocity: RefCell::new(None),
             mesh_fp: RefCell::new(None),
             logconf: RefCell::new(None),
             solve_tol: 1e-10,
@@ -1474,6 +1642,7 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             invalidate_handles_on_remesh(
                 &self.mesh_fp, &state.mesh, &self.poisson, &self.poisson_nc, &self.mg_pressure,
                 &self.mg_velx, &self.mg_vely,
+                Some(&self.mg_nc_pressure), Some(&self.mg_nc_velocity),
             );
             ensure_poisson_handle(&self.poisson, &state.mesh, self.alpha);
             ensure_poisson_nc_handle(&self.poisson_nc, &state.mesh, self.alpha);
@@ -1483,11 +1652,18 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             // `GpuStokes::new` below): λ = 1/(η_s Δt).
             let lambda = 1.0 / (self.eta_s * self.dt);
             ensure_mg_velocity_handles(&self.mg_velx, &self.mg_vely, &state.mesh, self.alpha, lambda, Vec::new(), Vec::new());
+            // NC p-multigrid for AMR meshes: pressure (reaction 0, all-Neumann ⇒ deflated/singular)
+            // and velocity (reaction λ, closed-box Dirichlet ⇒ non-singular). Built only when the mesh
+            // is non-conforming AND its base grid is recoverable; else cleared ⇒ plain-CG NC fallback.
+            ensure_mg_nc_handle(&self.mg_nc_pressure, &state.mesh, self.alpha, 0.0, state.mesh.boundary_tags(), true);
+            ensure_mg_nc_handle(&self.mg_nc_velocity, &state.mesh, self.alpha, lambda, Vec::new(), false);
             let handle = self.poisson.borrow();
             let nc_handle = self.poisson_nc.borrow();
             let mg_handle = self.mg_pressure.borrow();
             let mg_vx = self.mg_velx.borrow();
             let mg_vy = self.mg_vely.borrow();
+            let mgnc_p = self.mg_nc_pressure.borrow();
+            let mgnc_v = self.mg_nc_velocity.borrow();
             let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.eta_s, self.dt).with_tol(self.solve_tol);
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
@@ -1500,6 +1676,9 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             }
             if let Some(vx) = mg_vx.as_ref() {
                 stokes = stokes.with_mg_velocity(vx, mg_vy.as_ref().unwrap_or(vx));
+            }
+            if let (Some(p), Some(v)) = (mgnc_p.as_ref(), mgnc_v.as_ref()) {
+                stokes = stokes.with_mg_nc(p, v);
             }
             let (nux, nuy) = stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)

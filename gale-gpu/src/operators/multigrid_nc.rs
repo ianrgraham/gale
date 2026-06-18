@@ -251,6 +251,16 @@ impl GpuPMultigridNc {
 
     /// Device-resident p-MG-PCG: solves `(reaction·M + A)·x = rhs`, writing `out`. Fields stay on the
     /// GPU; only the CG/deflation scalars read back. Returns iterations.
+    /// Host-convenience solve: upload `b`, run the device-resident p-MG-PCG, download `x`. Returns
+    /// `(x, iters)` — a drop-in for the host-orchestrated flow integrator's `GpuPoissonNc::solve`
+    /// (the VE step is host-orchestrated, so a per-solve up/download is the existing pattern).
+    pub fn solve(&self, b: &[f64], tol: f64, maxit: usize) -> Result<(Vec<f64>, usize), Box<dyn std::error::Error>> {
+        let bd = self.upload(b)?;
+        let mut xd = DeviceBuffer::<f64>::zeroed(self.levels[0].stream(), self.ndof0)?;
+        let it = self.solve_dev(&bd, &mut xd, tol, maxit)?;
+        Ok((self.download(&xd)?, it))
+    }
+
     pub fn solve_dev(
         &self, rhs: &DeviceBuffer<f64>, out: &mut DeviceBuffer<f64>, tol: f64, maxit: usize,
     ) -> Result<usize, Box<dyn std::error::Error>> {
