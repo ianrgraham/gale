@@ -98,7 +98,10 @@ impl PMultigridNc {
         // h-coarsening tail: conforming p/h-multigrid on the order-1 UNIFORM base mesh (coarsens to a
         // tiny grid), plus the refined→base element map and the shared 2:1 transfer matrices.
         let base_mg = PMultigrid::with_bc(1, nx, ny, xr, yr, alpha, reaction, neumann_tags.clone());
-        let quad_pq = *base_mg.quad_prolong();
+        // `base_mg` is order 1 ⇒ its h-transfer matrices are exactly the 64-element (4×4 per
+        // quadrant) bilinear set this NC tail uses; copy into the fixed array.
+        let quad_pq: [f64; 64] =
+            base_mg.quad_prolong().try_into().expect("order-1 base quad_prolong must be 64 elems");
         let cell_ids = compute_cell_ids(nx, ny, refine);
 
         let mut mg = PMultigridNc {

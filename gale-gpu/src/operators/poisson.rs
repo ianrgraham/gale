@@ -124,6 +124,26 @@ fn matvec_cfgs(ne: usize, n1: u32) -> (LaunchConfig, LaunchConfig) {
     (g, o)
 }
 
+/// Launch config for the **fused volume matvec** [`kernels::operator_fused`] — same grid/block as
+/// [`matvec_cfgs`] but one extra per-element shared tile (the staged `u` for the in-kernel gradient
+/// recompute): `[ DS(nn) | US | PR | PS ]` = `(nn + 3·epb·nn)·8` bytes.
+fn fused_cfg(ne: usize, n1: u32) -> LaunchConfig {
+    let nn = (n1 as usize) * (n1 as usize);
+    let epb = 192usize.div_ceil(nn).max(1);
+    let grid = ne.div_ceil(epb) as u32;
+    let block = (epb * nn) as u32;
+    LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: ((nn + 3 * epb * nn) * 8) as u32 }
+}
+
+/// Launch config for [`kernels::operator_arith`] (n1=4): `epb` elements/block, shared `[ DS | PR | PS ]`
+/// = `(16 + 2·epb·16)·8` bytes (no u-staging tile). `epb=6` (96-thread blocks) was the C++ ref optimum.
+fn arith_cfg(ne: usize, epb: usize) -> LaunchConfig {
+    let nn = 16usize;
+    let grid = ne.div_ceil(epb) as u32;
+    let block = (epb * nn) as u32;
+    LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: ((nn + 2 * epb * nn) * 8) as u32 }
+}
+
 /// Convergence guard for the iterative elliptic solves (CG and MG-PCG alike): emit a
 /// one-line stderr warning when a solve exhausts `maxit` without reaching `tol`, so a
 /// pathological / under-resolved solve **surfaces** instead of silently feeding an
@@ -237,7 +257,7 @@ mod kernels {
             }
         }
         // affine: per-node jw = constant Jacobian × the (tiny, well-cached) GLL mass diagonal.
-        let jw_b = jac * mass[m];
+        let jw_b = jac * unsafe { *mass.get_unchecked(m) };
         let mut rf = 0.0f64;
         if active {
             unsafe {
@@ -320,6 +340,645 @@ mod kernels {
         }
     }
 
+    /// **Solo matvec** (Phase A2): the entire SIPG operator `A·u` in ONE kernel — **no separate
+    /// `gradient` pass, no global `gx`/`gy` buffers at all.** Each block stages its own element's `u`
+    /// in shared and recomputes the own gradient `(gxb,gyb)` from it (the same contraction `gradient`
+    /// ran), and for the interior-face SIPG consistency average it **recomputes the *neighbour's*
+    /// normal-derivative on the fly** from the neighbour's `u` row read from global (one length-`n1`
+    /// contraction per interior face node, reusing the shared diff matrix `DS`). This eliminates the
+    /// `gradient` kernel's ~245 µs latency-bound launch *and its `gx/gy` global write+read entirely*,
+    /// and the extra independent contraction loads are exactly the ILP that hides the matvec's memory
+    /// latency (Volkov: more independent work per thread, not more occupancy).
+    ///
+    /// **Valid for the affine axis-aligned uniform mesh `GpuPoissonMg` is built on** (constant `rx`,
+    /// `sy`, identical per-element metrics; `GpuPoissonMg` is conforming-uniform-only by design, and
+    /// the h-coarsened levels stay uniform). The neighbour node `(ing,jng)` is decoded from
+    /// `face_nbr` (so any conforming permutation is honoured), and on the uniform mesh `gx_ng =
+    /// rx·∂ᵣu_ng`, `gy_ng = sy·∂ₛu_ng` reproduce the `gradient` kernel's stored values **bit-for-bit**
+    /// — only the face-normal component is needed (`nx*gx_ng` for E/W, `ny*gy_ng` for S/N; the other
+    /// is `·0`). Bit-for-bit equal to `gradient` then `operator` at `G=f64`. Shared `[ DS | US | PR |
+    /// PS ]`. The `gx`/`gy` params are retained for a uniform call signature but are **unread** (no
+    /// gradient pass populates them); the type `G` is likewise vestigial here.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn operator_fused<U: Scalar, G: Scalar>(
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
+        mut out: DisjointSlice<U>,
+    ) {
+        let _ = (gx.len(), gy.len()); // retained for signature uniformity; not read (no gradient pass)
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | US(epb·nn) | PR(epb·nn) | PS(epb·nn) ]
+        let n1 = n1 as usize;
+        let nn = n1 * n1;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let active = e < ne as usize;
+        let us = nn + el * nn; // staged u tile
+        let pr = nn + epb * nn + el * nn;
+        let ps = nn + 2 * epb * nn + el * nn;
+        let b = e * nn + m;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = *d.get_unchecked(t); // shared diff matrix (DS), once per block
+            }
+            if active {
+                *sm.add(us + m) = u.get_unchecked(b).to_f64(); // stage u for the gradient recompute
+            }
+        }
+        thread::sync_threads();
+        let jw_b = jac * unsafe { *mass.get_unchecked(m) };
+        let i = m % n1;
+        let j = m / n1;
+        let mut rf = 0.0f64;
+        if active {
+            // Recompute the own-element gradient from staged u — identical contraction to `gradient`.
+            let mut ur = 0.0f64;
+            let mut uss = 0.0f64;
+            let mut k = 0usize;
+            while k < n1 {
+                unsafe {
+                    ur += *sm.add(i * n1 + k) * *sm.add(us + k + j * n1);
+                    uss += *sm.add(j * n1 + k) * *sm.add(us + i + k * n1);
+                }
+                k += 1;
+            }
+            let gxb = rx * ur; // affine: gx = rx·u_r (sx=0)
+            let gyb = sy * uss; // gy = sy·u_s (ry=0)
+            unsafe {
+                *sm.add(pr + m) = rx * (jw_b * gxb); // ry = 0
+                *sm.add(ps + m) = sy * (jw_b * gyb); // sx = 0
+            }
+            // Face SIPG term: own normal-derivative from the recomputed (gxb,gyb) registers; the
+            // neighbour normal-derivative recomputed on the fly from the neighbour's u row (global).
+            let ii = i;
+            let jj = j;
+            let mut hx = 0.0f64;
+            let mut hy = 0.0f64;
+            let mut t4 = 0usize;
+            while t4 < 4 {
+                let (on, a, nx, ny, xface) = if t4 == 0 {
+                    (jj == 0, ii, 0.0f64, -1.0f64, true) // South
+                } else if t4 == 1 {
+                    (ii == n1 - 1, jj, 1.0f64, 0.0f64, false) // East
+                } else if t4 == 2 {
+                    (jj == n1 - 1, ii, 0.0f64, 1.0f64, true) // North
+                } else {
+                    (ii == 0, jj, -1.0f64, 0.0f64, false) // West
+                };
+                if on {
+                    let idx = (e * 4 + t4) * n1 + a;
+                    let nbr = unsafe { *face_nbr.get_unchecked(idx) };
+                    if nbr != NEU {
+                        let sw = unsafe { if xface { *fswx.get_unchecked(a) } else { *fswy.get_unchecked(a) } };
+                        let dun_e = nx * gxb + ny * gyb;
+                        let ug = unsafe { u.get_unchecked(b).to_f64() };
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0)
+                        } else {
+                            let ng = nbr as usize;
+                            // Decode neighbour node (ing,jng); recompute its normal-derivative.
+                            let ng_base = (ng / nn) * nn;
+                            let nl = ng % nn;
+                            let ing = nl % n1;
+                            let jng = nl / n1;
+                            let dun_ng = if xface {
+                                // S/N face (normal y): gy_ng = sy·∂ₛu_ng, weighted by ny (nx=0).
+                                let mut sden = 0.0f64;
+                                let mut kk = 0usize;
+                                while kk < n1 {
+                                    unsafe { sden += *sm.add(jng * n1 + kk) * u.get_unchecked(ng_base + ing + kk * n1).to_f64(); }
+                                    kk += 1;
+                                }
+                                ny * (sy * sden)
+                            } else {
+                                // E/W face (normal x): gx_ng = rx·∂ᵣu_ng, weighted by nx (ny=0).
+                                let mut rden = 0.0f64;
+                                let mut kk = 0usize;
+                                while kk < n1 {
+                                    unsafe { rden += *sm.add(ing * n1 + kk) * u.get_unchecked(ng_base + kk + jng * n1).to_f64(); }
+                                    kk += 1;
+                                }
+                                nx * (rx * rden)
+                            };
+                            (0.5 * (dun_e + dun_ng), ug - unsafe { u.get_unchecked(ng).to_f64() }, 0.5)
+                        };
+                        let g = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * nx;
+                        hy += g * ny;
+                    }
+                }
+                t4 += 1;
+            }
+            unsafe {
+                *sm.add(pr + m) -= rx * hx; // ry = 0
+                *sm.add(ps + m) -= sy * hy; // sx = 0
+            }
+        }
+        thread::sync_threads();
+        if !active {
+            return;
+        }
+        let mut acc = 0.0f64;
+        let mut k = 0usize;
+        while k < n1 {
+            unsafe {
+                acc += *sm.add(k * n1 + i) * *sm.add(pr + k + j * n1)
+                    + *sm.add(k * n1 + j) * *sm.add(ps + i + k * n1);
+            }
+            k += 1;
+        }
+        unsafe {
+            *out.get_unchecked_mut(b) = U::from_f64(acc + rf + lambda * jw_b * u.get_unchecked(b).to_f64());
+        }
+    }
+
+    /// **arith matvec** — Rust port of `cuda-ref/matvec.cu::operator_fused_arith` (the C++ best, 44µs at
+    /// 256²/p3). n1=4 (p=3) SPECIALIZED. Every C++ optimization: balanced-tree FP64 contractions (reduce
+    /// the dependency depth — nvcc/LLVM don't reassociate FP64), HOISTED neighbour edge rows (the
+    /// L2-latency loads issued before the gradient), gradient row/col read straight from L1 (no u-staging
+    /// tile), neighbours computed ARITHMETICALLY (`e±1`/`e±ncol`, NO `face_nbr` global load), and
+    /// `get_unchecked` everywhere (no Rust bounds-check branch — the §4b audit fix). Uniform N×N
+    /// structured grid only (`ncol` = grid columns). Shared `[ DS(16) | PR(epb·16) | PS(epb·16) ]`.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn operator_arith<U: Scalar>(
+        d: &[f64], u: &[U], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        ne: u32, ncol: u32, rx: f64, sy: f64, jac: f64, tau: f64, lambda: f64,
+        neumann: u32, mut out: DisjointSlice<U>,
+    ) {
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(16) | PR(epb·16) | PS(epb·16) ]
+        let nn = 16usize;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let ne = ne as usize;
+        let ncol = ncol as usize;
+        let active = e < ne;
+        let pr = nn + el * nn;
+        let ps = nn + epb * nn + el * nn;
+        let eb = e * nn;
+        let i = m & 3;
+        let j = m >> 2;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = *d.get_unchecked(t);
+            }
+        }
+        thread::sync_threads();
+        let ex = e % ncol;
+        // Arithmetic neighbour bases (vgb/hgb = -1 ⇒ domain boundary). vertical = E/W, horizontal = S/N.
+        let mut vt = false;
+        let mut vnx = 0.0f64;
+        let mut vgb: i64 = -1;
+        let mut ving = 0usize;
+        if i == 0 {
+            vt = true;
+            vnx = -1.0;
+            if ex > 0 {
+                vgb = ((e - 1) * nn) as i64;
+                ving = 3;
+            }
+        } else if i == 3 {
+            vt = true;
+            vnx = 1.0;
+            if ex < ncol - 1 {
+                vgb = ((e + 1) * nn) as i64;
+                ving = 0;
+            }
+        }
+        let mut ht = false;
+        let mut hny = 0.0f64;
+        let mut hgb: i64 = -1;
+        let mut hjng = 0usize;
+        if j == 0 {
+            ht = true;
+            hny = -1.0;
+            if e >= ncol {
+                hgb = ((e - ncol) * nn) as i64;
+                hjng = 3;
+            }
+        } else if j == 3 {
+            ht = true;
+            hny = 1.0;
+            if e + ncol < ne {
+                hgb = ((e + ncol) * nn) as i64;
+                hjng = 0;
+            }
+        }
+        // Hoist the neighbour edge rows (the L2-latency loads — issued before the gradient).
+        let (mut qv0, mut qv1, mut qv2, mut qv3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut qh0, mut qh1, mut qh2, mut qh3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        unsafe {
+            if active && vgb >= 0 {
+                let g = vgb as usize;
+                qv0 = u.get_unchecked(g + j * 4).to_f64();
+                qv1 = u.get_unchecked(g + 1 + j * 4).to_f64();
+                qv2 = u.get_unchecked(g + 2 + j * 4).to_f64();
+                qv3 = u.get_unchecked(g + 3 + j * 4).to_f64();
+            }
+            if active && hgb >= 0 {
+                let g = hgb as usize;
+                qh0 = u.get_unchecked(g + i).to_f64();
+                qh1 = u.get_unchecked(g + i + 4).to_f64();
+                qh2 = u.get_unchecked(g + i + 8).to_f64();
+                qh3 = u.get_unchecked(g + i + 12).to_f64();
+            }
+        }
+        let jw = jac * unsafe { *mass.get_unchecked(m) };
+        let mut ug = 0.0f64;
+        let mut rf = 0.0f64;
+        if active {
+            unsafe {
+                // gradient row j + column i straight from L1 (no shared u-staging)
+                let r0 = u.get_unchecked(eb + j * 4).to_f64();
+                let r1 = u.get_unchecked(eb + 1 + j * 4).to_f64();
+                let r2 = u.get_unchecked(eb + 2 + j * 4).to_f64();
+                let r3 = u.get_unchecked(eb + 3 + j * 4).to_f64();
+                let c0 = u.get_unchecked(eb + i).to_f64();
+                let c1 = u.get_unchecked(eb + i + 4).to_f64();
+                let c2 = u.get_unchecked(eb + i + 8).to_f64();
+                let c3 = u.get_unchecked(eb + i + 12).to_f64();
+                ug = u.get_unchecked(eb + m).to_f64();
+                // balanced-tree contractions (depth 2, not 4) — LLVM won't reassociate FP64
+                let ur = (*sm.add(i * 4) * r0 + *sm.add(i * 4 + 1) * r1) + (*sm.add(i * 4 + 2) * r2 + *sm.add(i * 4 + 3) * r3);
+                let uss = (*sm.add(j * 4) * c0 + *sm.add(j * 4 + 1) * c1) + (*sm.add(j * 4 + 2) * c2 + *sm.add(j * 4 + 3) * c3);
+                let gx = rx * ur;
+                let gy = sy * uss;
+                let mut prv = rx * (jw * gx);
+                let mut psv = sy * (jw * gy);
+                if vt && (vgb >= 0 || neumann == 0) {
+                    // skip the boundary face term on Neumann domain faces (natural BC); interior + Dirichlet apply
+                    let sw = *fswy.get_unchecked(j);
+                    let dun_e = vnx * gx;
+                    let (avg, jump, gf) = if vgb < 0 {
+                        (dun_e, ug, 1.0)
+                    } else {
+                        let s = (*sm.add(ving * 4) * qv0 + *sm.add(ving * 4 + 1) * qv1) + (*sm.add(ving * 4 + 2) * qv2 + *sm.add(ving * 4 + 3) * qv3);
+                        let ung = if ving == 0 { qv0 } else { qv3 };
+                        (0.5 * (dun_e + vnx * (rx * s)), ug - ung, 0.5)
+                    };
+                    let g = gf * sw * jump;
+                    rf += -sw * avg + tau * sw * jump;
+                    prv -= rx * (g * vnx); // hx folded
+                }
+                if ht && (hgb >= 0 || neumann == 0) {
+                    let sw = *fswx.get_unchecked(i);
+                    let dun_e = hny * gy;
+                    let (avg, jump, gf) = if hgb < 0 {
+                        (dun_e, ug, 1.0)
+                    } else {
+                        let s = (*sm.add(hjng * 4) * qh0 + *sm.add(hjng * 4 + 1) * qh1) + (*sm.add(hjng * 4 + 2) * qh2 + *sm.add(hjng * 4 + 3) * qh3);
+                        let ung = if hjng == 0 { qh0 } else { qh3 };
+                        (0.5 * (dun_e + hny * (sy * s)), ug - ung, 0.5)
+                    };
+                    let g = gf * sw * jump;
+                    rf += -sw * avg + tau * sw * jump;
+                    psv -= sy * (g * hny); // hy folded
+                }
+                *sm.add(pr + m) = prv;
+                *sm.add(ps + m) = psv;
+            }
+        }
+        thread::sync_threads();
+        if !active {
+            return;
+        }
+        unsafe {
+            let acc_r = (*sm.add(i) * *sm.add(pr + j * 4) + *sm.add(4 + i) * *sm.add(pr + 1 + j * 4))
+                + (*sm.add(8 + i) * *sm.add(pr + 2 + j * 4) + *sm.add(12 + i) * *sm.add(pr + 3 + j * 4));
+            let acc_s = (*sm.add(j) * *sm.add(ps + i) + *sm.add(4 + j) * *sm.add(ps + i + 4))
+                + (*sm.add(8 + j) * *sm.add(ps + i + 8) + *sm.add(12 + j) * *sm.add(ps + i + 12));
+            *out.get_unchecked_mut(eb + m) = U::from_f64((acc_r + acc_s) + rf + lambda * jw * ug);
+        }
+    }
+
+    /// **arith damped-Jacobi smoother** — [`operator_arith`] (the C++-best matvec) with the Jacobi
+    /// update `out ← u + ω·invd·(rhs − A·u)` folded into the final write instead of `A·u`. n1=4/p=3
+    /// specialized; arithmetic neighbours (`ncol` = grid columns); `get_unchecked` throughout. This is
+    /// the per-step DOMINANT kernel (smoother, ~51% of GPU step time) — same 3.7× gain as the matvec.
+    /// Bit-for-bit equal to `gradient`+`operator_jacobi` at `G=f64` up to the FP-reassociation of the
+    /// balanced-tree contractions (rel ~1e-11, the §6 tolerance). `out` MUST be distinct from `u`.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn operator_jacobi_arith<U: Scalar>(
+        d: &[f64], u: &[U], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        ne: u32, ncol: u32, rx: f64, sy: f64, jac: f64, tau: f64, lambda: f64,
+        neumann: u32, rhs: &[f64], invd: &[f64], omega: f64, mut out: DisjointSlice<U>,
+    ) {
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(16) | PR(epb·16) | PS(epb·16) ]
+        let nn = 16usize;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let ne = ne as usize;
+        let ncol = ncol as usize;
+        let active = e < ne;
+        let pr = nn + el * nn;
+        let ps = nn + epb * nn + el * nn;
+        let eb = e * nn;
+        let i = m & 3;
+        let j = m >> 2;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = *d.get_unchecked(t);
+            }
+        }
+        thread::sync_threads();
+        let ex = e % ncol;
+        let mut vt = false;
+        let mut vnx = 0.0f64;
+        let mut vgb: i64 = -1;
+        let mut ving = 0usize;
+        if i == 0 {
+            vt = true;
+            vnx = -1.0;
+            if ex > 0 {
+                vgb = ((e - 1) * nn) as i64;
+                ving = 3;
+            }
+        } else if i == 3 {
+            vt = true;
+            vnx = 1.0;
+            if ex < ncol - 1 {
+                vgb = ((e + 1) * nn) as i64;
+                ving = 0;
+            }
+        }
+        let mut ht = false;
+        let mut hny = 0.0f64;
+        let mut hgb: i64 = -1;
+        let mut hjng = 0usize;
+        if j == 0 {
+            ht = true;
+            hny = -1.0;
+            if e >= ncol {
+                hgb = ((e - ncol) * nn) as i64;
+                hjng = 3;
+            }
+        } else if j == 3 {
+            ht = true;
+            hny = 1.0;
+            if e + ncol < ne {
+                hgb = ((e + ncol) * nn) as i64;
+                hjng = 0;
+            }
+        }
+        let (mut qv0, mut qv1, mut qv2, mut qv3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut qh0, mut qh1, mut qh2, mut qh3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        unsafe {
+            if active && vgb >= 0 {
+                let g = vgb as usize;
+                qv0 = u.get_unchecked(g + j * 4).to_f64();
+                qv1 = u.get_unchecked(g + 1 + j * 4).to_f64();
+                qv2 = u.get_unchecked(g + 2 + j * 4).to_f64();
+                qv3 = u.get_unchecked(g + 3 + j * 4).to_f64();
+            }
+            if active && hgb >= 0 {
+                let g = hgb as usize;
+                qh0 = u.get_unchecked(g + i).to_f64();
+                qh1 = u.get_unchecked(g + i + 4).to_f64();
+                qh2 = u.get_unchecked(g + i + 8).to_f64();
+                qh3 = u.get_unchecked(g + i + 12).to_f64();
+            }
+        }
+        let jw = jac * unsafe { *mass.get_unchecked(m) };
+        let mut ug = 0.0f64;
+        let mut rf = 0.0f64;
+        if active {
+            unsafe {
+                let r0 = u.get_unchecked(eb + j * 4).to_f64();
+                let r1 = u.get_unchecked(eb + 1 + j * 4).to_f64();
+                let r2 = u.get_unchecked(eb + 2 + j * 4).to_f64();
+                let r3 = u.get_unchecked(eb + 3 + j * 4).to_f64();
+                let c0 = u.get_unchecked(eb + i).to_f64();
+                let c1 = u.get_unchecked(eb + i + 4).to_f64();
+                let c2 = u.get_unchecked(eb + i + 8).to_f64();
+                let c3 = u.get_unchecked(eb + i + 12).to_f64();
+                ug = u.get_unchecked(eb + m).to_f64();
+                let ur = (*sm.add(i * 4) * r0 + *sm.add(i * 4 + 1) * r1) + (*sm.add(i * 4 + 2) * r2 + *sm.add(i * 4 + 3) * r3);
+                let uss = (*sm.add(j * 4) * c0 + *sm.add(j * 4 + 1) * c1) + (*sm.add(j * 4 + 2) * c2 + *sm.add(j * 4 + 3) * c3);
+                let gx = rx * ur;
+                let gy = sy * uss;
+                let mut prv = rx * (jw * gx);
+                let mut psv = sy * (jw * gy);
+                if vt && (vgb >= 0 || neumann == 0) {
+                    // skip the boundary face term on Neumann domain faces (natural BC); interior + Dirichlet apply
+                    let sw = *fswy.get_unchecked(j);
+                    let dun_e = vnx * gx;
+                    let (avg, jump, gf) = if vgb < 0 {
+                        (dun_e, ug, 1.0)
+                    } else {
+                        let s = (*sm.add(ving * 4) * qv0 + *sm.add(ving * 4 + 1) * qv1) + (*sm.add(ving * 4 + 2) * qv2 + *sm.add(ving * 4 + 3) * qv3);
+                        let ung = if ving == 0 { qv0 } else { qv3 };
+                        (0.5 * (dun_e + vnx * (rx * s)), ug - ung, 0.5)
+                    };
+                    let g = gf * sw * jump;
+                    rf += -sw * avg + tau * sw * jump;
+                    prv -= rx * (g * vnx);
+                }
+                if ht && (hgb >= 0 || neumann == 0) {
+                    let sw = *fswx.get_unchecked(i);
+                    let dun_e = hny * gy;
+                    let (avg, jump, gf) = if hgb < 0 {
+                        (dun_e, ug, 1.0)
+                    } else {
+                        let s = (*sm.add(hjng * 4) * qh0 + *sm.add(hjng * 4 + 1) * qh1) + (*sm.add(hjng * 4 + 2) * qh2 + *sm.add(hjng * 4 + 3) * qh3);
+                        let ung = if hjng == 0 { qh0 } else { qh3 };
+                        (0.5 * (dun_e + hny * (sy * s)), ug - ung, 0.5)
+                    };
+                    let g = gf * sw * jump;
+                    rf += -sw * avg + tau * sw * jump;
+                    psv -= sy * (g * hny);
+                }
+                *sm.add(pr + m) = prv;
+                *sm.add(ps + m) = psv;
+            }
+        }
+        thread::sync_threads();
+        if !active {
+            return;
+        }
+        unsafe {
+            let acc_r = (*sm.add(i) * *sm.add(pr + j * 4) + *sm.add(4 + i) * *sm.add(pr + 1 + j * 4))
+                + (*sm.add(8 + i) * *sm.add(pr + 2 + j * 4) + *sm.add(12 + i) * *sm.add(pr + 3 + j * 4));
+            let acc_s = (*sm.add(j) * *sm.add(ps + i) + *sm.add(4 + j) * *sm.add(ps + i + 4))
+                + (*sm.add(8 + j) * *sm.add(ps + i + 8) + *sm.add(12 + j) * *sm.add(ps + i + 12));
+            let ap = (acc_r + acc_s) + rf + lambda * jw * ug;
+            // damped-Jacobi: out ← u + ω·invd·(rhs − Ap)
+            *out.get_unchecked_mut(eb + m) =
+                U::from_f64(ug + omega * *invd.get_unchecked(eb + m) * (*rhs.get_unchecked(eb + m) - ap));
+        }
+    }
+
+    /// **arith Chebyshev smoother** — [`operator_jacobi_arith`] with the Chebyshev update tail instead of
+    /// damped-Jacobi: `dvec ← c1·dvec + c2·invd·(rhs − Ap); out ← u + dvec`. One degree-K Chebyshev sweep =
+    /// K launches with the host-precomputed per-step `(c1,c2)` (step 0 has `c1=0`, discarding the stale
+    /// `dvec`). `dvec` persists across the K steps (in-place, no neighbour ⇒ race-free). Validated in the
+    /// C++ prototype (cuda-ref/mgpcg.cu) to cut MG-PCG iterations ~1.5× vs damped-Jacobi. `out` ≠ `u`.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn operator_cheby_arith<U: Scalar>(
+        d: &[f64], u: &[U], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        ne: u32, ncol: u32, rx: f64, sy: f64, jac: f64, tau: f64, lambda: f64,
+        neumann: u32, rhs: &[f64], invd: &[f64], c1: f64, c2: f64,
+        mut dvec: DisjointSlice<f64>, mut out: DisjointSlice<U>,
+    ) {
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(16) | PR(epb·16) | PS(epb·16) ]
+        let nn = 16usize;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let ne = ne as usize;
+        let ncol = ncol as usize;
+        let active = e < ne;
+        let pr = nn + el * nn;
+        let ps = nn + epb * nn + el * nn;
+        let eb = e * nn;
+        let i = m & 3;
+        let j = m >> 2;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = *d.get_unchecked(t);
+            }
+        }
+        thread::sync_threads();
+        let ex = e % ncol;
+        let mut vt = false;
+        let mut vnx = 0.0f64;
+        let mut vgb: i64 = -1;
+        let mut ving = 0usize;
+        if i == 0 {
+            vt = true;
+            vnx = -1.0;
+            if ex > 0 {
+                vgb = ((e - 1) * nn) as i64;
+                ving = 3;
+            }
+        } else if i == 3 {
+            vt = true;
+            vnx = 1.0;
+            if ex < ncol - 1 {
+                vgb = ((e + 1) * nn) as i64;
+                ving = 0;
+            }
+        }
+        let mut ht = false;
+        let mut hny = 0.0f64;
+        let mut hgb: i64 = -1;
+        let mut hjng = 0usize;
+        if j == 0 {
+            ht = true;
+            hny = -1.0;
+            if e >= ncol {
+                hgb = ((e - ncol) * nn) as i64;
+                hjng = 3;
+            }
+        } else if j == 3 {
+            ht = true;
+            hny = 1.0;
+            if e + ncol < ne {
+                hgb = ((e + ncol) * nn) as i64;
+                hjng = 0;
+            }
+        }
+        let (mut qv0, mut qv1, mut qv2, mut qv3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut qh0, mut qh1, mut qh2, mut qh3) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        unsafe {
+            if active && vgb >= 0 {
+                let g = vgb as usize;
+                qv0 = u.get_unchecked(g + j * 4).to_f64();
+                qv1 = u.get_unchecked(g + 1 + j * 4).to_f64();
+                qv2 = u.get_unchecked(g + 2 + j * 4).to_f64();
+                qv3 = u.get_unchecked(g + 3 + j * 4).to_f64();
+            }
+            if active && hgb >= 0 {
+                let g = hgb as usize;
+                qh0 = u.get_unchecked(g + i).to_f64();
+                qh1 = u.get_unchecked(g + i + 4).to_f64();
+                qh2 = u.get_unchecked(g + i + 8).to_f64();
+                qh3 = u.get_unchecked(g + i + 12).to_f64();
+            }
+        }
+        let jw = jac * unsafe { *mass.get_unchecked(m) };
+        let mut ug = 0.0f64;
+        let mut rf = 0.0f64;
+        if active {
+            unsafe {
+                let r0 = u.get_unchecked(eb + j * 4).to_f64();
+                let r1 = u.get_unchecked(eb + 1 + j * 4).to_f64();
+                let r2 = u.get_unchecked(eb + 2 + j * 4).to_f64();
+                let r3 = u.get_unchecked(eb + 3 + j * 4).to_f64();
+                let c0 = u.get_unchecked(eb + i).to_f64();
+                let c1c = u.get_unchecked(eb + i + 4).to_f64();
+                let c2c = u.get_unchecked(eb + i + 8).to_f64();
+                let c3 = u.get_unchecked(eb + i + 12).to_f64();
+                ug = u.get_unchecked(eb + m).to_f64();
+                let ur = (*sm.add(i * 4) * r0 + *sm.add(i * 4 + 1) * r1) + (*sm.add(i * 4 + 2) * r2 + *sm.add(i * 4 + 3) * r3);
+                let uss = (*sm.add(j * 4) * c0 + *sm.add(j * 4 + 1) * c1c) + (*sm.add(j * 4 + 2) * c2c + *sm.add(j * 4 + 3) * c3);
+                let gx = rx * ur;
+                let gy = sy * uss;
+                let mut prv = rx * (jw * gx);
+                let mut psv = sy * (jw * gy);
+                if vt && (vgb >= 0 || neumann == 0) {
+                    let sw = *fswy.get_unchecked(j);
+                    let dun_e = vnx * gx;
+                    let (avg, jump, gf) = if vgb < 0 {
+                        (dun_e, ug, 1.0)
+                    } else {
+                        let s = (*sm.add(ving * 4) * qv0 + *sm.add(ving * 4 + 1) * qv1) + (*sm.add(ving * 4 + 2) * qv2 + *sm.add(ving * 4 + 3) * qv3);
+                        let ung = if ving == 0 { qv0 } else { qv3 };
+                        (0.5 * (dun_e + vnx * (rx * s)), ug - ung, 0.5)
+                    };
+                    let g = gf * sw * jump;
+                    rf += -sw * avg + tau * sw * jump;
+                    prv -= rx * (g * vnx);
+                }
+                if ht && (hgb >= 0 || neumann == 0) {
+                    let sw = *fswx.get_unchecked(i);
+                    let dun_e = hny * gy;
+                    let (avg, jump, gf) = if hgb < 0 {
+                        (dun_e, ug, 1.0)
+                    } else {
+                        let s = (*sm.add(hjng * 4) * qh0 + *sm.add(hjng * 4 + 1) * qh1) + (*sm.add(hjng * 4 + 2) * qh2 + *sm.add(hjng * 4 + 3) * qh3);
+                        let ung = if hjng == 0 { qh0 } else { qh3 };
+                        (0.5 * (dun_e + hny * (sy * s)), ug - ung, 0.5)
+                    };
+                    let g = gf * sw * jump;
+                    rf += -sw * avg + tau * sw * jump;
+                    psv -= sy * (g * hny);
+                }
+                *sm.add(pr + m) = prv;
+                *sm.add(ps + m) = psv;
+            }
+        }
+        thread::sync_threads();
+        if !active {
+            return;
+        }
+        unsafe {
+            let acc_r = (*sm.add(i) * *sm.add(pr + j * 4) + *sm.add(4 + i) * *sm.add(pr + 1 + j * 4))
+                + (*sm.add(8 + i) * *sm.add(pr + 2 + j * 4) + *sm.add(12 + i) * *sm.add(pr + 3 + j * 4));
+            let acc_s = (*sm.add(j) * *sm.add(ps + i) + *sm.add(4 + j) * *sm.add(ps + i + 4))
+                + (*sm.add(8 + j) * *sm.add(ps + i + 8) + *sm.add(12 + j) * *sm.add(ps + i + 12));
+            let ap = (acc_r + acc_s) + rf + lambda * jw * ug;
+            // Chebyshev: dvec ← c1·dvec + c2·invd·(rhs − Ap); out ← u + dvec
+            let dp = dvec.get_unchecked_mut(eb + m);
+            let dn = c1 * *dp + c2 * *invd.get_unchecked(eb + m) * (*rhs.get_unchecked(eb + m) - ap);
+            *dp = dn;
+            *out.get_unchecked_mut(eb + m) = U::from_f64(ug + dn);
+        }
+    }
+
     /// **SBM operator** (Shifted Boundary Method, natural-Neumann surrogate): the SIPG operator
     /// restricted to the ACTIVE (surrogate-fluid) elements, with identity on the inactive ones.
     /// Identical to [`operator`] except (a) it reads an `active_elem` mask, (b) an inactive element
@@ -354,7 +1013,7 @@ mod kernels {
                 *sm.add(t) = d[t];
             }
         }
-        let jw_b = jac * mass[m];
+        let jw_b = jac * unsafe { *mass.get_unchecked(m) };
         let mut rf = 0.0f64;
         if elem_active {
             let wx = jw_b * gx[b].to_f64();
@@ -478,7 +1137,7 @@ mod kernels {
                 *sm.add(t) = d[t];
             }
         }
-        let jw_b = jac * mass[m];
+        let jw_b = jac * unsafe { *mass.get_unchecked(m) };
         let mut rf = 0.0f64;
         if active {
             unsafe {
@@ -550,6 +1209,288 @@ mod kernels {
         }
     }
 
+    /// **Fused-volume damped-Jacobi smoother** (Phase C): [`operator_jacobi`] with the own-element
+    /// gradient recomputed from `u` staged in shared (à la [`operator_fused`]) instead of read back
+    /// from the global `gx`/`gy`. This is the dominant matvec in the V-cycle (run `n_pre + n_post`
+    /// sweeps per level per cycle), so eliminating its 16 MB own-gradient read + lengthening the
+    /// per-thread instruction stream is the main per-step lever. Neighbour normal-derivatives still
+    /// come from the global `gx`/`gy` (the `gradient` pass in `smooth_sweep` still runs). Bit-for-bit
+    /// equal to `gradient` then `operator_jacobi` at `G=f64`. Shared `[ DS | US | PR | PS ]`.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn operator_jacobi_fused<U: Scalar, G: Scalar>(
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
+        rhs: &[f64], invd: &[f64], omega: f64, mut out: DisjointSlice<U>,
+    ) {
+        let _ = (gx.len(), gy.len()); // retained for signature uniformity; not read (no gradient pass)
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | US(epb·nn) | PR(epb·nn) | PS(epb·nn) ]
+        let n1 = n1 as usize;
+        let nn = n1 * n1;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let active = e < ne as usize;
+        let us = nn + el * nn;
+        let pr = nn + epb * nn + el * nn;
+        let ps = nn + 2 * epb * nn + el * nn;
+        let b = e * nn + m;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = d[t];
+            }
+            if active {
+                *sm.add(us + m) = u[b].to_f64();
+            }
+        }
+        thread::sync_threads();
+        let jw_b = jac * unsafe { *mass.get_unchecked(m) };
+        let i = m % n1;
+        let j = m / n1;
+        let mut rf = 0.0f64;
+        if active {
+            let mut ur = 0.0f64;
+            let mut uss = 0.0f64;
+            let mut k = 0usize;
+            while k < n1 {
+                unsafe {
+                    ur += *sm.add(i * n1 + k) * *sm.add(us + k + j * n1);
+                    uss += *sm.add(j * n1 + k) * *sm.add(us + i + k * n1);
+                }
+                k += 1;
+            }
+            let gxb = rx * ur;
+            let gyb = sy * uss;
+            unsafe {
+                *sm.add(pr + m) = rx * (jw_b * gxb);
+                *sm.add(ps + m) = sy * (jw_b * gyb);
+            }
+            let ii = i;
+            let jj = j;
+            let mut hx = 0.0f64;
+            let mut hy = 0.0f64;
+            let mut t4 = 0usize;
+            while t4 < 4 {
+                let (on, a, nx, ny, xface) = if t4 == 0 {
+                    (jj == 0, ii, 0.0f64, -1.0f64, true)
+                } else if t4 == 1 {
+                    (ii == n1 - 1, jj, 1.0f64, 0.0f64, false)
+                } else if t4 == 2 {
+                    (jj == n1 - 1, ii, 0.0f64, 1.0f64, true)
+                } else {
+                    (ii == 0, jj, -1.0f64, 0.0f64, false)
+                };
+                if on {
+                    let idx = (e * 4 + t4) * n1 + a;
+                    let nbr = unsafe { *face_nbr.get_unchecked(idx) };
+                    if nbr != NEU {
+                        let sw = unsafe { if xface { *fswx.get_unchecked(a) } else { *fswy.get_unchecked(a) } };
+                        let dun_e = nx * gxb + ny * gyb;
+                        let ug = unsafe { u.get_unchecked(b).to_f64() };
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0)
+                        } else {
+                            let ng = nbr as usize;
+                            // Recompute the neighbour's normal-derivative on the fly (solo matvec —
+                            // no gradient pass / global gx,gy). See `operator_fused` for the rationale.
+                            let ng_base = (ng / nn) * nn;
+                            let nl = ng % nn;
+                            let ing = nl % n1;
+                            let jng = nl / n1;
+                            let dun_ng = if xface {
+                                let mut sden = 0.0f64;
+                                let mut kk = 0usize;
+                                while kk < n1 {
+                                    unsafe { sden += *sm.add(jng * n1 + kk) * u.get_unchecked(ng_base + ing + kk * n1).to_f64(); }
+                                    kk += 1;
+                                }
+                                ny * (sy * sden)
+                            } else {
+                                let mut rden = 0.0f64;
+                                let mut kk = 0usize;
+                                while kk < n1 {
+                                    unsafe { rden += *sm.add(ing * n1 + kk) * u.get_unchecked(ng_base + kk + jng * n1).to_f64(); }
+                                    kk += 1;
+                                }
+                                nx * (rx * rden)
+                            };
+                            (0.5 * (dun_e + dun_ng), ug - unsafe { u.get_unchecked(ng).to_f64() }, 0.5)
+                        };
+                        let g = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * nx;
+                        hy += g * ny;
+                    }
+                }
+                t4 += 1;
+            }
+            unsafe {
+                *sm.add(pr + m) -= rx * hx;
+                *sm.add(ps + m) -= sy * hy;
+            }
+        }
+        thread::sync_threads();
+        if !active {
+            return;
+        }
+        let mut acc = 0.0f64;
+        let mut k = 0usize;
+        while k < n1 {
+            unsafe {
+                acc += *sm.add(k * n1 + i) * *sm.add(pr + k + j * n1)
+                    + *sm.add(k * n1 + j) * *sm.add(ps + i + k * n1);
+            }
+            k += 1;
+        }
+        unsafe {
+            let ap = acc + rf + lambda * jw_b * u.get_unchecked(b).to_f64();
+            *out.get_unchecked_mut(b) =
+                U::from_f64(u.get_unchecked(b).to_f64() + omega * *invd.get_unchecked(b) * (*rhs.get_unchecked(b) - ap));
+        }
+    }
+
+    /// **Chebyshev-smoother variant of [`operator_jacobi_fused`]** (general n1): identical matvec, but the
+    /// final write applies one Chebyshev step `dvec ← c1·dvec + c2·invd·(rhs − Ap); out ← u + dvec` instead of
+    /// damped-Jacobi. Used at the coarser (n1<4) V-cycle levels so the Chebyshev smoother covers ALL levels
+    /// (the finest n1=4 uses [`operator_cheby_arith`]). `dvec` persists across the degree-K steps.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn operator_cheby_fused<U: Scalar, G: Scalar>(
+        d: &[f64], u: &[U], gx: &[G], gy: &[G], mass: &[f64], fswx: &[f64], fswy: &[f64],
+        n1: u32, ne: u32, rx: f64, sy: f64, jac: f64, face_nbr: &[u32], tau: f64, lambda: f64,
+        rhs: &[f64], invd: &[f64], c1: f64, c2: f64, mut dvec: DisjointSlice<f64>, mut out: DisjointSlice<U>,
+    ) {
+        let _ = (gx.len(), gy.len()); // retained for signature uniformity; not read (no gradient pass)
+        let sm = DynamicSharedArray::<f64>::get(); // [ DS(nn) | US(epb·nn) | PR(epb·nn) | PS(epb·nn) ]
+        let n1 = n1 as usize;
+        let nn = n1 * n1;
+        let t = thread::threadIdx_x() as usize;
+        let epb = thread::blockDim_x() as usize / nn;
+        let el = t / nn;
+        let m = t % nn;
+        let e = thread::blockIdx_x() as usize * epb + el;
+        let active = e < ne as usize;
+        let us = nn + el * nn;
+        let pr = nn + epb * nn + el * nn;
+        let ps = nn + 2 * epb * nn + el * nn;
+        let b = e * nn + m;
+        unsafe {
+            if t < nn {
+                *sm.add(t) = d[t];
+            }
+            if active {
+                *sm.add(us + m) = u[b].to_f64();
+            }
+        }
+        thread::sync_threads();
+        let jw_b = jac * unsafe { *mass.get_unchecked(m) };
+        let i = m % n1;
+        let j = m / n1;
+        let mut rf = 0.0f64;
+        if active {
+            let mut ur = 0.0f64;
+            let mut uss = 0.0f64;
+            let mut k = 0usize;
+            while k < n1 {
+                unsafe {
+                    ur += *sm.add(i * n1 + k) * *sm.add(us + k + j * n1);
+                    uss += *sm.add(j * n1 + k) * *sm.add(us + i + k * n1);
+                }
+                k += 1;
+            }
+            let gxb = rx * ur;
+            let gyb = sy * uss;
+            unsafe {
+                *sm.add(pr + m) = rx * (jw_b * gxb);
+                *sm.add(ps + m) = sy * (jw_b * gyb);
+            }
+            let ii = i;
+            let jj = j;
+            let mut hx = 0.0f64;
+            let mut hy = 0.0f64;
+            let mut t4 = 0usize;
+            while t4 < 4 {
+                let (on, a, nx, ny, xface) = if t4 == 0 {
+                    (jj == 0, ii, 0.0f64, -1.0f64, true)
+                } else if t4 == 1 {
+                    (ii == n1 - 1, jj, 1.0f64, 0.0f64, false)
+                } else if t4 == 2 {
+                    (jj == n1 - 1, ii, 0.0f64, 1.0f64, true)
+                } else {
+                    (ii == 0, jj, -1.0f64, 0.0f64, false)
+                };
+                if on {
+                    let idx = (e * 4 + t4) * n1 + a;
+                    let nbr = unsafe { *face_nbr.get_unchecked(idx) };
+                    if nbr != NEU {
+                        let sw = unsafe { if xface { *fswx.get_unchecked(a) } else { *fswy.get_unchecked(a) } };
+                        let dun_e = nx * gxb + ny * gyb;
+                        let ug = unsafe { u.get_unchecked(b).to_f64() };
+                        let (avg, jump, gfac) = if nbr == BND {
+                            (dun_e, ug, 1.0)
+                        } else {
+                            let ng = nbr as usize;
+                            let ng_base = (ng / nn) * nn;
+                            let nl = ng % nn;
+                            let ing = nl % n1;
+                            let jng = nl / n1;
+                            let dun_ng = if xface {
+                                let mut sden = 0.0f64;
+                                let mut kk = 0usize;
+                                while kk < n1 {
+                                    unsafe { sden += *sm.add(jng * n1 + kk) * u.get_unchecked(ng_base + ing + kk * n1).to_f64(); }
+                                    kk += 1;
+                                }
+                                ny * (sy * sden)
+                            } else {
+                                let mut rden = 0.0f64;
+                                let mut kk = 0usize;
+                                while kk < n1 {
+                                    unsafe { rden += *sm.add(ing * n1 + kk) * u.get_unchecked(ng_base + kk + jng * n1).to_f64(); }
+                                    kk += 1;
+                                }
+                                nx * (rx * rden)
+                            };
+                            (0.5 * (dun_e + dun_ng), ug - unsafe { u.get_unchecked(ng).to_f64() }, 0.5)
+                        };
+                        let g = gfac * sw * jump;
+                        rf += -sw * avg + tau * sw * jump;
+                        hx += g * nx;
+                        hy += g * ny;
+                    }
+                }
+                t4 += 1;
+            }
+            unsafe {
+                *sm.add(pr + m) -= rx * hx;
+                *sm.add(ps + m) -= sy * hy;
+            }
+        }
+        thread::sync_threads();
+        if !active {
+            return;
+        }
+        let mut acc = 0.0f64;
+        let mut k = 0usize;
+        while k < n1 {
+            unsafe {
+                acc += *sm.add(k * n1 + i) * *sm.add(pr + k + j * n1)
+                    + *sm.add(k * n1 + j) * *sm.add(ps + i + k * n1);
+            }
+            k += 1;
+        }
+        unsafe {
+            let ap = acc + rf + lambda * jw_b * u.get_unchecked(b).to_f64();
+            // Chebyshev: dvec ← c1·dvec + c2·invd·(rhs − Ap); out ← u + dvec
+            let dp = dvec.get_unchecked_mut(b);
+            let dn = c1 * *dp + c2 * *invd.get_unchecked(b) * (*rhs.get_unchecked(b) - ap);
+            *dp = dn;
+            *out.get_unchecked_mut(b) = U::from_f64(u.get_unchecked(b).to_f64() + dn);
+        }
+    }
+
     /// **SBM fused matvec + damped-Jacobi smoother** ([`operator_jacobi`] with the active mask).
     /// Inactive elements use `Ap = u` (identity), so the update `u + ω·invd·(rhs − u)` (with the
     /// uploaded `invd = 1` on the inactive block and `rhs = 0` there) drives them toward 0 — the
@@ -580,7 +1521,7 @@ mod kernels {
                 *sm.add(t) = d[t];
             }
         }
-        let jw_b = jac * mass[m];
+        let jw_b = jac * unsafe { *mass.get_unchecked(m) };
         let mut rf = 0.0f64;
         if elem_active {
             let wx = jw_b * gx[b].to_f64();
@@ -1112,16 +2053,31 @@ mod kernels {
         }
     }
 
-    /// **h-prolong** (2:1 geometric, order-1 both levels): one block per FINE element, 4
-    /// threads (the 4 fine nodes). The parent coarse element `ec` and child quadrant `q` are
-    /// derived from the fine element index and the two grid widths `nxf`/`nxc`; `pq` holds the
-    /// four 4×4 per-quadrant matrices `[q*16 + f*4 + a]`. `out[ef*4 + f]`. Matches the host
-    /// `PMultigrid::prolong_h`.
+    /// **h-prolong** (2:1 geometric): `epb = blockDim/nn` FINE elements per block (vs one — the
+    /// `nn=16` p=3 block was a half-idle warp at ~5% SoL / 19% occupancy; `epb` fills the warps).
+    /// `nn = n1²` threads per element. The parent coarse element `ec` and child quadrant `q` are
+    /// derived from the fine element index and the grid widths `nxf`/`nxc`; the four `nn×nn`
+    /// per-quadrant matrices `pq[q·nn·nn + f·nn + a]` are STAGED IN SHARED once per block (reused by
+    /// every thread). `out[ef·nn + f]`. `nn=4` for the default order-1 h-levels; `nn=(p+1)²` for
+    /// pure-h (`HMG`). Matches the host `PMultigrid::prolong_h`.
     #[kernel]
-    pub fn h_prolong(pq: &[f64], coarse: &[f64], nxf: u32, nxc: u32, mut out: DisjointSlice<f64>) {
-        let ef = thread::blockIdx_x() as usize;
-        let f = thread::threadIdx_x() as usize;
-        if f >= 4 {
+    pub fn h_prolong(pq: &[f64], coarse: &[f64], nxf: u32, nxc: u32, nn: u32, ne: u32, mut out: DisjointSlice<f64>) {
+        let spq = DynamicSharedArray::<f64>::get(); // the 4 per-quadrant nn×nn matrices
+        let nn = nn as usize;
+        let t = thread::threadIdx_x() as usize;
+        let bd = thread::blockDim_x() as usize;
+        let epb = bd / nn;
+        let pqlen = 4 * nn * nn;
+        let mut k = t;
+        while k < pqlen {
+            unsafe { *spq.add(k) = *pq.get_unchecked(k) };
+            k += bd;
+        }
+        thread::sync_threads();
+        let el = t / nn;
+        let f = t % nn;
+        let ef = thread::blockIdx_x() as usize * epb + el;
+        if ef >= ne as usize {
             return;
         }
         let (nxf, nxc) = (nxf as usize, nxc as usize);
@@ -1130,25 +2086,39 @@ mod kernels {
         let q = (fx % 2) + 2 * (fy % 2);
         let mut s = 0.0f64;
         let mut a = 0usize;
-        while a < 4 {
-            s += pq[q * 16 + f * 4 + a] * coarse[ec * 4 + a];
+        while a < nn {
+            s += unsafe { *spq.add(q * (nn * nn) + f * nn + a) * *coarse.get_unchecked(ec * nn + a) };
             a += 1;
         }
-        // block_dim is 4 (order-1) ⇒ global 1D thread index == ef*4 + f.
+        // active threads (ef<ne) are contiguous from block start ⇒ global 1D index == ef*nn + f.
         if let Some(o) = out.get_mut(thread::index_1d()) {
             *o = s;
         }
     }
 
-    /// **h-restrict** (the transpose `Rᵀ` of [`h_prolong`]): one block per COARSE element, 4
-    /// threads (the 4 coarse nodes `a`). Each coarse element gathers its 4 fine children
-    /// (quadrants), accumulating `pqᵀ`-weighted child contributions. `out[ec*4 + a]`. Matches
-    /// the host `PMultigrid::restrict_h`.
+    /// **h-restrict** (the transpose `Rᵀ` of [`h_prolong`]): `epb = blockDim/nn` COARSE elements per
+    /// block, `nn = n1²` threads per element (the coarse nodes `a`). Each coarse element gathers its
+    /// 4 fine children (quadrants), accumulating `pqᵀ`-weighted child contributions; `pq` staged in
+    /// shared once per block. `out[ec·nn + a]`. `nn=4` default order-1 h-levels; `nn=(p+1)²` pure-h.
+    /// Matches host `PMultigrid::restrict_h`.
     #[kernel]
-    pub fn h_restrict(pq: &[f64], fine: &[f64], nxf: u32, nxc: u32, mut out: DisjointSlice<f64>) {
-        let ec = thread::blockIdx_x() as usize;
-        let a = thread::threadIdx_x() as usize;
-        if a >= 4 {
+    pub fn h_restrict(pq: &[f64], fine: &[f64], nxf: u32, nxc: u32, nn: u32, ne: u32, mut out: DisjointSlice<f64>) {
+        let spq = DynamicSharedArray::<f64>::get();
+        let nn = nn as usize;
+        let t = thread::threadIdx_x() as usize;
+        let bd = thread::blockDim_x() as usize;
+        let epb = bd / nn;
+        let pqlen = 4 * nn * nn;
+        let mut k = t;
+        while k < pqlen {
+            unsafe { *spq.add(k) = *pq.get_unchecked(k) };
+            k += bd;
+        }
+        thread::sync_threads();
+        let el = t / nn;
+        let a = t % nn;
+        let ec = thread::blockIdx_x() as usize * epb + el;
+        if ec >= ne as usize {
             return;
         }
         let (nxf, nxc) = (nxf as usize, nxc as usize);
@@ -1159,13 +2129,12 @@ mod kernels {
             let (qx, qy) = (q % 2, q / 2);
             let ef = (2 * cx + qx) + (2 * cy + qy) * nxf;
             let mut f = 0usize;
-            while f < 4 {
-                s += pq[q * 16 + f * 4 + a] * fine[ef * 4 + f];
+            while f < nn {
+                s += unsafe { *spq.add(q * (nn * nn) + f * nn + a) * *fine.get_unchecked(ef * nn + f) };
                 f += 1;
             }
             q += 1;
         }
-        // block_dim is 4 (order-1) ⇒ global 1D thread index == ec*4 + a.
         if let Some(o) = out.get_mut(thread::index_1d()) {
             *o = s;
         }
@@ -1679,6 +2648,56 @@ pub fn pressure_cg_solve(
 /// Built once (`MgConst::build`) and reused across every [`pcg_solve_with`] call, so
 /// repeated solves on a fixed mesh skip the host `flatten_mesh` + H2D uploads (~ms per
 /// level). Only `rhs` and the per-solve scratch move thereafter.
+/// Per-level degree-3 Chebyshev smoother coefficients from each level's `omega` (the damped-Jacobi
+/// weight `(4/3)/λmax`, so `λmax = (4/3)/omega`). Returns `(c1, c2)` where smoother step `k` does
+/// `dvec ← c1[k]·dvec + c2[k]·invd·(rhs − Ap)`. Band `[0.05·λmax, 1.05·λmax]`, matching the validated
+/// C++ prototype (cuda-ref/mgpcg.cpp): step 0 has `c1=0` (discards stale dvec), then the 3-term recurrence.
+fn cheb_coeffs(omega: &[f64]) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
+    let dbg = std::env::var("CHEB_DBG").is_ok();
+    // CHEB_KIND=4 (default): 4th-kind Chebyshev (Lottes) — the smoother docs/research-pressure-multigrid.md
+    // recommends; needs only ρ=λmax (no band lower edge), optimal for MG smoothing. CHEB_KIND=1: the old
+    // 1st-kind shifted Chebyshev on band [eta·λmax, 1.05·λmax] (CHEB_ETA, default 0.2).
+    let kind: u32 = std::env::var("CHEB_KIND").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let eta = std::env::var("CHEB_ETA").ok().and_then(|v| v.parse().ok()).unwrap_or(0.2);
+    omega
+        .iter()
+        .enumerate()
+        .map(|(l, &om)| {
+            let lmax = (4.0 / 3.0) / om;
+            let mut c1 = [0.0f64; 3];
+            let mut c2 = [0.0f64; 3];
+            if kind == 4 {
+                // 4th-kind Chebyshev (Lottes): dvec ← ((2k−1)/(2k+3))·dvec + ((8k+4)/((2k+3)·λmax))·invd·(rhs−Ap).
+                // k=0 uses c1=0 (discards the stale dvec; d_0=0 in the recurrence anyway) ⇒ first step is the
+                // optimal damped-Jacobi 4/(3λmax). No eta band needed — only λmax.
+                for k in 0..3 {
+                    let kf = k as f64;
+                    c1[k] = if k == 0 { 0.0 } else { (2.0 * kf - 1.0) / (2.0 * kf + 3.0) };
+                    c2[k] = (8.0 * kf + 4.0) / ((2.0 * kf + 3.0) * lmax);
+                }
+            } else {
+                // 1st-kind shifted Chebyshev on band [eta·λmax, 1.05·λmax].
+                let (aa, bb) = (eta * lmax, 1.05 * lmax);
+                let theta = 0.5 * (bb + aa);
+                let delta = 0.5 * (bb - aa);
+                let sigma = theta / delta;
+                let mut rho = 1.0 / sigma;
+                c2[0] = 1.0 / theta;
+                for k in 1..3 {
+                    let rho_n = 1.0 / (2.0 * sigma - rho);
+                    c1[k] = rho * rho_n;
+                    c2[k] = 2.0 * rho_n / delta;
+                    rho = rho_n;
+                }
+            }
+            if dbg {
+                eprintln!("  cheb L{l} (kind={kind}): omega={om:.4} lmax={lmax:.4} c1={c1:.4?} c2={c2:.4?}");
+            }
+            (c1, c2)
+        })
+        .unzip()
+}
+
 struct MgConst {
     nlev: usize,
     n_pre: usize,
@@ -1703,6 +2722,11 @@ struct MgConst {
     fswy: Vec<DeviceBuffer<f64>>,
     taus: Vec<f64>,
     omega: Vec<f64>,
+    /// Per-level Chebyshev-smoother coefficients (degree 3): step `k` does
+    /// `dvec ← cheb_c1[l][k]·dvec + cheb_c2[l][k]·invd·(rhs − Ap)`. Derived at build from
+    /// `λmax = (4/3)/omega[l]` (the Jacobi weight encodes `lam_hi`), band `[0.05·λmax, 1.05·λmax]`.
+    cheb_c1: Vec<[f64; 3]>,
+    cheb_c2: Vec<[f64; 3]>,
     interp: Vec<DeviceBuffer<f64>>,
     /// Per-transition (`len = nlev−1`): true ⇒ h-coarsening (2:1 geometric, the `h_prolong`/
     /// `h_restrict` kernels + `pq`); false ⇒ p-coarsening (the tensor `interp` + restrict/prolong).
@@ -1710,7 +2734,12 @@ struct MgConst {
     /// Element-grid width `nx` per level (for the h-transfer kernels' index arithmetic).
     nxv: Vec<u32>,
     /// The four 2:1 geometric prolongation matrices (shared across all h-transfers), uploaded once.
+    /// Row-major `[q·h_nn·h_nn + f·h_nn + a]`, length `4·h_nn·h_nn`.
     pq: DeviceBuffer<f64>,
+    /// Nodes-per-element of the h-transfer levels (`= n1²` there): the `pq` per-quadrant stride and
+    /// the `h_prolong`/`h_restrict` block size. `4` for the default order-1 h-tail, `(p+1)²` for
+    /// pure-h (`HMG`).
+    h_nn: u32,
     cfg: Vec<LaunchConfig>,
     vcfg: Vec<LaunchConfig>,
     reaction: f64,
@@ -1723,6 +2752,12 @@ struct MgConst {
     /// **SBM** per-level device data: `Some` ⇒ the matvec/smoother macros call
     /// `sbm_operator`/`sbm_operator_jacobi`; `None` ⇒ the plain Poisson path.
     sbm: Option<SbmData>,
+    /// arith matvec/smoother eligibility (finest level): `arith_usable` ⇒ the boundary is UNIFORM
+    /// (all-Dirichlet or all-Neumann, not mixed) so arith's single `neumann` flag is exact; mixed
+    /// boundaries fall back to `operator_fused` (which reads per-face `fnbr`). `arith_neumann` ⇒ the
+    /// uniform boundary is Neumann (skip the boundary face term) vs Dirichlet (apply the penalty).
+    arith_usable: bool,
+    arith_neumann: bool,
 }
 
 /// Per-level SBM device arrays (one entry per multigrid level): the active-element mask
@@ -1757,9 +2792,15 @@ impl MgConst {
         // Per-region Neumann tags (rediscretized at every level) — all-tags + reaction 0 is
         // the singular pressure operator (auto-deflated below); empty is all-Dirichlet.
         let neumann_tags = mg.neumann_tags();
+        // Finest-level boundary type for the arith path: scan the boundary faces (BND/NEU sentinels).
+        let (mut bc_bnd, mut bc_neu) = (false, false);
         for l in 0..nlev {
             let m = mg.mesh(l);
             let ma = flatten_mesh(m, mg.alpha, neumann_tags);
+            if l == 0 {
+                bc_bnd = ma.fnbr.iter().any(|&n| n == BND);
+                bc_neu = ma.fnbr.iter().any(|&n| n == NEU);
+            }
             n1v.push(ma.n1);
             nev.push(ma.ne as u32);
             ndofv.push(ma.ndof);
@@ -1775,6 +2816,7 @@ impl MgConst {
             taus.push(ma.tau);
             omega.push(mg.jacobi_omega(l));
         }
+        let (cheb_c1, cheb_c2) = cheb_coeffs(&omega);
         // transfer operators (coarse l+1 → fine l): p-transfers carry a tensor interp matrix;
         // h-transfers carry none (they use the shared `pq` + the kernels' index arithmetic),
         // so a 1-elem dummy keeps the per-transition vec index-aligned.
@@ -1788,6 +2830,7 @@ impl MgConst {
         }
         let nxv: Vec<u32> = (0..nlev).map(|l| mg.level_dims(l).0 as u32).collect();
         let pq = up(&mg.quad_prolong()[..])?;
+        let h_nn = mg.h_nodes() as u32;
 
         // per-level launch configs
         let cfg: Vec<LaunchConfig> = (0..nlev)
@@ -1822,10 +2865,13 @@ impl MgConst {
             fswy,
             taus,
             omega,
+            cheb_c1,
+            cheb_c2,
             interp,
             is_h,
             nxv,
             pq,
+            h_nn,
             cfg,
             vcfg,
             reaction: mg.reaction(),
@@ -1836,6 +2882,8 @@ impl MgConst {
             ninv_c,
             clast,
             sbm: None,
+            arith_usable: !(bc_bnd && bc_neu), // mixed boundary ⇒ fall back to operator_fused
+            arith_neumann: bc_neu && !bc_bnd,  // uniform Neumann ⇒ skip the boundary face term
         })
     }
 
@@ -1882,6 +2930,7 @@ impl MgConst {
             sdx_dev.push(up(&sdx)?);
             sdy_dev.push(up(&sdy)?);
         }
+        let (cheb_c1, cheb_c2) = cheb_coeffs(&omega); // unused on the SBM path (sbm smoother), fills the struct
         // p-only coarsening: every transition carries a tensor interp matrix; no h-transfers.
         let mut interp = Vec::new();
         for l in 0..nlev - 1 {
@@ -1920,10 +2969,13 @@ impl MgConst {
             fswy,
             taus,
             omega,
+            cheb_c1,
+            cheb_c2,
             interp,
             is_h,
             nxv,
             pq,
+            h_nn: 4, // unused (SBM is p-only, no h-transfers)
             cfg,
             vcfg,
             reaction: smg.reaction(),
@@ -1934,6 +2986,8 @@ impl MgConst {
             ninv_c,
             clast,
             sbm: Some(SbmData { act: act_dev, sdx: sdx_dev, sdy: sdy_dev }),
+            arith_usable: false, // SBM path uses sbm_operator/_jacobi, never arith
+            arith_neumann: false,
         })
     }
 }
@@ -2005,6 +3059,8 @@ struct SolverWorkspace<G: Scalar + DeviceCopy> {
     gyb: Vec<DeviceBuffer<G>>,
     tmpb: Vec<DeviceBuffer<f64>>,
     sm: Vec<DeviceBuffer<f64>>,
+    /// Per-level Chebyshev-smoother direction vector `dvec` (persists across the degree-3 steps).
+    dvec: Vec<DeviceBuffer<f64>>,
     psol: DeviceBuffer<f64>,
     pres: DeviceBuffer<f64>,
     pp: DeviceBuffer<f64>,
@@ -2043,8 +3099,8 @@ impl<G: Scalar + DeviceCopy> SolverWorkspace<G> {
         let nlev = dev.nlev;
         let n0 = dev.n0;
         let clast = dev.clast;
-        let (mut xb, mut bb, mut rb, mut apb, mut gxb, mut gyb, mut tmpb, mut sm) =
-            (vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+        let (mut xb, mut bb, mut rb, mut apb, mut gxb, mut gyb, mut tmpb, mut sm, mut dvec) =
+            (vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
         for l in 0..nlev {
             let nd = dev.ndofv[l];
             xb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
@@ -2055,10 +3111,11 @@ impl<G: Scalar + DeviceCopy> SolverWorkspace<G> {
             gyb.push(DeviceBuffer::<G>::zeroed(stream, nd)?);
             tmpb.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
             sm.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
+            dvec.push(DeviceBuffer::<f64>::zeroed(stream, nd)?);
         }
         let z = || DeviceBuffer::<f64>::zeroed(stream, 1);
         Ok(SolverWorkspace {
-            xb, bb, rb, apb, gxb, gyb, tmpb, sm,
+            xb, bb, rb, apb, gxb, gyb, tmpb, sm, dvec,
             psol: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             pres: DeviceBuffer::<f64>::zeroed(stream, n0)?,
             pp: DeviceBuffer::<f64>::zeroed(stream, n0)?,
@@ -2162,10 +3219,13 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ref fswy,
         ref taus,
         ref omega,
+        ref cheb_c1,
+        ref cheb_c2,
         ref interp,
         ref is_h,
         ref nxv,
         ref pq,
+        h_nn,
         ref cfg,
         ref vcfg,
         reaction,
@@ -2176,11 +3236,26 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         ninv_c,
         clast,
         ref sbm,
+        arith_usable,
+        arith_neumann,
     } = *dev;
+    let arith_neu = arith_neumann as u32;
     // Per-level packed matvec launch configs (gradient_cfg, operator_cfg) — derived from the
     // element count + order at each level; the transfer/vector kernels keep `cfg`/`vcfg`.
     let mvcfg: Vec<(LaunchConfig, LaunchConfig)> =
         (0..nlev).map(|l| matvec_cfgs(nev[l] as usize, n1v[l])).collect();
+    // Per-level fused-matvec configs (operator_fused: one extra shared tile for the staged u).
+    let fvcfg: Vec<LaunchConfig> = (0..nlev).map(|l| fused_cfg(nev[l] as usize, n1v[l])).collect();
+    // Per-level arith-matvec configs (operator_arith/_jacobi_arith): only used where `n1v[l]==4` and
+    // non-SBM. `epb=6` (96-thread blocks) was the C++ reference optimum; shared `[ DS | PR | PS ]`.
+    let avcfg: Vec<LaunchConfig> = (0..nlev).map(|l| arith_cfg(nev[l] as usize, 6)).collect();
+    // arith matvec/smoother on by default for n1=4; `ARITH_OFF=1` reverts to operator_fused (A/B + escape hatch).
+    let use_arith = std::env::var("ARITH_OFF").is_err();
+    // Chebyshev smoother (deg=3) on the finest arith level; `CHEBY=1` opt-in for A/B vs damped-Jacobi.
+    // Replaces the `n_pre`/`n_post` Jacobi sweeps with one degree-3 Chebyshev sweep (coefficient-varying
+    // steps from `cheb_c1`/`cheb_c2`). Coarser levels (n1<4) keep damped-Jacobi.
+    let use_cheby = use_arith && std::env::var("CHEBY").is_ok();
+    let cheb_deg: usize = std::env::var("CHEB_DEG").ok().and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 3);
     debug_assert_eq!(out.len(), n0, "out length must match the finest level");
 
     // Per-solve scratch comes from the (persistent or throwaway) `ws`. Destructuring `&mut ws`
@@ -2190,9 +3265,9 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // lets the WHILE-graph body be captured once and relaunched (the graph references these by ptr).
     // Disjoint `&mut` borrows of each field — `mut` bindings so the macros' `&mut x` (and `&x`)
     // patterns work via deref coercion exactly as with the old owned locals.
-    let (xb, bb, rb, apb, gxb, gyb, tmpb, sm) = (
+    let (xb, bb, rb, apb, gxb, gyb, tmpb, sm, dvec) = (
         &mut ws.xb, &mut ws.bb, &mut ws.rb, &mut ws.apb,
-        &mut ws.gxb, &mut ws.gyb, &mut ws.tmpb, &mut ws.sm,
+        &mut ws.gxb, &mut ws.gyb, &mut ws.tmpb, &mut ws.sm, &mut ws.dvec,
     );
     let mut psol = &mut ws.psol;
     let mut pres = &mut ws.pres;
@@ -2315,15 +3390,26 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     macro_rules! matvec {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
-            module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
             if let Some(s) = sbm {
+                // SBM operator still uses the two-pass gradient→sbm_operator (not made solo).
+                module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
                 module.sbm_operator::<f64, G>(
                     &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
                     rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &s.sdx[l], &s.sdy[l], &s.act[l], $dst,
                 )?;
+            } else if use_arith && arith_usable && n1v[l] == 4 {
+                // arith SOLO matvec (n1=4/p3, uniform structured grid): the C++-best kernel — balanced-tree
+                // contractions, hoisted neighbour loads, L1 row/col reads, ARITHMETIC neighbours (e±1/e±nxv,
+                // no face_nbr), get_unchecked throughout. ~3.7× over operator_fused. Bit-exact to ~1e-11.
+                module.operator_arith::<f64>(
+                    &stream, avcfg[l], &dl[l], $src, &massl[l], &fswx[l], &fswy[l], nev[l], nxv[l],
+                    rxs[l], sys[l], jacs[l], taus[l], reaction, arith_neu, $dst,
+                )?;
             } else {
-                module.operator::<f64, G>(
-                    &stream, mvcfg[l].1, &dl[l], $src, &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                // SOLO matvec: one kernel, no gradient pass / global gx,gy (own + neighbour gradients
+                // recomputed in-kernel). gxb/gyb passed but unread. Bit-exact to gradient→operator at G=f64.
+                module.operator_fused::<f64, G>(
+                    &stream, fvcfg[l], &dl[l], $src, &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
                     rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, $dst,
                 )?;
             }
@@ -2337,19 +3423,52 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     macro_rules! smooth_sweep {
         ($l:expr) => {{
             let l = $l;
-            module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], &xb[l], rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
             if let Some(s) = sbm {
+                module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], &xb[l], rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
                 module.sbm_operator_jacobi::<f64, G>(
                     &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
                     rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l], omega[l], &s.sdx[l], &s.sdy[l], &s.act[l], &mut sm[l],
                 )?;
+            } else if use_arith && arith_usable && n1v[l] == 4 {
+                // arith damped-Jacobi smoother (the per-step DOMINANT kernel, ~51% of GPU time).
+                module.operator_jacobi_arith::<f64>(
+                    &stream, avcfg[l], &dl[l], &xb[l], &massl[l], &fswx[l], &fswy[l], nev[l], nxv[l],
+                    rxs[l], sys[l], jacs[l], taus[l], reaction, arith_neu, &bb[l], &invd[l], omega[l], &mut sm[l],
+                )?;
             } else {
-                module.operator_jacobi::<f64, G>(
-                    &stream, mvcfg[l].1, &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                module.operator_jacobi_fused::<f64, G>(
+                    &stream, fvcfg[l], &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
                     rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l], omega[l], &mut sm[l],
                 )?;
             }
             std::mem::swap(&mut xb[l], &mut sm[l]);
+        }};
+    }
+    // One degree-3 Chebyshev smoothing sweep on the finest arith level (= the `n_pre`/`n_post` Jacobi
+    // loop's replacement). Three `operator_cheby_arith` launches with the host-precomputed per-step
+    // (c1,c2); `dvec[l]` persists in-place across the steps (step 0 has c1=0, discarding the stale
+    // direction — no reset needed between V-cycle visits). Ping-pongs `xb[l]`↔`sm[l]` like smooth_sweep!.
+    macro_rules! chebyshev_smooth {
+        ($l:expr) => {{
+            let l = $l;
+            for k in 0..cheb_deg {
+                if use_arith && arith_usable && n1v[l] == 4 {
+                    module.operator_cheby_arith::<f64>(
+                        &stream, avcfg[l], &dl[l], &xb[l], &massl[l], &fswx[l], &fswy[l], nev[l], nxv[l],
+                        rxs[l], sys[l], jacs[l], taus[l], reaction, arith_neu, &bb[l], &invd[l],
+                        cheb_c1[l][k], cheb_c2[l][k], &mut dvec[l], &mut sm[l],
+                    )?;
+                } else {
+                    // coarser levels (n1<4): gradient pass then the fused Chebyshev step
+                    module.gradient::<f64, G>(&stream, mvcfg[l].0, &dl[l], &xb[l], rxs[l], sys[l], n1v[l], nev[l], &mut gxb[l], &mut gyb[l])?;
+                    module.operator_cheby_fused::<f64, G>(
+                        &stream, fvcfg[l], &dl[l], &xb[l], &gxb[l], &gyb[l], &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                        rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &bb[l], &invd[l],
+                        cheb_c1[l][k], cheb_c2[l][k], &mut dvec[l], &mut sm[l],
+                    )?;
+                }
+                std::mem::swap(&mut xb[l], &mut sm[l]);
+            }
         }};
     }
     // Two operator applications MUST stay FP64 even in mixed mode, with their own f64 gx/gy
@@ -2362,15 +3481,21 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     // Only the V-cycle *smoother* matvecs (a robust stationary Jacobi) carry the FP32 intermediates.
     macro_rules! matvec0 {
         ($src:expr, $dst:expr) => {{
-            module.gradient::<f64, f64>(&stream, mvcfg[0].0, &dl[0], $src, rxs[0], sys[0], n1v[0], nev[0], &mut gx0, &mut gy0)?;
             if let Some(s) = sbm {
+                module.gradient::<f64, f64>(&stream, mvcfg[0].0, &dl[0], $src, rxs[0], sys[0], n1v[0], nev[0], &mut gx0, &mut gy0)?;
                 module.sbm_operator::<f64, f64>(
                     &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], &fswx[0], &fswy[0], n1v[0], nev[0],
                     rxs[0], sys[0], jacs[0], &fnbr[0], taus[0], reaction, &s.sdx[0], &s.sdy[0], &s.act[0], $dst,
                 )?;
+            } else if use_arith && arith_usable && n1v[0] == 4 {
+                // arith finest-level A·p for the outer PCG (FP64 — CG needs an exact, consistent operator).
+                module.operator_arith::<f64>(
+                    &stream, avcfg[0], &dl[0], $src, &massl[0], &fswx[0], &fswy[0], nev[0], nxv[0],
+                    rxs[0], sys[0], jacs[0], taus[0], reaction, arith_neu, $dst,
+                )?;
             } else {
-                module.operator::<f64, f64>(
-                    &stream, mvcfg[0].1, &dl[0], $src, &gx0, &gy0, &massl[0], &fswx[0], &fswy[0], n1v[0], nev[0],
+                module.operator_fused::<f64, f64>(
+                    &stream, fvcfg[0], &dl[0], $src, &gx0, &gy0, &massl[0], &fswx[0], &fswy[0], n1v[0], nev[0],
                     rxs[0], sys[0], jacs[0], &fnbr[0], taus[0], reaction, $dst,
                 )?;
             }
@@ -2379,15 +3504,15 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     macro_rules! matvec_c {
         ($l:expr, $src:expr, $dst:expr) => {{
             let l = $l;
-            module.gradient::<f64, f64>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxc, &mut gyc)?;
             if let Some(s) = sbm {
+                module.gradient::<f64, f64>(&stream, mvcfg[l].0, &dl[l], $src, rxs[l], sys[l], n1v[l], nev[l], &mut gxc, &mut gyc)?;
                 module.sbm_operator::<f64, f64>(
                     &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
                     rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, &s.sdx[l], &s.sdy[l], &s.act[l], $dst,
                 )?;
             } else {
-                module.operator::<f64, f64>(
-                    &stream, mvcfg[l].1, &dl[l], $src, &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
+                module.operator_fused::<f64, f64>(
+                    &stream, fvcfg[l], &dl[l], $src, &gxc, &gyc, &massl[l], &fswx[l], &fswy[l], n1v[l], nev[l],
                     rxs[l], sys[l], jacs[l], &fnbr[l], taus[l], reaction, $dst,
                 )?;
             }
@@ -2544,14 +3669,21 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             let last = nlev - 1;
             for l in 0..last {
                 module.scal(&stream, vcfg[l], &mut xb[l], 0.0)?;
-                for _ in 0..n_pre {
-                    smooth_sweep!(l);
+                if use_cheby && sbm.is_none() {
+                    chebyshev_smooth!(l);
+                } else {
+                    for _ in 0..n_pre {
+                        smooth_sweep!(l);
+                    }
                 }
                 matvec!(l, &xb[l], &mut apb[l]);
                 module.sub(&stream, vcfg[l], &mut rb[l], &bb[l], &apb[l])?;
                 if is_h[l] {
-                    // h-restrict: one block per COARSE element (cfg[l+1]); grids nxv[l]→nxv[l+1].
-                    module.h_restrict(&stream, cfg[l + 1], pq, &rb[l], nxv[l], nxv[l + 1], &mut bb[l + 1])?;
+                    // h-restrict: one block per COARSE element (cfg[l+1], block_dim = n1v² = h_nn,
+                    // equal at l and l+1 since h-coarsening keeps the order); grids nxv[l]→nxv[l+1].
+                    let htepb = (256 / h_nn).max(1);
+                    let htcfg = LaunchConfig { grid_dim: ((nev[l + 1] + htepb - 1) / htepb, 1, 1), block_dim: (htepb * h_nn, 1, 1), shared_mem_bytes: 4 * h_nn * h_nn * 8 };
+                    module.h_restrict(&stream, htcfg, pq, &rb[l], nxv[l], nxv[l + 1], h_nn, nev[l + 1], &mut bb[l + 1])?;
                 } else {
                     module.restrict(&stream, cfg[l], &interp[l], &rb[l], n1v[l], n1v[l + 1], &mut bb[l + 1])?;
                 }
@@ -2563,14 +3695,21 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
             }
             for l in (0..last).rev() {
                 if is_h[l] {
-                    // h-prolong: one block per FINE element (cfg[l]); coarse l+1 → fine l.
-                    module.h_prolong(&stream, cfg[l], pq, &xb[l + 1], nxv[l], nxv[l + 1], &mut tmpb[l])?;
+                    // h-prolong: one block per FINE element (cfg[l], block_dim = n1v² = h_nn);
+                    // coarse l+1 → fine l.
+                    let htepb = (256 / h_nn).max(1);
+                    let htcfg = LaunchConfig { grid_dim: ((nev[l] + htepb - 1) / htepb, 1, 1), block_dim: (htepb * h_nn, 1, 1), shared_mem_bytes: 4 * h_nn * h_nn * 8 };
+                    module.h_prolong(&stream, htcfg, pq, &xb[l + 1], nxv[l], nxv[l + 1], h_nn, nev[l], &mut tmpb[l])?;
                 } else {
                     module.prolong(&stream, cfg[l], &interp[l], &xb[l + 1], n1v[l], n1v[l + 1], &mut tmpb[l])?;
                 }
                 module.axpy(&stream, vcfg[l], &mut xb[l], &tmpb[l], 1.0)?;
-                for _ in 0..n_post {
-                    smooth_sweep!(l);
+                if use_cheby && sbm.is_none() {
+                    chebyshev_smooth!(l);
+                } else {
+                    for _ in 0..n_post {
+                        smooth_sweep!(l);
+                    }
                 }
             }
         }};
@@ -2667,6 +3806,7 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
         graph_cache.as_ref().unwrap().launch(stream)?;
         stream.synchronize()?;
         let iters = d_it.to_host_vec(&stream)?[0] as usize;
+        if std::env::var("WG_ITERS").is_ok() { eprintln!("[wg] iters={iters} (maxit={maxit})"); }
         let converged = iters < maxit;
         let kind = if deflate { "singular-Neumann pressure" } else { "Helmholtz" };
         warn_unconverged(&format!("p-MG-PCG WHILE-graph ({kind})"), converged, iters, maxit, if converged { 0.0 } else { 1.0 }, tol);
@@ -3046,6 +4186,15 @@ pub fn bench_poisson_kernels(
     reps: u32,
 ) -> Result<PoissonBench, Box<dyn std::error::Error>> {
     let ma = flatten_mesh(mesh, alpha, &[]);
+    if std::env::var("DUMP_COEFFS").is_ok() {
+        // Dump the real DG-SIPG reference coefficients for the C++ Phase-E prototype (cuda-ref/mgpcg.cu).
+        eprintln!("COEFFS n1={} ne={} rx={:.17e} sy={:.17e} jac={:.17e} tau={:.17e} alpha={:.17e}",
+            ma.n1, ma.ne, ma.rx, ma.sy, ma.jac, ma.tau, alpha);
+        eprint!("COEFFS d ="); for v in &ma.diff { eprint!(" {v:.17e}"); } eprintln!();
+        eprint!("COEFFS mass ="); for v in &ma.mass { eprint!(" {v:.17e}"); } eprintln!();
+        eprint!("COEFFS fswx ="); for v in &ma.fswx { eprint!(" {v:.17e}"); } eprintln!();
+        eprint!("COEFFS fswy ="); for v in &ma.fswy { eprint!(" {v:.17e}"); } eprintln!();
+    }
     let ndof = ma.ndof;
     let ctx = CudaContext::new(0)?;
     let stream = ctx.default_stream();
@@ -3104,6 +4253,25 @@ pub fn bench_poisson_kernels(
             ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, 0.0, &mut out,
         )?;
     });
+    let fcfg = fused_cfg(ma.ne, ma.n1);
+    let fused_ms = timed!({
+        module.operator_fused::<f64, f64>(
+            &stream, fcfg, &d_dev, &u_dev, &gx, &gy, &mass_dev, &fswx_dev, &fswy_dev, n1, nev,
+            ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, 0.0, &mut out,
+        )?;
+    });
+    // arith port (n1=4 only): grid columns = isqrt(ne) for the square test mesh.
+    let ncol = (ma.ne as f64).sqrt().round() as u32;
+    let arith_epb = std::env::var("ARITH_EPB").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize);
+    let acfg = arith_cfg(ma.ne, arith_epb);
+    let arith_ms = if ma.n1 == 4 {
+        timed!({
+            module.operator_arith::<f64>(
+                &stream, acfg, &d_dev, &u_dev, &mass_dev, &fswx_dev, &fswy_dev, nev, ncol,
+                ma.rx, ma.sy, ma.jac, ma.tau, 0.0, 0, &mut out,
+            )?;
+        })
+    } else { 0.0 };
     let axpy_ms = timed!({
         module.axpy(&stream, vec_cfg, &mut y_dev, &x_dev0, 0.7)?;
     });
@@ -3127,6 +4295,27 @@ pub fn bench_poisson_kernels(
     stream.synchronize()?;
     let axpy_wall_us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
 
+    // --- correctness: operator_arith vs the validated `operator` on a NON-constant u (n1=4 only) ---
+    if ma.n1 == 4 {
+        let hu: Vec<f64> =
+            (0..ndof).map(|g| (g as f64 * 0.013).sin() + 0.3 * (g as f64 * 0.0007).cos()).collect();
+        let u2 = up(&hu)?;
+        let mut refb = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+        let mut arb = DeviceBuffer::<f64>::zeroed(&stream, ndof)?;
+        module.gradient::<f64, f64>(&stream, gcfg, &d_dev, &u2, ma.rx, ma.sy, n1, nev, &mut gx, &mut gy)?;
+        module.operator::<f64, f64>(&stream, ocfg, &d_dev, &u2, &gx, &gy, &mass_dev, &fswx_dev, &fswy_dev, n1, nev, ma.rx, ma.sy, ma.jac, &fnbr_dev, ma.tau, 0.0, &mut refb)?;
+        module.operator_arith::<f64>(&stream, acfg, &d_dev, &u2, &mass_dev, &fswx_dev, &fswy_dev, nev, ncol, ma.rx, ma.sy, ma.jac, ma.tau, 0.0, 0, &mut arb)?;
+        stream.synchronize()?;
+        let (rh, ah) = (refb.to_host_vec(&stream)?, arb.to_host_vec(&stream)?);
+        let (mut maxrel, mut nbad) = (0.0f64, 0usize);
+        for g in 0..ndof {
+            let r = (ah[g] - rh[g]).abs() / (rh[g].abs() + 1e-300);
+            if r > maxrel { maxrel = r; }
+            if r > 1e-9 { nbad += 1; }
+        }
+        eprintln!("  [correctness] operator_arith vs operator: max rel diff {maxrel:.2e}; {nbad}/{ndof} nodes bad");
+    }
+
     Ok(PoissonBench {
         ne: ma.ne,
         nn: ma.nn,
@@ -3136,6 +4325,8 @@ pub fn bench_poisson_kernels(
         kernels: vec![
             KernelTime { name: "gradient", ms: grad_ms },
             KernelTime { name: "operator", ms: op_ms },
+            KernelTime { name: "operator_fused", ms: fused_ms },
+            KernelTime { name: "operator_arith", ms: arith_ms },
             KernelTime { name: "axpy", ms: axpy_ms },
             KernelTime { name: "xpby", ms: xpby_ms },
             KernelTime { name: "dot_partial", ms: dot_ms },

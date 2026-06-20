@@ -67,23 +67,37 @@ enum Transfer {
 }
 
 /// The four 2:1 geometric prolongation matrices (one per child quadrant `q = qx + 2·qy`),
-/// **4 fine nodes × 4 coarse nodes**, row-major `[q*16 + f*4 + a]`. A child quadrant occupies
-/// half of the coarse reference square per axis; fine node `f`'s child-reference coord maps to
-/// the coarse-reference coord `(r+2qx−1)/2`, evaluated in the order-1 (bilinear) coarse basis.
-/// Identical for every 2:1 level (reference-space geometry only), so built once and shared.
-fn quad_prolong_matrices() -> [f64; 64] {
-    let nd = [-1.0f64, 1.0]; // order-1 LGL reference nodes
-    let mut p = [0.0; 64];
+/// **`nn` fine nodes × `nn` coarse nodes** (`nn = n1²`), row-major `[q·nn·nn + f·nn + a]`. A child
+/// quadrant occupies half of the coarse reference square per axis; the fine node `f=(fx,fy)` maps
+/// to the coarse-reference coords `((r+2qx−1)/2, (s+2qy−1)/2)`, where the coarse value at that point
+/// is the order-`p` Lagrange interpolant (tensor product of the 1D Lagrange weights). Identical for
+/// every 2:1 level at this order (reference-space geometry only), so built once and shared.
+///
+/// `nodes` are the order-`p` 1D LGL reference nodes (`n1 = nodes.len()`); for `nodes=[-1,1]`
+/// (order 1) this reproduces the old hardcoded `[f64;64]` bilinear matrices (asserted in tests).
+fn quad_prolong_matrices(nodes: &[f64]) -> Vec<f64> {
+    let n1 = nodes.len();
+    let nn = n1 * n1;
+    let mut p = vec![0.0; 4 * nn * nn];
     for qy in 0..2 {
         for qx in 0..2 {
             let q = qx + 2 * qy;
-            for f in 0..4 {
-                let (rf, sf) = (nd[f % 2], nd[f / 2]);
-                let rc = (rf + (2.0 * qx as f64 - 1.0)) / 2.0;
-                let sc = (sf + (2.0 * qy as f64 - 1.0)) / 2.0;
-                for a in 0..4 {
-                    let (rca, sca) = (nd[a % 2], nd[a / 2]);
-                    p[q * 16 + f * 4 + a] = 0.25 * (1.0 + rc * rca) * (1.0 + sc * sca);
+            // Coarse-reference eval coords for this quadrant's fine nodes, per axis.
+            let ex: Vec<f64> = nodes.iter().map(|&r| (r + (2.0 * qx as f64 - 1.0)) / 2.0).collect();
+            let ey: Vec<f64> = nodes.iter().map(|&s| (s + (2.0 * qy as f64 - 1.0)) / 2.0).collect();
+            // `lagrange_matrix(basis, eval)[e*n1 + b] = L_b(eval[e])`. Here basis = `nodes` (the
+            // coarse 1D nodes), eval = the per-quadrant fine coords.
+            let lx = lagrange_matrix(nodes, &ex); // [fx*n1 + ax] = L_ax(ex[fx])
+            let ly = lagrange_matrix(nodes, &ey); // [fy*n1 + ay] = L_ay(ey[fy])
+            for fy in 0..n1 {
+                for fx in 0..n1 {
+                    let f = fy * n1 + fx;
+                    for ay in 0..n1 {
+                        for ax in 0..n1 {
+                            let a = ay * n1 + ax;
+                            p[q * nn * nn + f * nn + a] = lx[fx * n1 + ax] * ly[fy * n1 + ay];
+                        }
+                    }
                 }
             }
         }
@@ -112,8 +126,15 @@ pub struct PMultigrid {
     /// the appended h-levels halve it (order 1 throughout), so the coarsest level is genuinely
     /// small and its solve is cheap — the fix for p-multigrid's otherwise-h-fine coarse grid.
     dims: Vec<(usize, usize)>,
-    /// Shared 2:1 geometric prolongation matrices (per quadrant) for the h-transfers.
-    quad_prolong: [f64; 64],
+    /// Shared 2:1 geometric prolongation matrices (per quadrant) for the h-transfers, row-major
+    /// `[q·nn·nn + f·nn + a]` with `nn = h_nn` fine/coarse nodes per element. Length `4·nn·nn`.
+    /// (Order 1 ⇒ `nn=4`, length 64, the original p-then-h hierarchy; pure-h ⇒ `nn=(p+1)²`.)
+    quad_prolong: Vec<f64>,
+    /// Nodes-per-element (`n1²`) of the h-transfer levels — the per-quadrant matrix stride is
+    /// `h_nn·h_nn` and the GPU kernel launches `h_nn` threads/block. In the default p-then-h
+    /// hierarchy the h-levels are order 1 (`h_nn=4`); under `HMG` every level is order `p`
+    /// (`h_nn=(p+1)²`).
+    h_nn: usize,
     inv_diag: Vec<Vec<f64>>,
     lam_hi: Vec<f64>,
     n_pre: usize,
@@ -154,25 +175,52 @@ impl PMultigrid {
         order: usize, nx: usize, ny: usize, xr: [f64; 2], yr: [f64; 2], alpha: f64, reaction: f64,
         neumann_tags: Vec<u32>,
     ) -> Self {
-        // Levels: p-coarsening [p, p/2, …, 1] on the full grid, then h-coarsening — order 1
-        // on a 2:1-halved grid each step, while both dims stay even, down to a tiny coarsest
-        // grid (so its CG solve is cheap and near-exact, not the hundreds of iters a p-only
-        // order-1-on-the-full-grid coarse level took).
+        // Two hierarchy modes:
+        //  - default (p-then-h): p-coarsening [p, p/2, …, 1] on the full grid, then h-coarsening
+        //    — order 1 on a 2:1-halved grid each step, while both dims stay even, down to a tiny
+        //    coarsest grid (so its CG solve is cheap, not the hundreds of iters a p-only
+        //    order-1-on-the-full-grid coarse level took).
+        //  - `HMG` env set (pure-h, perf experiment): KEEP order `p` and h-coarsen the MESH all
+        //    the way down (nx×ny → nx/2×ny/2 → … → 1×1), every level order `p`. The coarsest is
+        //    order `p` on 1×1 ((p+1)² dofs) so its solve is still cheap; geometric h-MG at full
+        //    order gives mesh-independent iteration counts (the head-to-head vs p-MG).
+        let hmg = std::env::var("HMG").is_ok();
         let mut orders: Vec<usize> = Vec::new();
         let mut dims: Vec<(usize, usize)> = Vec::new();
-        for &o in &order_levels(order) {
-            orders.push(o);
+        // h-transfer node count: order 1 (nn=4) for the appended h-levels in the default path;
+        // order `p` (nn=(p+1)²) for the pure-h hierarchy.
+        let h_order = if hmg { order } else { 1 };
+        if hmg {
+            // Pure-h: full grid at order `p`, then halve while both dims are even and ≥ 2.
+            orders.push(order);
             dims.push((nx, ny));
-        }
-        let (mut hx, mut hy) = (nx, ny);
-        while hx % 2 == 0 && hy % 2 == 0 && hx >= 2 && hy >= 2 {
-            hx /= 2;
-            hy /= 2;
-            orders.push(1);
-            dims.push((hx, hy));
+            let (mut hx, mut hy) = (nx, ny);
+            while hx % 2 == 0 && hy % 2 == 0 && hx >= 2 && hy >= 2 {
+                hx /= 2;
+                hy /= 2;
+                orders.push(order);
+                dims.push((hx, hy));
+            }
+        } else {
+            for &o in &order_levels(order) {
+                orders.push(o);
+                dims.push((nx, ny));
+            }
+            let (mut hx, mut hy) = (nx, ny);
+            while hx % 2 == 0 && hy % 2 == 0 && hx >= 2 && hy >= 2 {
+                hx /= 2;
+                hy /= 2;
+                orders.push(1);
+                dims.push((hx, hy));
+            }
         }
         let meshes: Vec<Mesh2d> =
             (0..orders.len()).map(|l| Mesh2d::rectangular(orders[l], dims[l].0, dims[l].1, xr, yr)).collect();
+        // 1D LGL nodes of the h-transfer order (order 1 for the default appended h-levels, order
+        // `p` for pure-h) — the per-quadrant geometric prolongation matrices and their stride.
+        let h_nodes = Mesh2d::rectangular(h_order, 1, 1, xr, yr).refq.line.nodes.clone();
+        let h_nn = h_nodes.len() * h_nodes.len();
+        let quad_prolong = quad_prolong_matrices(&h_nodes);
         // p-transfer where the grid is unchanged (order drops), h-transfer where it halves.
         let transfers: Vec<Transfer> = (0..orders.len() - 1)
             .map(|l| {
@@ -199,7 +247,8 @@ impl PMultigrid {
             neumann_tags,
             transfers,
             dims,
-            quad_prolong: quad_prolong_matrices(),
+            quad_prolong,
+            h_nn,
             inv_diag: Vec::new(),
             lam_hi: Vec::new(),
             n_pre: 3,
@@ -299,10 +348,16 @@ impl PMultigrid {
     pub fn is_h_transfer(&self, l: usize) -> bool {
         matches!(self.transfers[l], Transfer::H)
     }
-    /// The four per-quadrant 2:1 geometric prolongation matrices (4 fine × 4 coarse nodes,
-    /// `[q*16 + f*4 + a]`), shared by every h-transfer.
-    pub fn quad_prolong(&self) -> &[f64; 64] {
+    /// The four per-quadrant 2:1 geometric prolongation matrices (`nn` fine × `nn` coarse nodes,
+    /// `[q·nn·nn + f·nn + a]`, `nn = `[`h_nodes`](Self::h_nodes)), shared by every h-transfer.
+    pub fn quad_prolong(&self) -> &[f64] {
         &self.quad_prolong
+    }
+    /// Nodes-per-element (`n1²`) of the h-transfer levels — the per-quadrant `quad_prolong` stride
+    /// (`h_nodes·h_nodes`) and the GPU h-transfer kernel block size. `4` for the default p-then-h
+    /// hierarchy (order-1 h-levels); `(p+1)²` for pure-h (`HMG`).
+    pub fn h_nodes(&self) -> usize {
+        self.h_nn
     }
     /// Inverse operator diagonal at level `l`.
     pub fn inv_diagonal(&self, l: usize) -> &[f64] {
@@ -457,17 +512,18 @@ impl PMultigrid {
         let (nxf, _) = self.dims[l];
         let ne_f = self.meshes[l].n_elements();
         let pq = &self.quad_prolong;
-        let mut out = vec![0.0; ne_f * 4];
+        let nn = self.h_nn;
+        let mut out = vec![0.0; ne_f * nn];
         for ef in 0..ne_f {
             let (fx, fy) = (ef % nxf, ef / nxf);
             let ec = (fx / 2) + (fy / 2) * nxc;
             let q = (fx % 2) + 2 * (fy % 2);
-            for f in 0..4 {
+            for f in 0..nn {
                 let mut s = 0.0;
-                for a in 0..4 {
-                    s += pq[q * 16 + f * 4 + a] * coarse[ec * 4 + a];
+                for a in 0..nn {
+                    s += pq[q * nn * nn + f * nn + a] * coarse[ec * nn + a];
                 }
-                out[ef * 4 + f] = s;
+                out[ef * nn + f] = s;
             }
         }
         out
@@ -480,17 +536,18 @@ impl PMultigrid {
         let (nxf, _) = self.dims[l];
         let ne_f = self.meshes[l].n_elements();
         let pq = &self.quad_prolong;
-        let mut out = vec![0.0; self.meshes[l + 1].n_elements() * 4];
+        let nn = self.h_nn;
+        let mut out = vec![0.0; self.meshes[l + 1].n_elements() * nn];
         for ef in 0..ne_f {
             let (fx, fy) = (ef % nxf, ef / nxf);
             let ec = (fx / 2) + (fy / 2) * nxc;
             let q = (fx % 2) + 2 * (fy % 2);
-            for a in 0..4 {
+            for a in 0..nn {
                 let mut s = 0.0;
-                for f in 0..4 {
-                    s += pq[q * 16 + f * 4 + a] * fine[ef * 4 + f];
+                for f in 0..nn {
+                    s += pq[q * nn * nn + f * nn + a] * fine[ef * nn + f];
                 }
-                out[ec * 4 + a] += s;
+                out[ec * nn + a] += s;
             }
         }
         out
@@ -862,6 +919,75 @@ mod tests {
         let _ = it_cg;
         assert!(rel < 1e-6, "deflated MG-PCG vs deflated CG rel diff {rel}");
         assert!(it_pcg < 40, "deflated MG-PCG iters not bounded: {it_pcg}");
+    }
+
+    #[test]
+    fn quad_prolong_order1_matches_old_bilinear() {
+        // The generalized tensor-Lagrange `quad_prolong_matrices` must reproduce the original
+        // hardcoded order-1 bilinear matrices exactly when given the order-1 nodes [-1,1] — this
+        // proves the generalization (used at any order for pure-h) is correct at the base order.
+        let nd = [-1.0f64, 1.0];
+        let got = quad_prolong_matrices(&nd);
+        assert_eq!(got.len(), 64);
+        let mut want = [0.0f64; 64];
+        for qy in 0..2 {
+            for qx in 0..2 {
+                let q = qx + 2 * qy;
+                for f in 0..4 {
+                    let (rf, sf) = (nd[f % 2], nd[f / 2]);
+                    let rc = (rf + (2.0 * qx as f64 - 1.0)) / 2.0;
+                    let sc = (sf + (2.0 * qy as f64 - 1.0)) / 2.0;
+                    for a in 0..4 {
+                        let (rca, sca) = (nd[a % 2], nd[a / 2]);
+                        want[q * 16 + f * 4 + a] = 0.25 * (1.0 + rc * rca) * (1.0 + sc * sca);
+                    }
+                }
+            }
+        }
+        for i in 0..64 {
+            assert!((got[i] - want[i]).abs() < 1e-14, "quad_prolong[{i}] {} != {}", got[i], want[i]);
+        }
+    }
+
+    #[test]
+    fn quad_prolong_order3_reproduces_coarse_polynomial() {
+        // Pure-h correctness (order 3): geometric prolongation at full order must REPRODUCE any
+        // polynomial of degree ≤ 3 exactly — a coarse field sampled from p(x,y) on the coarse LGL
+        // nodes, prolonged into a child quadrant, must equal p sampled on the *fine* (child) nodes.
+        // This is the property the h-transfer needs (and what makes the geometric h-MG correct).
+        let nodes = Mesh2d::rectangular(3, 1, 1, [0.0, 1.0], [0.0, 1.0]).refq.line.nodes;
+        let n1 = nodes.len();
+        let nn = n1 * n1;
+        let pq = quad_prolong_matrices(&nodes);
+        // A degree-3 (per axis) test polynomial on the reference square [-1,1]².
+        let poly = |r: f64, s: f64| 1.0 - 0.5 * r + 0.3 * s + 0.2 * r * s - 0.1 * r * r * r + 0.05 * s * s;
+        // Coarse nodal values.
+        let mut c = vec![0.0; nn];
+        for ay in 0..n1 {
+            for ax in 0..n1 {
+                c[ay * n1 + ax] = poly(nodes[ax], nodes[ay]);
+            }
+        }
+        for qy in 0..2 {
+            for qx in 0..2 {
+                let q = qx + 2 * qy;
+                for fy in 0..n1 {
+                    for fx in 0..n1 {
+                        let f = fy * n1 + fx;
+                        // Prolonged value at this fine node.
+                        let mut got = 0.0;
+                        for a in 0..nn {
+                            got += pq[q * nn * nn + f * nn + a] * c[a];
+                        }
+                        // The same fine node's coarse-reference coord, evaluated in the polynomial.
+                        let rc = (nodes[fx] + (2.0 * qx as f64 - 1.0)) / 2.0;
+                        let sc = (nodes[fy] + (2.0 * qy as f64 - 1.0)) / 2.0;
+                        let want = poly(rc, sc);
+                        assert!((got - want).abs() < 1e-10, "q={q} f={f}: prolong {got} != poly {want}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

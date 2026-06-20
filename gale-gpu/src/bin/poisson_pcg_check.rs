@@ -9,11 +9,12 @@ use gale::dg::{PMultigrid, Poisson};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::f64::consts::PI;
-    let order = 4;
+    let order = std::env::var("MG_P").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
     println!("=== gale_gpu::poisson_pcg_solve (library) vs CPU oracle (p={order}) ===\n");
 
     // CPU setup (validated) + reference solve.
-    let mg = PMultigrid::new(order, 3, 3, [0.0, 1.0], [0.0, 1.0], 5.0);
+    let g = std::env::var("MG_GRID").ok().and_then(|v| v.parse().ok()).unwrap_or(3usize);
+    let mg = PMultigrid::new(order, g, g, [0.0, 1.0], [0.0, 1.0], 5.0);
     let nlev = mg.n_levels();
     let fine = mg.mesh(0);
     let nn0 = fine.refq.n_nodes();
