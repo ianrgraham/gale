@@ -1616,6 +1616,17 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
 
     fn step(&self, state: &mut gale::sim::State, hook: &dyn gale::sim::StateStageHook) {
         let t_new = state.time.t + self.dt;
+        let __timing = std::env::var("VE_TIMING").is_ok();
+        let mut __last = std::time::Instant::now();
+        macro_rules! __mark {
+            ($name:expr) => {
+                if __timing {
+                    let now = std::time::Instant::now();
+                    eprintln!("  [ve-timing] {:<14} {:6.1} ms", $name, (now - __last).as_secs_f64() * 1e3);
+                    __last = now;
+                }
+            };
+        }
         let (nux, nuy, npsi) = {
             let (ux, uy) = {
                 let v = state.fields.by_id(self.velocity);
@@ -1637,8 +1648,10 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             if let Some(b) = self.trace_bound {
                 clamp_logconf_spectrum(&mut c, b);
             }
+            __mark!("read+clamp");
             // Momentum: GPU velocity using ∇·τ_p from the OLD conformation + drive.
             let (bx, by) = self.body_force(&state.mesh, &c, t_new);
+            __mark!("stress_div");
             invalidate_handles_on_remesh(
                 &self.mesh_fp, &state.mesh, &self.poisson, &self.poisson_nc, &self.mg_pressure,
                 &self.mg_velx, &self.mg_vely,
@@ -1664,7 +1677,9 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             let mg_vy = self.mg_vely.borrow();
             let mgnc_p = self.mg_nc_pressure.borrow();
             let mgnc_v = self.mg_nc_velocity.borrow();
+            __mark!("ensure-handles");
             let mut stokes = GpuStokes::new(&state.mesh, self.alpha, self.eta_s, self.dt).with_tol(self.solve_tol);
+            __mark!("stokes-build");
             if let Some(h) = handle.as_ref() {
                 stokes = stokes.with_handle(h);
             }
@@ -1683,6 +1698,7 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
             let (nux, nuy) = stokes
                 .step_ns_forced(&ux, &uy, t_new, &self.bc_u, &self.bc_v, &bx, &by)
                 .expect("gale-gpu: viscoelastic velocity step failed");
+            __mark!("flow-solve");
             // Constitutive: GPU SSP-RK3 conformation transport with the NEW velocity.
             // Stress diffusion κ∇²Ψ is applied EXPLICITLY inside the RK3 rhs (`kappa_explicit`)
             // unless implicit diffusion is selected, in which case it's an operator-split implicit
@@ -1706,6 +1722,7 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
                 }
             }
             .expect("gale-gpu: viscoelastic conformation advance failed");
+            __mark!("conformation");
             if self.diffusion_implicit && self.kappa > 0.0 && matches!(self.model, gale::sim::ViscoModel::LogConf) {
                 apply_logconf_diffusion_implicit(
                     &state.mesh, &mut npsi, self.kappa, self.dt, self.alpha, self.solve_tol,
@@ -1718,6 +1735,7 @@ impl gale::sim::StateIntegrator for GpuViscoelasticDualSplitting {
                     limit_logconf_trace_bound(&state.mesh, &mut npsi, b);
                 }
             }
+            __mark!("diffusion");
             (nux, nuy, npsi)
         };
         {

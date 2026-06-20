@@ -342,8 +342,15 @@ impl GpuResidentVe {
         // loop as a device-side conditional graph — the convergence test is on the GPU, so there is
         // NO per-iteration host residual readback (the last per-step host sync).
         let g_stream = CudaContext::new(0)?.new_stream()?;
+        // Each solve's PCG loop runs as a device-side conditional WHILE graph by default (zero
+        // per-iter host sync — the production path). `RVP_NOGRAPH=1` disables capture so the solve
+        // kernels launch normally: this is the PROFILING ESCAPE HATCH — ncu cannot profile kernels
+        // inside conditional graphs (per-node profiling is "unsupported", whole-graph profiling
+        // mis-attributes), so an out-of-graph run is the only way to get real per-kernel SOL/BW.
+        // Functionally identical (same kernels/data, just not captured); never use it for sweeps.
+        let use_graph = std::env::var("RVP_NOGRAPH").is_err();
         let mk = |mg: PMultigrid| -> Result<GpuPoissonMg, Err> {
-            Ok(GpuPoissonMg::new_on_stream(mg, g_stream.clone())?.with_while_graph(true)?)
+            Ok(GpuPoissonMg::new_on_stream(mg, g_stream.clone())?.with_while_graph(use_graph)?)
         };
         let hp = mk(PMultigrid::from_mesh(mesh, alpha, 0.0, tags.clone()).ok_or("GpuResidentVe: needs uniform rect mesh")?)?;
         let hv = mk(PMultigrid::from_mesh(mesh, alpha, lambda, Vec::new()).ok_or("GpuResidentVe: needs uniform rect mesh")?)?;

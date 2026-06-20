@@ -12,3 +12,5 @@ rustc-ice-*.txt
 
 # mdBook build output
 /book/book/
+
+/runs

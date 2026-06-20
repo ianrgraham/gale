@@ -32,11 +32,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let fx = move |_x: f64, y: f64| force * (two_pi * nk * y).sin();
     let fy = |_x: f64, _y: f64| 0.0;
+    let tol = std::env::var("RVP_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-9);
     let mut ve = GpuResidentVe::new(&mesh, eta_s, eta_p, lambda_p, dt, alpha, kappa, fx, fy)?
         .with_trace_bound(2000.0)
-        .with_tol(1e-9, 4000);
+        .with_tol(tol, 4000);
     ve.set_velocity(&ux0, &uy0)?;
-    println!("resident-ve-perf: {n}×{n} p={p}, {steps} steps, κ={kappa} — stepping (profile now)");
+    // RVP_NOGRAPH=1 disables the device-side WHILE-graph capture (solve kernels launch normally) so
+    // ncu can profile them directly — kernels inside conditional graphs are unprofilable by ncu.
+    let graph = if std::env::var("RVP_NOGRAPH").is_err() { "while-graph (production)" } else { "NO-GRAPH (ncu/profiling)" };
+    println!("resident-ve-perf: {n}×{n} p={p}, {steps} steps, κ={kappa}, {graph} — stepping (profile now)");
     ve.run(steps)?;
     let psi = ve.psi()?;
     let lc = gale::dg::LogConfOldroydB::new(&mesh, lambda_p, eta_p);

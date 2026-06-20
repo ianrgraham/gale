@@ -74,6 +74,11 @@ path = "src/bin/traj_amr_kolmogorov.rs"
 required-features = ["traj"]
 
 [[bin]]
+name = "traj-resident-kolmogorov"
+path = "src/bin/traj_resident_kolmogorov.rs"
+required-features = ["traj"]
+
+[[bin]]
 name = "traj-ve-cylinder"
 path = "src/bin/traj_ve_cylinder.rs"
 required-features = ["traj"]

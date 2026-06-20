@@ -13,7 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reps: u32 = std::env::var("MG_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
     let mesh = Mesh2d::rectangular(p, g, g, [0.0, 1.0], [0.0, 1.0]);
     let b = bench_poisson_kernels(&mesh, 5.0, reps)?;
-    let op = b.kernels.iter().find(|k| k.name == "operator").map(|k| k.ms * 1e3).unwrap_or(0.0);
-    println!("op_profile: p={p} grid={g}² ndof={} operator={op:.2} µs/call", b.ndof);
+    println!("op_profile: p={p} grid={g}² ndof={}", b.ndof);
+    for k in &b.kernels {
+        println!("  {:<24} {:8.2} µs/call", k.name, k.ms * 1e3);
+    }
     Ok(())
 }

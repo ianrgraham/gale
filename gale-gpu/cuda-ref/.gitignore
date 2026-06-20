@@ -1,0 +1,11 @@
+# cuda-ref: commit the .cu/.cpp/.h prototype SOURCE + README; never commit compiled binaries or build
+# output. Build into out/ (see README). The `*` + whitelist also catches stray bare-directory builds
+# (the nvcc/g++ binaries here have no extension, so a name/extension pattern wouldn't catch them).
+*
+!*.cu
+!*.cpp
+!*.cuh
+!*.h
+!*.hpp
+!README.md
+!.gitignore
