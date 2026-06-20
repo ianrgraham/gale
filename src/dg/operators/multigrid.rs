@@ -184,14 +184,21 @@ impl PMultigrid {
         //    the way down (nx×ny → nx/2×ny/2 → … → 1×1), every level order `p`. The coarsest is
         //    order `p` on 1×1 ((p+1)² dofs) so its solve is still cheap; geometric h-MG at full
         //    order gives mesh-independent iteration counts (the head-to-head vs p-MG).
-        let hmg = std::env::var("HMG").is_ok();
+        // hp (h-coarsen at order `p`, then the p-tail) is the DEFAULT: it gives the ~1.5× device-
+        // resident VE step (h-multigrid makes every level full-spectrum so the Chebyshev smoother
+        // compounds). `PMG_LEGACY=1` reverts to the old p-first hierarchy (p-coarsen the full grid,
+        // then order-1 h-levels) for A/B + as an escape hatch.
+        let hmg = std::env::var("PMG_LEGACY").is_err();
         let mut orders: Vec<usize> = Vec::new();
         let mut dims: Vec<(usize, usize)> = Vec::new();
         // h-transfer node count: order 1 (nn=4) for the appended h-levels in the default path;
         // order `p` (nn=(p+1)²) for the pure-h hierarchy.
         let h_order = if hmg { order } else { 1 };
         if hmg {
-            // Pure-h: full grid at order `p`, then halve while both dims are even and ≥ 2.
+            // hp: KEEP order `p` and h-coarsen the MESH while both dims are even, THEN p-coarsen
+            // (order p→1) at the coarsest h-grid. The p-tail (a) makes the coarsest cheap — order 1
+            // on the small grid, not order `p` — and (b) handles NON-power-of-2 grids: the h-part
+            // stops at the first odd dim and the p-tail finishes the hierarchy from there.
             orders.push(order);
             dims.push((nx, ny));
             let (mut hx, mut hy) = (nx, ny);
@@ -200,6 +207,15 @@ impl PMultigrid {
                 hy /= 2;
                 orders.push(order);
                 dims.push((hx, hy));
+            }
+            // p-tail ONLY if the h-part stopped above 1×1 (non-power-of-2 grids) — p-coarsen there to
+            // a cheap coarsest. Power-of-2 grids reach order `p` on 1×1 (tiny, (p+1)² dofs) so they need
+            // no p-tail; adding one would just be an extra dispatch-bound level.
+            if hx > 1 || hy > 1 {
+                for &o in order_levels(order).iter().skip(1) {
+                    orders.push(o);
+                    dims.push((hx, hy));
+                }
             }
         } else {
             for &o in &order_levels(order) {

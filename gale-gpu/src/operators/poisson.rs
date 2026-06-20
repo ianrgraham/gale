@@ -3251,10 +3251,11 @@ fn pcg_solve_with<G: Scalar + DeviceCopy>(
     let avcfg: Vec<LaunchConfig> = (0..nlev).map(|l| arith_cfg(nev[l] as usize, 6)).collect();
     // arith matvec/smoother on by default for n1=4; `ARITH_OFF=1` reverts to operator_fused (A/B + escape hatch).
     let use_arith = std::env::var("ARITH_OFF").is_err();
-    // Chebyshev smoother (deg=3) on the finest arith level; `CHEBY=1` opt-in for A/B vs damped-Jacobi.
-    // Replaces the `n_pre`/`n_post` Jacobi sweeps with one degree-3 Chebyshev sweep (coefficient-varying
-    // steps from `cheb_c1`/`cheb_c2`). Coarser levels (n1<4) keep damped-Jacobi.
-    let use_cheby = use_arith && std::env::var("CHEBY").is_ok();
+    // Chebyshev smoother (degree-3, 4th-kind Lottes default) is the DEFAULT at EVERY level (arith at
+    // n1=4, fused at coarser) — it's what makes the hp/h-multigrid's ~1.5× device-resident VE step
+    // show up (every level full-spectrum ⇒ the smoother compounds). Replaces the `n_pre`/`n_post`
+    // Jacobi sweeps with one degree-3 Chebyshev sweep. `JACOBI=1` reverts to damped-Jacobi (A/B + hatch).
+    let use_cheby = use_arith && std::env::var("JACOBI").is_err();
     let cheb_deg: usize = std::env::var("CHEB_DEG").ok().and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 3);
     debug_assert_eq!(out.len(), n0, "out length must match the finest level");
 
